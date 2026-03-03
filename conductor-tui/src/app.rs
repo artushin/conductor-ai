@@ -256,6 +256,9 @@ impl App {
             Action::WorkTargetAdd => self.handle_work_target_add(),
             Action::WorkTargetDelete => self.handle_work_target_delete(),
 
+            // Model configuration
+            Action::SetModel => self.handle_set_model(),
+
             // Agent (tmux-based)
             Action::LaunchAgent => self.handle_launch_agent(),
             Action::StopAgent => self.handle_stop_agent(),
@@ -1004,14 +1007,14 @@ impl App {
             _ => return,
         };
 
-        if value.is_empty() {
-            return;
-        }
         match on_submit {
             InputAction::CreateWorktree {
                 repo_slug,
                 ticket_id,
             } => {
+                if value.is_empty() {
+                    return;
+                }
                 let wt_mgr = WorktreeManager::new(&self.conn, &self.config);
                 match wt_mgr.create(&repo_slug, &value, None, ticket_id.as_deref()) {
                     Ok((wt, warnings)) => {
@@ -1045,6 +1048,9 @@ impl App {
                 }
             }
             InputAction::LinkTicket { worktree_id } => {
+                if value.is_empty() {
+                    return;
+                }
                 let syncer = TicketSyncer::new(&self.conn);
                 // Find ticket by source_id, scoped to the worktree's repo
                 let wt_repo_id = self
@@ -1085,13 +1091,122 @@ impl App {
                 worktree_slug,
                 resume_session_id,
             } => {
+                if value.is_empty() {
+                    return;
+                }
+                // Resolve the default model: per-worktree → per-repo → global config
+                let wt_model = self
+                    .state
+                    .data
+                    .worktrees
+                    .iter()
+                    .find(|w| w.id == worktree_id)
+                    .and_then(|w| w.model.clone());
+                let repo_model = self
+                    .state
+                    .data
+                    .worktrees
+                    .iter()
+                    .find(|w| w.id == worktree_id)
+                    .and_then(|w| self.state.data.repos.iter().find(|r| r.id == w.repo_id))
+                    .and_then(|r| r.model.clone());
+                let resolved_default = wt_model
+                    .or(repo_model)
+                    .or_else(|| self.config.general.model.clone());
+
+                // Show second step: optional model override
+                let prompt_text = match &resolved_default {
+                    Some(m) => format!("Model (default: {m}, leave blank to use it):"),
+                    None => "Model override (leave blank for claude's default):".to_string(),
+                };
+                self.state.modal = Modal::Input {
+                    title: "Model Override".to_string(),
+                    prompt: prompt_text,
+                    value: String::new(),
+                    on_submit: InputAction::AgentModelOverride {
+                        prompt: value,
+                        worktree_id,
+                        worktree_path,
+                        worktree_slug,
+                        resume_session_id,
+                        resolved_default,
+                    },
+                };
+            }
+            InputAction::AgentModelOverride {
+                prompt,
+                worktree_id,
+                worktree_path,
+                worktree_slug,
+                resume_session_id,
+                resolved_default,
+            } => {
+                // Empty value means "use the resolved default"
+                let model = if value.trim().is_empty() {
+                    resolved_default
+                } else {
+                    Some(value)
+                };
                 self.start_agent_tmux(
-                    value,
+                    prompt,
                     worktree_id,
                     worktree_path,
                     worktree_slug,
                     resume_session_id,
+                    model,
                 );
+            }
+            InputAction::SetWorktreeModel {
+                worktree_id,
+                repo_slug,
+                slug,
+            } => {
+                let model = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
+                let mgr = WorktreeManager::new(&self.conn, &self.config);
+                match mgr.set_model(&repo_slug, &slug, model.as_deref()) {
+                    Ok(()) => {
+                        let msg = match &model {
+                            Some(m) => format!("Model for {slug} set to: {m}"),
+                            None => format!("Model for {slug} cleared"),
+                        };
+                        self.state.status_message = Some(msg);
+                        self.refresh_data();
+                    }
+                    Err(e) => {
+                        self.state.modal = Modal::Error {
+                            message: format!("Failed to set model: {e}"),
+                        };
+                    }
+                }
+                let _ = worktree_id;
+            }
+            InputAction::SetRepoModel { repo_id, slug } => {
+                let model = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
+                let mgr = RepoManager::new(&self.conn, &self.config);
+                match mgr.set_model(&slug, model.as_deref()) {
+                    Ok(()) => {
+                        let msg = match &model {
+                            Some(m) => format!("Model for {slug} set to: {m}"),
+                            None => format!("Model for {slug} cleared"),
+                        };
+                        self.state.status_message = Some(msg);
+                        self.refresh_data();
+                    }
+                    Err(e) => {
+                        self.state.modal = Modal::Error {
+                            message: format!("Failed to set model: {e}"),
+                        };
+                    }
+                }
+                let _ = repo_id;
             }
         }
     }
@@ -2040,6 +2155,117 @@ impl App {
         }
     }
 
+    // ── Model configuration ────────────────────────────────────────────
+
+    fn handle_set_model(&mut self) {
+        match self.state.view {
+            View::Dashboard => {
+                use crate::state::DashboardFocus;
+                match self.state.dashboard_focus {
+                    DashboardFocus::Worktrees => {
+                        let Some(wt) = self
+                            .state
+                            .data
+                            .worktrees
+                            .get(self.state.worktree_index)
+                            .cloned()
+                        else {
+                            return;
+                        };
+                        let repo_slug = self
+                            .state
+                            .data
+                            .repo_slug_map
+                            .get(&wt.repo_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let current = wt.model.clone().unwrap_or_default();
+                        self.state.modal = Modal::Input {
+                            title: "Set Worktree Model".to_string(),
+                            prompt: "Model (e.g. claude-sonnet-4-6, leave blank to clear):"
+                                .to_string(),
+                            value: current,
+                            on_submit: InputAction::SetWorktreeModel {
+                                worktree_id: wt.id.clone(),
+                                repo_slug,
+                                slug: wt.slug.clone(),
+                            },
+                        };
+                    }
+                    DashboardFocus::Repos => {
+                        let Some(repo) = self.state.data.repos.get(self.state.repo_index).cloned()
+                        else {
+                            return;
+                        };
+                        let current = repo.model.clone().unwrap_or_default();
+                        self.state.modal = Modal::Input {
+                            title: "Set Repo Model".to_string(),
+                            prompt: "Model (e.g. claude-sonnet-4-6, leave blank to clear):"
+                                .to_string(),
+                            value: current,
+                            on_submit: InputAction::SetRepoModel {
+                                repo_id: repo.id.clone(),
+                                slug: repo.slug.clone(),
+                            },
+                        };
+                    }
+                    DashboardFocus::Tickets => {}
+                }
+            }
+            View::WorktreeDetail => {
+                let Some(wt) = self
+                    .state
+                    .selected_worktree_id
+                    .as_ref()
+                    .and_then(|id| self.state.data.worktrees.iter().find(|w| &w.id == id))
+                    .cloned()
+                else {
+                    return;
+                };
+                let repo_slug = self
+                    .state
+                    .data
+                    .repo_slug_map
+                    .get(&wt.repo_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let current = wt.model.clone().unwrap_or_default();
+                self.state.modal = Modal::Input {
+                    title: "Set Worktree Model".to_string(),
+                    prompt: "Model (e.g. claude-sonnet-4-6, leave blank to clear):".to_string(),
+                    value: current,
+                    on_submit: InputAction::SetWorktreeModel {
+                        worktree_id: wt.id.clone(),
+                        repo_slug,
+                        slug: wt.slug.clone(),
+                    },
+                };
+            }
+            View::RepoDetail => {
+                let Some(repo) = self
+                    .state
+                    .selected_repo_id
+                    .as_ref()
+                    .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))
+                    .cloned()
+                else {
+                    return;
+                };
+                let current = repo.model.clone().unwrap_or_default();
+                self.state.modal = Modal::Input {
+                    title: "Set Repo Model".to_string(),
+                    prompt: "Model (e.g. claude-sonnet-4-6, leave blank to clear):".to_string(),
+                    value: current,
+                    on_submit: InputAction::SetRepoModel {
+                        repo_id: repo.id.clone(),
+                        slug: repo.slug.clone(),
+                    },
+                };
+            }
+            _ => {}
+        }
+    }
+
     // ── Agent handlers (tmux-based) ────────────────────────────────────
 
     fn handle_launch_agent(&mut self) {
@@ -2245,10 +2471,16 @@ impl App {
         worktree_path: String,
         worktree_slug: String,
         resume_session_id: Option<String>,
+        model: Option<String>,
     ) {
         // Create DB record with tmux window name
         let mgr = AgentManager::new(&self.conn);
-        let run = match mgr.create_run(&worktree_id, &prompt, Some(&worktree_slug)) {
+        let run = match mgr.create_run(
+            &worktree_id,
+            &prompt,
+            Some(&worktree_slug),
+            model.as_deref(),
+        ) {
             Ok(run) => run,
             Err(e) => {
                 self.state.modal = Modal::Error {
@@ -2273,6 +2505,11 @@ impl App {
         if let Some(ref session_id) = resume_session_id {
             args.push("--resume".to_string());
             args.push(session_id.clone());
+        }
+
+        if let Some(ref m) = model {
+            args.push("--model".to_string());
+            args.push(m.clone());
         }
 
         // Resolve the conductor binary path — look next to the current executable first,
