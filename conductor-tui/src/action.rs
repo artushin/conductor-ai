@@ -96,8 +96,12 @@ pub enum Action {
     OrchestrateAgent,
     StopAgent,
     ViewAgentLog,
+    CopyLastCodeBlock,
+    ExpandAgentEvent,
     AgentActivityDown,
     AgentActivityUp,
+    ScrollLeft,
+    ScrollRight,
 
     // Scroll navigation (all views)
     GoToTop,

@@ -24,6 +24,11 @@ use crate::state::{
 };
 use crate::ui;
 
+/// Maximum scroll offset for a text body (total lines minus one visible line).
+fn max_scroll(line_count: usize) -> u16 {
+    line_count.saturating_sub(1) as u16
+}
+
 /// Derive a worktree slug from a ticket's source_id and title.
 /// Format: `{source_id}-{slugified-title}`, e.g. `15-tui-create-worktree`.
 /// Title portion is truncated to keep the total slug under ~40 chars.
@@ -154,6 +159,24 @@ impl App {
             Action::PrevPanel => self.prev_panel(),
             Action::MoveUp => self.move_up(),
             Action::MoveDown => self.move_down(),
+            Action::ScrollLeft => {
+                if let Modal::EventDetail {
+                    ref mut horizontal_offset,
+                    ..
+                } = self.state.modal
+                {
+                    *horizontal_offset = horizontal_offset.saturating_sub(4);
+                }
+            }
+            Action::ScrollRight => {
+                if let Modal::EventDetail {
+                    ref mut horizontal_offset,
+                    ..
+                } = self.state.modal
+                {
+                    *horizontal_offset += 4;
+                }
+            }
             Action::Select => self.select(),
 
             // View navigation
@@ -294,6 +317,8 @@ impl App {
             Action::OrchestrateAgent => self.handle_orchestrate_agent(),
             Action::StopAgent => self.handle_stop_agent(),
             Action::ViewAgentLog => self.handle_view_agent_log(),
+            Action::CopyLastCodeBlock => self.handle_copy_last_code_block(),
+            Action::ExpandAgentEvent => self.handle_expand_agent_event(),
             Action::AgentActivityDown => {
                 let len = self.state.data.agent_activity_len();
                 let cur = self.state.agent_list_state.borrow().selected().unwrap_or(0);
@@ -306,6 +331,14 @@ impl App {
             }
             // Scroll navigation (all views + discover modals)
             Action::GoToTop => match self.state.modal {
+                Modal::EventDetail {
+                    ref mut scroll_offset,
+                    ref mut horizontal_offset,
+                    ..
+                } => {
+                    *scroll_offset = 0;
+                    *horizontal_offset = 0;
+                }
                 Modal::GithubDiscoverOrgs { ref mut cursor, .. }
                 | Modal::GithubDiscover { ref mut cursor, .. } => {
                     *cursor = 0;
@@ -315,6 +348,13 @@ impl App {
                 }
             },
             Action::GoToBottom => match self.state.modal {
+                Modal::EventDetail {
+                    ref mut scroll_offset,
+                    line_count,
+                    ..
+                } => {
+                    *scroll_offset = max_scroll(line_count);
+                }
                 Modal::GithubDiscoverOrgs {
                     ref orgs,
                     ref mut cursor,
@@ -628,6 +668,13 @@ impl App {
 
     fn move_up(&mut self) {
         match self.state.modal {
+            Modal::EventDetail {
+                ref mut scroll_offset,
+                ..
+            } => {
+                *scroll_offset = scroll_offset.saturating_sub(1);
+                return;
+            }
             Modal::ModelPicker {
                 ref mut selected,
                 ref mut custom_active,
@@ -732,6 +779,14 @@ impl App {
 
     fn move_down(&mut self) {
         match self.state.modal {
+            Modal::EventDetail {
+                ref mut scroll_offset,
+                line_count,
+                ..
+            } => {
+                *scroll_offset = scroll_offset.saturating_add(1).min(max_scroll(line_count));
+                return;
+            }
             Modal::ModelPicker {
                 ref mut selected,
                 ref mut custom_active,
@@ -3119,6 +3174,91 @@ impl App {
         }
     }
 
+    fn handle_copy_last_code_block(&mut self) {
+        let wt_id = self.state.selected_worktree_id.as_ref();
+        let run = wt_id.and_then(|id| self.state.data.latest_agent_runs.get(id));
+
+        let log_path = run.and_then(|r| r.log_file.as_deref());
+        let Some(log_path) = log_path else {
+            self.state.status_message = Some("No agent log available".to_string());
+            return;
+        };
+
+        let file = match std::fs::File::open(log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.state.status_message = Some(format!("Failed to read log: {e}"));
+                return;
+            }
+        };
+        let reader = std::io::BufReader::new(file);
+
+        let Some(code_block) = extract_last_code_block(reader) else {
+            self.state.status_message = Some("No code block found in log".to_string());
+            return;
+        };
+
+        // Try pbcopy (macOS), then xclip, then xsel
+        let copy_result = Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .or_else(|_| {
+                Command::new("xclip")
+                    .args(["-selection", "clipboard"])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+            })
+            .or_else(|_| {
+                Command::new("xsel")
+                    .arg("--clipboard")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+            });
+
+        match copy_result {
+            Ok(mut child) => {
+                use std::io::Write;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(code_block.as_bytes());
+                    drop(stdin); // Close stdin so clipboard tool sees EOF
+                }
+                match child.wait() {
+                    Ok(status) if status.success() => {
+                        self.state.status_message = Some("Copied to clipboard".to_string());
+                    }
+                    _ => {
+                        self.state.status_message = Some("Clipboard command failed".to_string());
+                    }
+                }
+            }
+            Err(_) => {
+                self.state.status_message =
+                    Some("No clipboard tool found (pbcopy/xclip/xsel)".to_string());
+            }
+        }
+    }
+
+    fn handle_expand_agent_event(&mut self) {
+        let selected = self.state.agent_list_state.borrow().selected().unwrap_or(0);
+
+        let Some(ev) = self.state.data.event_at_visual_index(selected) else {
+            return;
+        };
+
+        let summary_prefix = truncate_to_char_boundary(&ev.summary, 60);
+        let title = format!("[{}] {}", ev.kind, summary_prefix);
+        let body = ev.summary.clone();
+        let line_count = body.lines().count();
+
+        self.state.modal = Modal::EventDetail {
+            title,
+            body,
+            line_count,
+            scroll_offset: 0,
+            horizontal_offset: 0,
+        };
+    }
+
     // ── GitHub repo discovery ────────────────────────────────────────────────
 
     fn handle_discover_github_orgs(&mut self) {
@@ -3360,6 +3500,46 @@ impl App {
     }
 }
 
+/// Truncate a string to at most `max_chars` characters at a char boundary.
+fn truncate_to_char_boundary(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+/// Extract the last fenced code block (```...```) from a reader (line-by-line streaming).
+fn extract_last_code_block(reader: impl std::io::BufRead) -> Option<String> {
+    let mut last_block: Option<String> = None;
+    let mut in_block = false;
+    let mut current_block = String::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim_start().starts_with("```") {
+            if in_block {
+                // Closing fence — save the block (take avoids clone)
+                last_block = Some(std::mem::take(&mut current_block));
+                in_block = false;
+            } else {
+                // Opening fence
+                in_block = true;
+                current_block.clear();
+            }
+        } else if in_block {
+            if !current_block.is_empty() {
+                current_block.push('\n');
+            }
+            current_block.push_str(&line);
+        }
+    }
+
+    last_block
+}
+
 /// Best-effort capture of tmux scrollback to `~/.conductor/agent-logs/<run_id>.log`.
 fn capture_agent_log(mgr: &AgentManager, run_id: &str, tmux_window: &str) {
     let log_dir = conductor_core::config::conductor_dir().join("agent-logs");
@@ -3392,5 +3572,43 @@ fn capture_agent_log(mgr: &AgentManager, run_id: &str, tmux_window: &str) {
             let _ = mgr.update_run_log_file(run_id, &path_str);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_extract_last_code_block_single() {
+        let content = "some text\n```bash\necho hello\n```\nmore text";
+        assert_eq!(
+            extract_last_code_block(Cursor::new(content)),
+            Some("echo hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_last_code_block_multiple() {
+        let content = "```\nfirst\n```\nstuff\n```python\nsecond\nthird\n```\n";
+        assert_eq!(
+            extract_last_code_block(Cursor::new(content)),
+            Some("second\nthird".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_last_code_block_none() {
+        assert_eq!(extract_last_code_block(Cursor::new("no code here")), None);
+    }
+
+    #[test]
+    fn test_extract_last_code_block_unclosed() {
+        let content = "```\nclosed\n```\n```\nunclosed";
+        assert_eq!(
+            extract_last_code_block(Cursor::new(content)),
+            Some("closed".to_string())
+        );
     }
 }

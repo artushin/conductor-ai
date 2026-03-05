@@ -121,8 +121,9 @@ pub fn render_ticket_info(
 
     let body_text = if ticket.body.is_empty() {
         "(no description)".to_string()
-    } else if ticket.body.len() > 500 {
-        format!("{}...", &ticket.body[..500])
+    } else if ticket.body.chars().count() > 500 {
+        let s: String = ticket.body.chars().take(500).collect();
+        format!("{s}...")
     } else {
         ticket.body.clone()
     };
@@ -1002,8 +1003,9 @@ pub fn render_github_discover(
             lines.push(Line::from(spans));
 
             if !repo.description.is_empty() {
-                let desc = if repo.description.len() > 60 {
-                    format!("{}...", &repo.description[..57])
+                let desc = if repo.description.chars().count() > 60 {
+                    let s: String = repo.description.chars().take(57).collect();
+                    format!("{s}...")
                 } else {
                     repo.description.clone()
                 };
@@ -1066,6 +1068,60 @@ pub fn render_github_discover(
         .scroll((scroll_offset, 0));
 
     frame.render_widget(content, popup);
+}
+
+pub fn render_event_detail(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: &str,
+    line_count: usize,
+    scroll_offset: u16,
+    horizontal_offset: u16,
+) {
+    let popup = centered_rect(85, 85, area);
+    frame.render_widget(Clear, popup);
+
+    let lines: Vec<Line> = body
+        .lines()
+        .map(|l| Line::from(Span::raw(l.to_string())))
+        .collect();
+
+    let hint = format!(
+        " j/k=scroll  h/l=pan  gg/G=top/bot  q/Esc=close  (line {}/{})",
+        scroll_offset + 1,
+        line_count.max(1),
+    );
+
+    let max_title_chars = (popup.width as usize).saturating_sub(7);
+    let title_display = if title.chars().count() > (popup.width as usize).saturating_sub(4) {
+        let truncated: String = title.chars().take(max_title_chars).collect();
+        format!(" {truncated}... ")
+    } else {
+        format!(" {title} ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title_display);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split: body (fill) + hint line (1)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let body_widget = Paragraph::new(lines).scroll((scroll_offset, horizontal_offset));
+    frame.render_widget(body_widget, chunks[0]);
+
+    let hint_widget = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(hint_widget, chunks[1]);
 }
 
 fn format_source_config_lines(source: &IssueSource) -> Vec<String> {
