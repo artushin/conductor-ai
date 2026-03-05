@@ -11,6 +11,19 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Truncate `s` to at most `max` bytes (on a char boundary) and append `suffix` when truncated.
+pub fn cap_with_suffix(s: &str, max: usize, suffix: &str) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let truncated = truncate_str(s, max);
+        let mut out = String::with_capacity(truncated.len() + suffix.len());
+        out.push_str(truncated);
+        out.push_str(suffix);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
