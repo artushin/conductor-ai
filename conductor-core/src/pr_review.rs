@@ -101,6 +101,7 @@ pub struct ReviewSwarmInput<'a> {
     pub model: Option<&'a str>,
     pub conductor_bin: &'a str,
     pub swarm_config: &'a ReviewSwarmConfig,
+    pub app_token: Option<&'a str>,
 }
 
 /// Launch a PR review swarm for a worktree.
@@ -309,7 +310,13 @@ pub fn run_review_swarm(input: &ReviewSwarmInput<'_>) -> Result<ReviewSwarmResul
     if review_config.post_to_pr {
         if let Some(pr_num) = pr_number {
             if let Some((ref owner, ref repo_name)) = gh_remote {
-                let _ = post_pr_comment(owner, repo_name, pr_num, &aggregated_comment);
+                let _ = post_pr_comment(
+                    owner,
+                    repo_name,
+                    pr_num,
+                    &aggregated_comment,
+                    input.app_token,
+                );
             }
         }
     }
@@ -843,7 +850,16 @@ fn build_aggregated_comment(
 }
 
 /// Post a comment to a GitHub PR using the `gh` CLI.
-fn post_pr_comment(owner: &str, repo: &str, pr_number: i64, comment: &str) -> Result<()> {
+///
+/// When `token` is `Some`, the comment is posted under that identity
+/// (e.g. a GitHub App bot). When `None`, uses the default `gh` user.
+fn post_pr_comment(
+    owner: &str,
+    repo: &str,
+    pr_number: i64,
+    comment: &str,
+    token: Option<&str>,
+) -> Result<()> {
     // Write comment to a temp file to avoid exceeding command-line arg limits (~10KB+).
     // Use mode 0o600 to prevent other local users from reading the comment.
     let comment_file = std::env::temp_dir().join(format!(
@@ -862,18 +878,23 @@ fn post_pr_comment(owner: &str, repo: &str, pr_number: i64, comment: &str) -> Re
             .map_err(|e| ConductorError::Agent(format!("failed to write comment file: {e}")))?;
     }
 
-    let output = Command::new("gh")
-        .args([
+    let pr_str = pr_number.to_string();
+    let repo_slug = format!("{owner}/{repo}");
+    let file_path = comment_file.to_string_lossy();
+    let output = crate::github::build_gh_cmd(
+        &[
             "pr",
             "comment",
-            &pr_number.to_string(),
+            &pr_str,
             "--repo",
-            &format!("{owner}/{repo}"),
+            &repo_slug,
             "--body-file",
-            &comment_file.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| ConductorError::Agent(format!("failed to post PR comment: {e}")))?;
+            &file_path,
+        ],
+        token,
+    )
+    .output()
+    .map_err(|e| ConductorError::Agent(format!("failed to post PR comment: {e}")))?;
 
     // Clean up temp file
     let _ = std::fs::remove_file(&comment_file);
@@ -1456,6 +1477,7 @@ mod tests {
             model: None,
             conductor_bin: "conductor",
             swarm_config: &swarm_config,
+            app_token: None,
         });
 
         assert!(result.is_err());

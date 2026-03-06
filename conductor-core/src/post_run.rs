@@ -14,6 +14,7 @@ use crate::agent::{AgentManager, CostPhase};
 use crate::config::Config;
 use crate::error::{ConductorError, Result};
 use crate::github;
+use crate::github_app;
 use crate::pr_review::{self, ReviewSwarmConfig, ReviewSwarmInput};
 use crate::repo::RepoManager;
 use crate::text_util::truncate_str;
@@ -141,8 +142,18 @@ pub fn run_post_lifecycle(input: &PostRunInput<'_>) -> Result<PostRunResult> {
         }
     };
 
+    // Resolve GitHub App token (if configured) for bot-identity comments
+    let app_token = github_app::resolve_app_token(config, "post-run");
+
     // Post initial cost summary now that we have a PR number
-    post_cost_summary(conn, owner, repo_name, pr_number, &wt.id);
+    post_cost_summary(
+        conn,
+        owner,
+        repo_name,
+        pr_number,
+        &wt.id,
+        app_token.as_deref(),
+    );
 
     // ── Phase 3: Review → Fix Loop ───────────────────────────────────
     eprintln!(
@@ -171,6 +182,7 @@ pub fn run_post_lifecycle(input: &PostRunInput<'_>) -> Result<PostRunResult> {
             model: None,
             conductor_bin: input.conductor_bin,
             swarm_config: &swarm_config,
+            app_token: app_token.as_deref(),
         })?;
 
         if swarm_result.all_required_approved {
@@ -197,7 +209,14 @@ pub fn run_post_lifecycle(input: &PostRunInput<'_>) -> Result<PostRunResult> {
                         );
                         break;
                     }
-                    post_cost_summary(conn, owner, repo_name, pr_number, &wt.id);
+                    post_cost_summary(
+                        conn,
+                        owner,
+                        repo_name,
+                        pr_number,
+                        &wt.id,
+                        app_token.as_deref(),
+                    );
                 }
                 Err(e) => {
                     eprintln!("[post-run] Fix agent failed: {e}");
@@ -674,6 +693,7 @@ fn post_cost_summary(
     repo_name: &str,
     pr_number: i64,
     worktree_id: &str,
+    token: Option<&str>,
 ) {
     let mgr = AgentManager::new(conn);
     let phases = match mgr.worktree_cost_phases(worktree_id) {
@@ -684,7 +704,7 @@ fn post_cost_summary(
         }
     };
     let body = build_cost_comment(&phases);
-    if let Err(e) = github::upsert_sticky_comment(owner, repo_name, pr_number, &body) {
+    if let Err(e) = github::upsert_sticky_comment(owner, repo_name, pr_number, &body, token) {
         eprintln!("[post-run] Failed to post cost summary: {e}");
     }
 }
