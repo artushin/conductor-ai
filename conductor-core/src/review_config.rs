@@ -1,359 +1,438 @@
-//! Per-repo review configuration for multi-agent PR review swarms.
+//! File-based reviewer configuration for multi-agent PR review swarms.
 //!
-//! Each repo can define a set of reviewer roles (architecture, security, etc.)
-//! along with configuration for retry limits, auto-merge, and PR comment posting.
+//! Reads `.conductor/reviewers/*.md` from the repo root (not the PR worktree)
+//! and `.conductor/review.toml` for swarm-level settings.
+//! Each reviewer file uses YAML frontmatter + markdown body.
 
-use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use serde::Deserialize;
 
-/// A single reviewer role in a PR review swarm.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewerRole {
-    /// Short identifier, e.g. "architecture", "security".
-    pub name: String,
-    /// Human-readable focus area description.
-    pub focus: String,
-    /// System prompt injected into the reviewer agent.
-    pub system_prompt: String,
-    /// If true, blocking findings from this reviewer prevent auto-merge.
+use crate::error::{ConductorError, Result};
+
+const REVIEWER_HINT: &str = "See .conductor/reviewers/ in conductor-ai for reference roles.";
+
+/// Swarm-level review settings from `.conductor/review.toml`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewSettings {
+    /// Whether to post an aggregated review comment to the PR (default: true).
     #[serde(default = "default_true")]
-    pub required: bool,
+    pub post_to_pr: bool,
+    /// Whether to auto-enqueue for merge when all required reviewers approve (default: true).
+    #[serde(default = "default_true")]
+    pub auto_merge: bool,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        Self {
+            post_to_pr: true,
+            auto_merge: true,
+        }
+    }
+}
+
+/// YAML frontmatter fields for a reviewer role `.md` file.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct ReviewerFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    model: Option<String>,
+    #[serde(default = "default_true")]
+    required: bool,
+    color: Option<String>,
+    source: Option<String>,
 }
 
 fn default_true() -> bool {
     true
 }
 
-/// Build a reviewer system prompt from an intro, focus points, and a "no issues" phrase.
-fn reviewer_system_prompt(intro: &str, focus_points: &str, no_issues_phrase: &str) -> String {
-    format!(
-        "{intro}\n\
-         Focus exclusively on:\n\
-         {focus_points}\n\n\
-         For each issue found, report:\n\
-         - **Issue**: one-line description\n\
-         - **Severity**: critical | warning | suggestion\n\
-         - **Location**: file:line reference\n\
-         - **Details**: explanation and recommended fix\n\n\
-         If you find no issues, state \"{no_issues_phrase}\" and explain what you reviewed."
-    )
+/// A single reviewer role parsed from a `.md` file.
+#[derive(Debug, Clone)]
+pub struct ReviewerRole {
+    /// Short identifier, e.g. "architecture", "security".
+    pub name: String,
+    /// Human-readable focus area description.
+    pub focus: String,
+    /// System prompt (the markdown body of the file).
+    pub system_prompt: String,
+    /// If true, blocking findings from this reviewer prevent auto-merge.
+    pub required: bool,
 }
 
-/// Default reviewer roles used when no per-repo config exists.
-pub fn default_reviewer_roles() -> Vec<ReviewerRole> {
-    vec![
-        ReviewerRole {
-            name: "architecture".to_string(),
-            focus: "Coupling, cohesion, layer violations, design patterns".to_string(),
-            system_prompt: reviewer_system_prompt(
-                "You are a senior software architect reviewing a pull request.",
-                "- Coupling and cohesion between modules\n\
-                 - Layer violations (e.g. UI code calling DB directly)\n\
-                 - Design pattern misuse or missed opportunities\n\
-                 - API surface consistency",
-                "No architectural issues found",
-            ),
-            required: true,
-        },
-        ReviewerRole {
-            name: "dry-abstraction".to_string(),
-            focus: "Duplication, premature abstraction, missing helpers".to_string(),
-            system_prompt: reviewer_system_prompt(
-                "You are a code quality reviewer focused on DRY principles and abstraction.",
-                "- Code duplication (copy-pasted logic)\n\
-                 - Premature or over-engineered abstractions\n\
-                 - Missing helper functions that would reduce repetition\n\
-                 - Unnecessary indirection",
-                "No DRY/abstraction issues found",
-            ),
-            required: false,
-        },
-        ReviewerRole {
-            name: "security".to_string(),
-            focus: "Input validation, auth gaps, injection risks, secrets in code".to_string(),
-            system_prompt: reviewer_system_prompt(
-                "You are a security-focused code reviewer.",
-                "- Input validation gaps\n\
-                 - Authentication and authorization issues\n\
-                 - Injection risks (SQL, command, XSS)\n\
-                 - Secrets, credentials, or tokens in code\n\
-                 - Unsafe deserialization",
-                "No security issues found",
-            ),
-            required: true,
-        },
-        ReviewerRole {
-            name: "performance".to_string(),
-            focus: "Unnecessary allocations, N+1 queries, blocking calls".to_string(),
-            system_prompt: reviewer_system_prompt(
-                "You are a performance-focused code reviewer.",
-                "- Unnecessary memory allocations or copies\n\
-                 - N+1 query patterns\n\
-                 - Blocking calls in hot paths\n\
-                 - Missing caching opportunities\n\
-                 - Algorithmic complexity issues",
-                "No performance issues found",
-            ),
-            required: false,
-        },
-    ]
+/// Parse a reviewer `.md` file into a `ReviewerRole`.
+///
+/// The file format is YAML frontmatter delimited by `---` lines, followed by
+/// a markdown body that becomes the system prompt.
+fn parse_reviewer_file(path: &Path) -> Result<ReviewerRole> {
+    let content = fs::read_to_string(path).map_err(|e| {
+        ConductorError::Config(format!(
+            "Failed to read reviewer file {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let (frontmatter, body) = parse_frontmatter(&content).ok_or_else(|| {
+        ConductorError::Config(format!(
+            "Invalid frontmatter in reviewer file {}. Expected YAML between --- delimiters.",
+            path.display()
+        ))
+    })?;
+
+    let fm: ReviewerFrontmatter = serde_yml::from_str(frontmatter).map_err(|e| {
+        ConductorError::Config(format!(
+            "Invalid YAML frontmatter in {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(ReviewerRole {
+        name: fm.name.unwrap_or_else(|| file_stem.clone()),
+        focus: fm.description.unwrap_or(file_stem),
+        system_prompt: body.trim().to_string(),
+        required: fm.required,
+    })
 }
 
-/// Per-repo review swarm configuration stored in the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewConfig {
-    pub id: String,
-    pub repo_id: String,
-    pub roles: Vec<ReviewerRole>,
-    pub post_to_pr: bool,
-    pub auto_merge: bool,
-    pub created_at: String,
-    pub updated_at: String,
+/// Split a file's content into (frontmatter_yaml, body).
+///
+/// Returns `None` if the content doesn't start with `---` or has no closing `---`.
+fn parse_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    // Skip the opening `---` line
+    let after_open = &trimmed[3..];
+    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
+
+    // Find the closing `---`
+    let close_pos = after_open.find("\n---")?;
+    let yaml = &after_open[..close_pos];
+    let rest = &after_open[close_pos + 4..]; // skip "\n---"
+                                             // Skip the newline after closing ---
+    let body = rest.strip_prefix('\n').unwrap_or(rest);
+    Some((yaml, body))
 }
 
-pub struct ReviewConfigManager<'a> {
-    conn: &'a Connection,
-}
+/// Load review settings from `.conductor/review.toml` in the given repo path.
+///
+/// Returns `ReviewSettings::default()` if the file doesn't exist.
+pub fn load_review_settings(repo_path: &str) -> Result<ReviewSettings> {
+    let settings_path = PathBuf::from(repo_path)
+        .join(".conductor")
+        .join("review.toml");
 
-impl<'a> ReviewConfigManager<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
-        Self { conn }
+    if !settings_path.is_file() {
+        return Ok(ReviewSettings::default());
     }
 
-    /// Get the review config for a repo, or None if not configured.
-    pub fn get_for_repo(&self, repo_id: &str) -> Result<Option<ReviewConfig>> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT id, repo_id, roles_json, post_to_pr, auto_merge, created_at, \
-                 updated_at FROM review_configs WHERE repo_id = ?1",
-                params![repo_id],
-                |row| {
-                    let roles_json: String = row.get(2)?;
-                    let roles: Vec<ReviewerRole> =
-                        serde_json::from_str(&roles_json).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })?;
-                    Ok(ReviewConfig {
-                        id: row.get(0)?,
-                        repo_id: row.get(1)?,
-                        roles,
-                        post_to_pr: row.get::<_, bool>(3)?,
-                        auto_merge: row.get::<_, bool>(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(result)
-    }
+    let content = fs::read_to_string(&settings_path).map_err(|e| {
+        ConductorError::Config(format!("Failed to read {}: {e}", settings_path.display()))
+    })?;
 
-    /// Get the review config for a repo, falling back to defaults if not configured.
-    pub fn get_or_default(&self, repo_id: &str) -> Result<ReviewConfig> {
-        if let Some(config) = self.get_for_repo(repo_id)? {
-            return Ok(config);
+    toml::from_str(&content).map_err(|e| {
+        ConductorError::Config(format!("Invalid TOML in {}: {e}", settings_path.display()))
+    })
+}
+
+/// Load all reviewer roles from `.conductor/reviewers/*.md`.
+///
+/// Checks `worktree_path` first (supports developing/testing reviewer files in a
+/// branch before merging), then falls back to `repo_path` (the main checkout).
+///
+/// Returns an error with a helpful message if neither location has the directory.
+///
+/// # Trust model
+///
+/// Reviewer files are treated as trusted repository content. This tool is
+/// designed for single-owner or small-team repos where all contributors with
+/// push access are trusted. In that context, a PR author may include
+/// `.conductor/reviewers/*.md` changes in their branch, and those changes will
+/// be used when reviewing that PR — intentionally, so that reviewer roles can be
+/// developed and tested in-branch before being merged.
+///
+/// If you run this against repos with untrusted external contributors, be aware
+/// that a PR author could modify reviewer system prompts for their own PR. In
+/// that environment, either restrict the review swarm to protected branches or
+/// remove the worktree-first lookup so only the main-branch reviewers are used.
+pub fn load_reviewer_roles(worktree_path: &str, repo_path: &str) -> Result<Vec<ReviewerRole>> {
+    // Prefer the worktree so new/modified reviewer files can be tested in-branch.
+    // Fall back to the main repo checkout when the worktree doesn't have them.
+    let worktree_dir = PathBuf::from(worktree_path)
+        .join(".conductor")
+        .join("reviewers");
+    let reviewers_dir = if worktree_dir.is_dir() {
+        worktree_dir
+    } else {
+        let repo_dir = PathBuf::from(repo_path)
+            .join(".conductor")
+            .join("reviewers");
+        if !repo_dir.is_dir() {
+            return Err(ConductorError::Config(format!(
+                "No .conductor/reviewers/ directory found in {} or {}. \
+                 Create it and add reviewer role .md files. {REVIEWER_HINT}",
+                worktree_path, repo_path
+            )));
         }
-        let now = Utc::now().to_rfc3339();
-        Ok(ReviewConfig {
-            id: String::new(),
-            repo_id: repo_id.to_string(),
-            roles: default_reviewer_roles(),
-            post_to_pr: true,
-            auto_merge: true,
-            created_at: now.clone(),
-            updated_at: now,
-        })
+        repo_dir
+    };
+
+    let mut roles: Vec<ReviewerRole> = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&reviewers_dir)
+        .map_err(|e| {
+            ConductorError::Config(format!("Failed to read {}: {e}", reviewers_dir.display()))
+        })?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .collect();
+
+    // Sort by filename for deterministic ordering
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        roles.push(parse_reviewer_file(&entry.path())?);
     }
 
-    /// Create or update the review config for a repo.
-    pub fn upsert(
-        &self,
-        repo_id: &str,
-        roles: &[ReviewerRole],
-        post_to_pr: bool,
-        auto_merge: bool,
-    ) -> Result<ReviewConfig> {
-        let now = Utc::now().to_rfc3339();
-        let roles_json = serde_json::to_string(roles)
-            .map_err(|e| crate::error::ConductorError::Config(e.to_string()))?;
-
-        let existing = self.get_for_repo(repo_id)?;
-        let id = existing
-            .map(|c| c.id)
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
-
-        self.conn.execute(
-            "INSERT INTO review_configs (id, repo_id, roles_json, post_to_pr, auto_merge, \
-             created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-             ON CONFLICT(repo_id) DO UPDATE SET
-                roles_json = excluded.roles_json,
-                post_to_pr = excluded.post_to_pr,
-                auto_merge = excluded.auto_merge,
-                updated_at = excluded.updated_at",
-            params![id, repo_id, roles_json, post_to_pr, auto_merge, now],
-        )?;
-
-        Ok(ReviewConfig {
-            id,
-            repo_id: repo_id.to_string(),
-            roles: roles.to_vec(),
-            post_to_pr,
-            auto_merge,
-            created_at: now.clone(),
-            updated_at: now,
-        })
+    if roles.is_empty() {
+        return Err(ConductorError::Config(format!(
+            "No .md files found in {}. Add reviewer role files. {REVIEWER_HINT}",
+            reviewers_dir.display()
+        )));
     }
 
-    /// Delete the review config for a repo.
-    pub fn delete_for_repo(&self, repo_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM review_configs WHERE repo_id = ?1",
-            params![repo_id],
-        )?;
-        Ok(())
-    }
+    Ok(roles)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
-    use tempfile::NamedTempFile;
+    use std::fs;
+    use tempfile::TempDir;
 
-    fn setup() -> (Connection, String) {
-        let tmp = NamedTempFile::new().unwrap();
-        let conn = db::open_database(tmp.path()).unwrap();
-        let repo_id = ulid::Ulid::new().to_string();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO repos (id, slug, local_path, remote_url, default_branch, workspace_dir, created_at)
-             VALUES (?1, 'test-repo', '/tmp/test', 'https://github.com/test/repo', 'main', '/tmp/ws', ?2)",
-            params![repo_id, now],
+    fn write_reviewer_file(dir: &Path, name: &str, content: &str) {
+        let reviewers_dir = dir.join(".conductor").join("reviewers");
+        fs::create_dir_all(&reviewers_dir).unwrap();
+        fs::write(reviewers_dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn test_parse_frontmatter_basic() {
+        let content = "---\nname: security\nrequired: true\n---\nYou are a security reviewer.";
+        let (yaml, body) = parse_frontmatter(content).unwrap();
+        assert!(yaml.contains("name: security"));
+        assert_eq!(body, "You are a security reviewer.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_no_opening() {
+        assert!(parse_frontmatter("no frontmatter here").is_none());
+    }
+
+    #[test]
+    fn test_parse_frontmatter_no_closing() {
+        assert!(parse_frontmatter("---\nname: test\nno closing").is_none());
+    }
+
+    #[test]
+    fn test_parse_reviewer_file() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("security.md");
+        fs::write(
+            &file_path,
+            "---\nname: security\ndescription: Input validation, auth gaps\nrequired: true\n---\nYou are a security reviewer.\nFocus on injection risks.",
         ).unwrap();
-        (conn, repo_id)
-    }
 
-    #[test]
-    fn test_default_reviewer_roles() {
-        let roles = default_reviewer_roles();
-        assert_eq!(roles.len(), 4);
-        assert_eq!(roles[0].name, "architecture");
-        assert!(roles[0].required);
-        assert_eq!(roles[1].name, "dry-abstraction");
-        assert!(!roles[1].required);
-        assert_eq!(roles[2].name, "security");
-        assert!(roles[2].required);
-        assert_eq!(roles[3].name, "performance");
-        assert!(!roles[3].required);
-    }
-
-    #[test]
-    fn test_get_or_default_without_config() {
-        let (conn, repo_id) = setup();
-        let mgr = ReviewConfigManager::new(&conn);
-        let config = mgr.get_or_default(&repo_id).unwrap();
-        assert_eq!(config.roles.len(), 4);
-        assert!(config.post_to_pr);
-        assert!(config.auto_merge);
-    }
-
-    #[test]
-    fn test_upsert_and_get() {
-        let (conn, repo_id) = setup();
-        let mgr = ReviewConfigManager::new(&conn);
-
-        let roles = vec![ReviewerRole {
-            name: "security".to_string(),
-            focus: "Security review".to_string(),
-            system_prompt: "Review for security".to_string(),
-            required: true,
-        }];
-
-        let config = mgr.upsert(&repo_id, &roles, false, true).unwrap();
-        assert_eq!(config.roles.len(), 1);
-        assert!(!config.post_to_pr);
-        assert!(config.auto_merge);
-
-        let fetched = mgr.get_for_repo(&repo_id).unwrap().unwrap();
-        assert_eq!(fetched.roles.len(), 1);
-        assert_eq!(fetched.roles[0].name, "security");
-    }
-
-    #[test]
-    fn test_upsert_overwrites() {
-        let (conn, repo_id) = setup();
-        let mgr = ReviewConfigManager::new(&conn);
-
-        let roles1 = vec![ReviewerRole {
-            name: "a".to_string(),
-            focus: "A".to_string(),
-            system_prompt: "A".to_string(),
-            required: true,
-        }];
-        mgr.upsert(&repo_id, &roles1, true, true).unwrap();
-
-        let roles2 = vec![
-            ReviewerRole {
-                name: "b".to_string(),
-                focus: "B".to_string(),
-                system_prompt: "B".to_string(),
-                required: false,
-            },
-            ReviewerRole {
-                name: "c".to_string(),
-                focus: "C".to_string(),
-                system_prompt: "C".to_string(),
-                required: true,
-            },
-        ];
-        mgr.upsert(&repo_id, &roles2, false, false).unwrap();
-
-        let config = mgr.get_for_repo(&repo_id).unwrap().unwrap();
-        assert_eq!(config.roles.len(), 2);
-        assert!(!config.post_to_pr);
-        assert!(!config.auto_merge);
-    }
-
-    #[test]
-    fn test_delete_for_repo() {
-        let (conn, repo_id) = setup();
-        let mgr = ReviewConfigManager::new(&conn);
-
-        let roles = default_reviewer_roles();
-        mgr.upsert(&repo_id, &roles, true, true).unwrap();
-        assert!(mgr.get_for_repo(&repo_id).unwrap().is_some());
-
-        mgr.delete_for_repo(&repo_id).unwrap();
-        assert!(mgr.get_for_repo(&repo_id).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_reviewer_role_serialization() {
-        let role = ReviewerRole {
-            name: "test".to_string(),
-            focus: "Testing".to_string(),
-            system_prompt: "Review tests".to_string(),
-            required: false,
-        };
-        let json = serde_json::to_string(&role).unwrap();
-        let deserialized: ReviewerRole = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.name, "test");
-        assert!(!deserialized.required);
-    }
-
-    #[test]
-    fn test_reviewer_role_default_required() {
-        let json = r#"{"name":"x","focus":"X","system_prompt":"X"}"#;
-        let role: ReviewerRole = serde_json::from_str(json).unwrap();
+        let role = parse_reviewer_file(&file_path).unwrap();
+        assert_eq!(role.name, "security");
+        assert_eq!(role.focus, "Input validation, auth gaps");
         assert!(role.required);
+        assert!(role.system_prompt.contains("security reviewer"));
+        assert!(role.system_prompt.contains("injection risks"));
+    }
+
+    #[test]
+    fn test_parse_reviewer_file_defaults_name_to_stem() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("my-reviewer.md");
+        fs::write(&file_path, "---\nrequired: false\n---\nReview the code.").unwrap();
+
+        let role = parse_reviewer_file(&file_path).unwrap();
+        assert_eq!(role.name, "my-reviewer");
+        assert!(!role.required);
+    }
+
+    #[test]
+    fn test_parse_reviewer_file_default_required_true() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("test.md");
+        fs::write(&file_path, "---\nname: test\n---\nReview.").unwrap();
+
+        let role = parse_reviewer_file(&file_path).unwrap();
+        assert!(role.required);
+    }
+
+    #[test]
+    fn test_load_reviewer_roles_from_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        write_reviewer_file(
+            tmp.path(),
+            "architecture.md",
+            "---\nname: architecture\ndescription: Design review\nrequired: true\n---\nYou are an architect.",
+        );
+        write_reviewer_file(
+            tmp.path(),
+            "security.md",
+            "---\nname: security\ndescription: Security review\nrequired: false\n---\nYou review security.",
+        );
+
+        // Worktree has reviewers — should use those regardless of repo
+        let roles =
+            load_reviewer_roles(tmp.path().to_str().unwrap(), repo.path().to_str().unwrap())
+                .unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].name, "architecture");
+        assert_eq!(roles[1].name, "security");
+    }
+
+    #[test]
+    fn test_load_reviewer_roles_falls_back_to_repo() {
+        let worktree = TempDir::new().unwrap(); // no .conductor/reviewers/
+        let repo = TempDir::new().unwrap();
+        write_reviewer_file(
+            repo.path(),
+            "security.md",
+            "---\nname: security\ndescription: Security review\nrequired: true\n---\nYou review security.",
+        );
+
+        // Worktree has no reviewers — should fall back to repo
+        let roles = load_reviewer_roles(
+            worktree.path().to_str().unwrap(),
+            repo.path().to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].name, "security");
+    }
+
+    #[test]
+    fn test_load_reviewer_roles_no_directory() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let result = load_reviewer_roles(
+            worktree.path().to_str().unwrap(),
+            repo.path().to_str().unwrap(),
+        );
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("No .conductor/reviewers/ directory"));
+        assert!(err.contains("conductor-ai"));
+    }
+
+    #[test]
+    fn test_load_reviewer_roles_empty_directory() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        // Put the empty dir in the worktree — it will be found and then error on no .md files
+        fs::create_dir_all(worktree.path().join(".conductor").join("reviewers")).unwrap();
+        let result = load_reviewer_roles(
+            worktree.path().to_str().unwrap(),
+            repo.path().to_str().unwrap(),
+        );
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("No .md files"));
+    }
+
+    #[test]
+    fn test_load_reviewer_roles_ignores_non_md_files() {
+        let tmp = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let reviewers_dir = tmp.path().join(".conductor").join("reviewers");
+        fs::create_dir_all(&reviewers_dir).unwrap();
+        fs::write(
+            reviewers_dir.join("security.md"),
+            "---\nname: security\n---\nReview.",
+        )
+        .unwrap();
+        fs::write(reviewers_dir.join("README.txt"), "not a reviewer").unwrap();
+
+        let roles =
+            load_reviewer_roles(tmp.path().to_str().unwrap(), repo.path().to_str().unwrap())
+                .unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].name, "security");
+    }
+
+    #[test]
+    fn test_load_review_settings_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let settings = load_review_settings(tmp.path().to_str().unwrap()).unwrap();
+        assert!(settings.post_to_pr);
+        assert!(settings.auto_merge);
+    }
+
+    #[test]
+    fn test_load_review_settings_from_file() {
+        let tmp = TempDir::new().unwrap();
+        let conductor_dir = tmp.path().join(".conductor");
+        fs::create_dir_all(&conductor_dir).unwrap();
+        fs::write(
+            conductor_dir.join("review.toml"),
+            "post_to_pr = false\nauto_merge = false\n",
+        )
+        .unwrap();
+
+        let settings = load_review_settings(tmp.path().to_str().unwrap()).unwrap();
+        assert!(!settings.post_to_pr);
+        assert!(!settings.auto_merge);
+    }
+
+    #[test]
+    fn test_load_review_settings_partial() {
+        let tmp = TempDir::new().unwrap();
+        let conductor_dir = tmp.path().join(".conductor");
+        fs::create_dir_all(&conductor_dir).unwrap();
+        fs::write(conductor_dir.join("review.toml"), "auto_merge = false\n").unwrap();
+
+        let settings = load_review_settings(tmp.path().to_str().unwrap()).unwrap();
+        assert!(settings.post_to_pr); // default
+        assert!(!settings.auto_merge);
+    }
+
+    #[test]
+    fn test_frontmatter_with_all_fields() {
+        let content = "---\n\
+            name: security\n\
+            description: Input validation, auth gaps, injection risks\n\
+            model: opus\n\
+            required: true\n\
+            color: red\n\
+            source: github:LivelyVideo/claude-plugin-marketplace/plugins/base-agents/agents/security.md\n\
+            ---\n\
+            You are a security reviewer.";
+        let (yaml, body) = parse_frontmatter(content).unwrap();
+
+        let fm: ReviewerFrontmatter = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(fm.name.unwrap(), "security");
+        assert_eq!(
+            fm.description.unwrap(),
+            "Input validation, auth gaps, injection risks"
+        );
+        assert_eq!(fm.model.unwrap(), "opus");
+        assert!(fm.required);
+        assert_eq!(fm.color.unwrap(), "red");
+        assert!(fm.source.unwrap().contains("claude-plugin-marketplace"));
+        assert_eq!(body, "You are a security reviewer.");
     }
 }
