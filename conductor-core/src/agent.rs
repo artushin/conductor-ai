@@ -14,6 +14,34 @@ use crate::error::Result;
 /// import it upward, keeping the dependency flow unidirectional.
 pub const PR_REVIEW_SWARM_PROMPT_PREFIX: &str = "PR review swarm";
 
+/// Protocol marker that agents emit to request human feedback.
+pub const FEEDBACK_MARKER: &str = "[NEEDS_FEEDBACK] ";
+
+/// If `text` is a feedback request line, return the prompt portion.
+pub fn parse_feedback_marker(text: &str) -> Option<&str> {
+    text.strip_prefix(FEEDBACK_MARKER)
+}
+
+/// Maximum allowed length (in bytes) for feedback prompts and responses.
+const FEEDBACK_MAX_LEN: usize = 10_240; // 10 KB
+
+/// Truncate a string to at most `max_bytes` bytes, ensuring the cut falls on a
+/// valid UTF-8 character boundary (avoids panics on multi-byte characters).
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Shared SELECT column list for the `feedback_requests` table.
+const FEEDBACK_SELECT: &str =
+    "SELECT id, run_id, prompt, response, status, created_at, responded_at FROM feedback_requests";
+
 /// A single step in an agent's two-phase execution plan.
 /// Stored as individual records in the `agent_run_steps` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +107,11 @@ pub struct AgentRun {
 }
 
 impl AgentRun {
+    /// Returns true if this run is currently active (running or waiting for feedback).
+    pub fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "running" | "waiting_for_feedback")
+    }
+
     /// Returns true if this run ended (failed/cancelled) with incomplete plan steps
     /// and has a session_id available for resume.
     pub fn needs_resume(&self) -> bool {
@@ -352,6 +385,22 @@ pub struct AgentCreatedIssue {
     pub title: String,
     pub url: String,
     pub created_at: String,
+}
+
+/// A human-in-the-loop feedback request created by an agent run.
+/// The agent pauses execution and waits for the user to respond.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackRequest {
+    pub id: String,
+    pub run_id: String,
+    /// The question or context the agent is asking about.
+    pub prompt: String,
+    /// The user's response (populated when status changes to "responded").
+    pub response: Option<String>,
+    /// One of: pending, responded, dismissed.
+    pub status: String,
+    pub created_at: String,
+    pub responded_at: Option<String>,
 }
 
 /// Aggregated agent stats for a ticket (across all linked worktrees).
@@ -1055,19 +1104,155 @@ impl<'a> AgentManager<'a> {
         )?;
         Ok(row)
     }
+
+    // ── Feedback requests (human-in-the-loop) ────────────────────────
+
+    /// Transition a run to "waiting_for_feedback" and create a feedback request.
+    pub fn request_feedback(&self, run_id: &str, prompt: &str) -> Result<FeedbackRequest> {
+        let prompt = truncate_utf8(prompt, FEEDBACK_MAX_LEN);
+        let id = ulid::Ulid::new().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        // Update run status
+        self.conn.execute(
+            "UPDATE agent_runs SET status = 'waiting_for_feedback' WHERE id = ?1",
+            params![run_id],
+        )?;
+
+        let req = FeedbackRequest {
+            id: id.clone(),
+            run_id: run_id.to_string(),
+            prompt: prompt.to_string(),
+            response: None,
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            responded_at: None,
+        };
+
+        self.conn.execute(
+            "INSERT INTO feedback_requests (id, run_id, prompt, status, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![req.id, req.run_id, req.prompt, req.status, req.created_at],
+        )?;
+
+        Ok(req)
+    }
+
+    /// Submit a response to a pending feedback request and resume the run.
+    pub fn submit_feedback(&self, feedback_id: &str, response: &str) -> Result<FeedbackRequest> {
+        let response = truncate_utf8(response, FEEDBACK_MAX_LEN);
+        let now = Utc::now().to_rfc3339();
+
+        // Update feedback request
+        self.conn.execute(
+            "UPDATE feedback_requests SET status = 'responded', response = ?1, responded_at = ?2 \
+             WHERE id = ?3 AND status = 'pending'",
+            params![response, now, feedback_id],
+        )?;
+
+        self.resume_run_after_feedback(feedback_id)?;
+
+        // Return updated feedback request
+        let req = self.conn.query_row(
+            &format!("{FEEDBACK_SELECT} WHERE id = ?1"),
+            params![feedback_id],
+            row_to_feedback_request,
+        )?;
+
+        Ok(req)
+    }
+
+    /// Dismiss a pending feedback request without responding; resume the run.
+    pub fn dismiss_feedback(&self, feedback_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "UPDATE feedback_requests SET status = 'dismissed', responded_at = ?1 \
+             WHERE id = ?2 AND status = 'pending'",
+            params![now, feedback_id],
+        )?;
+
+        self.resume_run_after_feedback(feedback_id)?;
+
+        Ok(())
+    }
+
+    /// Transition a run back to "running" after feedback is resolved.
+    fn resume_run_after_feedback(&self, feedback_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_runs SET status = 'running' \
+             WHERE id = (SELECT run_id FROM feedback_requests WHERE id = ?1) \
+             AND status = 'waiting_for_feedback'",
+            params![feedback_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get the pending feedback request for a run (if any).
+    pub fn pending_feedback_for_run(&self, run_id: &str) -> Result<Option<FeedbackRequest>> {
+        let result = self.conn.query_row(
+            &format!(
+                "{FEEDBACK_SELECT} WHERE run_id = ?1 AND status = 'pending' \
+                 ORDER BY created_at DESC LIMIT 1"
+            ),
+            params![run_id],
+            row_to_feedback_request,
+        );
+
+        optional_row(result)
+    }
+
+    /// Get a feedback request by ID.
+    pub fn get_feedback(&self, feedback_id: &str) -> Result<Option<FeedbackRequest>> {
+        let result = self.conn.query_row(
+            &format!("{FEEDBACK_SELECT} WHERE id = ?1"),
+            params![feedback_id],
+            row_to_feedback_request,
+        );
+
+        optional_row(result)
+    }
+
+    /// List all feedback requests for a run, newest first.
+    pub fn list_feedback_for_run(&self, run_id: &str) -> Result<Vec<FeedbackRequest>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{FEEDBACK_SELECT} WHERE run_id = ?1 ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map(params![run_id], row_to_feedback_request)?;
+        let reqs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(reqs)
+    }
+
+    /// Get the pending feedback request for a worktree's latest running agent.
+    pub fn pending_feedback_for_worktree(
+        &self,
+        worktree_id: &str,
+    ) -> Result<Option<FeedbackRequest>> {
+        let result = self.conn.query_row(
+            &format!(
+                "{FEEDBACK_SELECT} WHERE run_id IN \
+                 (SELECT id FROM agent_runs WHERE worktree_id = ?1) \
+                 AND status = 'pending' ORDER BY created_at DESC LIMIT 1"
+            ),
+            params![worktree_id],
+            row_to_feedback_request,
+        );
+
+        optional_row(result)
+    }
 }
 
 /// Build a startup context block to prepend to the agent prompt.
 ///
 /// Pulls worktree info, linked ticket, prior run plans, recent commits,
-/// and prior run summaries from the database. Returns `None` if there is
-/// no useful context to inject (e.g. first run with no linked ticket).
+/// and prior run summaries from the database. Always includes the feedback
+/// protocol so agents know how to request human input mid-run.
 pub fn build_startup_context(
     conn: &Connection,
     worktree_id: &str,
     current_run_id: &str,
     worktree_path: &str,
-) -> Option<String> {
+) -> String {
     let mut sections = Vec::new();
 
     // 1. Worktree branch
@@ -1163,11 +1348,38 @@ pub fn build_startup_context(
         }
     }
 
-    if sections.is_empty() {
-        return None;
-    }
+    // Always include the feedback protocol so agents know how to request input.
+    sections.push(
+        "**Feedback protocol:** If you need human input to continue (e.g. a decision, \
+         clarification, or approval), output `[NEEDS_FEEDBACK] <your question>` as a \
+         standalone line. The conductor will pause your run and surface the question to \
+         the user. When they respond, your run will resume with their answer."
+            .to_string(),
+    );
 
-    Some(format!("## Session Context\n\n{}", sections.join("\n\n")))
+    format!("## Session Context\n\n{}", sections.join("\n\n"))
+}
+
+/// Convert a `rusqlite::Result<T>` into `Result<Option<T>>`, treating
+/// `QueryReturnedNoRows` as `Ok(None)`.
+fn optional_row<T>(result: rusqlite::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(val) => Ok(Some(val)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn row_to_feedback_request(row: &rusqlite::Row) -> rusqlite::Result<FeedbackRequest> {
+    Ok(FeedbackRequest {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        prompt: row.get(2)?,
+        response: row.get(3)?,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        responded_at: row.get(6)?,
+    })
 }
 
 fn row_to_agent_run_event(row: &rusqlite::Row) -> rusqlite::Result<AgentRunEvent> {
@@ -2097,7 +2309,7 @@ mod tests {
     // --- build_startup_context tests ---
 
     #[test]
-    fn test_startup_context_returns_none_when_no_useful_data() {
+    fn test_startup_context_always_includes_feedback_protocol() {
         let conn = setup_db();
         let mgr = AgentManager::new(&conn);
 
@@ -2105,12 +2317,10 @@ mod tests {
         let current = mgr.create_run("w1", "Do stuff", None, None).unwrap();
 
         // worktree_path is /tmp which has no git repo → commits section will be empty
-        // but the branch is still known from the DB
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
-        // Should have at least the worktree branch
-        assert!(ctx.is_some());
-        let text = ctx.unwrap();
+        let text = build_startup_context(&conn, "w1", &current.id, "/tmp");
         assert!(text.contains("**Worktree:** feat/test"));
+        assert!(text.contains("**Feedback protocol:**"));
+        assert!(text.contains("[NEEDS_FEEDBACK]"));
         // No ticket, no prior runs
         assert!(!text.contains("**Ticket:**"));
         assert!(!text.contains("**Plan steps"));
@@ -2133,7 +2343,7 @@ mod tests {
         let mgr = AgentManager::new(&conn);
         let current = mgr.create_run("w1", "Fix it", None, None).unwrap();
 
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp").unwrap();
+        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
         assert!(ctx.contains("**Ticket:** #42 — Fix payment bug"));
     }
 
@@ -2169,7 +2379,7 @@ mod tests {
         // Create current run
         let current = mgr.create_run("w1", "Continue work", None, None).unwrap();
 
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp").unwrap();
+        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
         assert!(ctx.contains("**Plan steps (from prior run):**"));
         assert!(ctx.contains("1. ✅ Read the code"));
         assert!(ctx.contains("2. ✅ Write tests"));
@@ -2196,7 +2406,7 @@ mod tests {
         // Create current run
         let current = mgr.create_run("w1", "Next task", None, None).unwrap();
 
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp").unwrap();
+        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
         assert!(ctx.contains("**Prior run outcome (completed):**"));
         assert!(ctx.contains("Successfully implemented the payment module"));
     }
@@ -2209,7 +2419,7 @@ mod tests {
         // Only the current run exists (no prior runs)
         let current = mgr.create_run("w1", "My prompt", None, None).unwrap();
 
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp").unwrap();
+        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
         // Should NOT include any prior run info
         assert!(!ctx.contains("**Plan steps"));
         assert!(!ctx.contains("**Prior run outcome"));
@@ -2228,7 +2438,7 @@ mod tests {
 
         let current = mgr.create_run("w1", "Next", None, None).unwrap();
 
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp").unwrap();
+        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
         assert!(ctx.contains("**Prior run outcome (completed):**"));
         // Should be truncated to 500 chars + ellipsis
         assert!(ctx.contains(&"x".repeat(500)));
@@ -2249,7 +2459,7 @@ mod tests {
 
         let current = mgr.create_run("w1", "Next", None, None).unwrap();
 
-        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp").unwrap();
+        let ctx = build_startup_context(&conn, "w1", &current.id, "/tmp");
         assert!(ctx.contains('…'));
         // Extract the truncated 'é' portion before the ellipsis
         let ellipsis_pos = ctx.find('…').unwrap();
@@ -2593,5 +2803,155 @@ mod tests {
         // Only 1 phase (the parent), but it should aggregate the child's cost
         assert_eq!(phases.len(), 1);
         assert!((phases[0].cost_usd - 0.015).abs() < 1e-6);
+    }
+
+    // ── Feedback request tests ───────────────────────────────────────
+
+    #[test]
+    fn test_request_feedback() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+        assert_eq!(run.status, "running");
+
+        let fb = mgr
+            .request_feedback(&run.id, "Should I refactor this module?")
+            .unwrap();
+        assert_eq!(fb.run_id, run.id);
+        assert_eq!(fb.prompt, "Should I refactor this module?");
+        assert_eq!(fb.status, "pending");
+        assert!(fb.response.is_none());
+        assert!(fb.responded_at.is_none());
+
+        // Run status should be waiting_for_feedback
+        let fetched_run = mgr.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched_run.status, "waiting_for_feedback");
+    }
+
+    #[test]
+    fn test_submit_feedback() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+        let fb = mgr
+            .request_feedback(&run.id, "Proceed with refactor?")
+            .unwrap();
+
+        let updated = mgr.submit_feedback(&fb.id, "Yes, go ahead").unwrap();
+        assert_eq!(updated.status, "responded");
+        assert_eq!(updated.response.as_deref(), Some("Yes, go ahead"));
+        assert!(updated.responded_at.is_some());
+
+        // Run should be back to running
+        let fetched_run = mgr.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched_run.status, "running");
+    }
+
+    #[test]
+    fn test_dismiss_feedback() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+        let fb = mgr.request_feedback(&run.id, "Need approval").unwrap();
+
+        mgr.dismiss_feedback(&fb.id).unwrap();
+
+        // Feedback should be dismissed
+        let fetched_fb = mgr.get_feedback(&fb.id).unwrap().unwrap();
+        assert_eq!(fetched_fb.status, "dismissed");
+
+        // Run should be back to running
+        let fetched_run = mgr.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched_run.status, "running");
+    }
+
+    #[test]
+    fn test_pending_feedback_for_run() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+
+        // No pending feedback yet
+        assert!(mgr.pending_feedback_for_run(&run.id).unwrap().is_none());
+
+        // Create a feedback request
+        let fb = mgr.request_feedback(&run.id, "Need input").unwrap();
+        let pending = mgr.pending_feedback_for_run(&run.id).unwrap().unwrap();
+        assert_eq!(pending.id, fb.id);
+
+        // After submitting, no more pending
+        mgr.submit_feedback(&fb.id, "Done").unwrap();
+        assert!(mgr.pending_feedback_for_run(&run.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_pending_feedback_for_worktree() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+
+        // No pending feedback
+        assert!(mgr.pending_feedback_for_worktree("w1").unwrap().is_none());
+
+        let fb = mgr.request_feedback(&run.id, "Approve this?").unwrap();
+        let pending = mgr.pending_feedback_for_worktree("w1").unwrap().unwrap();
+        assert_eq!(pending.id, fb.id);
+
+        // Different worktree should have no pending feedback
+        assert!(mgr.pending_feedback_for_worktree("w2").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_feedback_for_run() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+
+        // Create first feedback, respond to it
+        let fb1 = mgr.request_feedback(&run.id, "Question 1").unwrap();
+        mgr.submit_feedback(&fb1.id, "Answer 1").unwrap();
+
+        // Create second feedback (still pending)
+        let fb2 = mgr.request_feedback(&run.id, "Question 2").unwrap();
+
+        let all = mgr.list_feedback_for_run(&run.id).unwrap();
+        assert_eq!(all.len(), 2);
+        // Newest first
+        assert_eq!(all[0].prompt, "Question 2");
+        assert_eq!(all[0].status, "pending");
+        assert_eq!(all[1].prompt, "Question 1");
+        assert_eq!(all[1].status, "responded");
+
+        // Different run should have no feedback
+        let run2 = mgr.create_run("w2", "Other task", None, None).unwrap();
+        assert!(mgr.list_feedback_for_run(&run2.id).unwrap().is_empty());
+
+        // Clean up: dismiss fb2 so run goes back to running
+        mgr.dismiss_feedback(&fb2.id).unwrap();
+    }
+
+    #[test]
+    fn test_feedback_cascade_delete_on_run_removal() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let run = mgr.create_run("w1", "Fix the bug", None, None).unwrap();
+        let fb = mgr.request_feedback(&run.id, "Approve?").unwrap();
+
+        // Delete the run
+        conn.execute(
+            "DELETE FROM agent_runs WHERE id = ?1",
+            rusqlite::params![run.id],
+        )
+        .unwrap();
+
+        // Feedback should be cascade-deleted
+        assert!(mgr.get_feedback(&fb.id).unwrap().is_none());
     }
 }

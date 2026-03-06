@@ -100,6 +100,8 @@ pub enum Action {
     ExpandAgentEvent,
     AgentActivityDown,
     AgentActivityUp,
+    SubmitFeedback,
+    DismissFeedback,
     ScrollLeft,
     ScrollRight,
 

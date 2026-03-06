@@ -1,13 +1,7 @@
 import type { AgentRun } from "../../api/types";
+import { isActiveRun, statusColors, statusLabels } from "../../utils/agentStats";
 import { TimeAgo } from "../shared/TimeAgo";
 import { ChildRunsList } from "./ChildRunsList";
-
-const statusColors: Record<string, string> = {
-  running: "bg-yellow-100 text-yellow-700",
-  completed: "bg-green-100 text-green-700",
-  failed: "bg-red-100 text-red-700",
-  cancelled: "bg-gray-100 text-gray-600",
-};
 
 function formatDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);
@@ -51,14 +45,16 @@ export function AgentStatusDisplay({
   );
 
   // Include in-progress run's turns in the total
-  const displayCost =
-    run.status === "running" ? totalCost + (run.cost_usd ?? 0) : totalCost;
-  const displayTurns =
-    run.status === "running" ? totalTurns + (run.num_turns ?? 0) : totalTurns;
-  const displayDuration =
-    run.status === "running"
-      ? totalDurationMs + (run.duration_ms ?? 0)
-      : totalDurationMs;
+  const isActive = isActiveRun(run);
+  const displayCost = isActive
+    ? totalCost + (run.cost_usd ?? 0)
+    : totalCost;
+  const displayTurns = isActive
+    ? totalTurns + (run.num_turns ?? 0)
+    : totalTurns;
+  const displayDuration = isActive
+    ? totalDurationMs + (run.duration_ms ?? 0)
+    : totalDurationMs;
 
   // If the latest run has child runs, compute aggregated (parent + children) totals
   const childCost = hasChildren
@@ -85,10 +81,13 @@ export function AgentStatusDisplay({
           <span
             className={`inline-block px-2 py-0.5 text-xs font-medium rounded-full ${color}`}
           >
-            {run.status}
+            {statusLabels[run.status] ?? run.status}
           </span>
           {run.status === "running" && (
             <span className="inline-block w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />
+          )}
+          {run.status === "waiting_for_feedback" && (
+            <span className="inline-block w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
           )}
           {hasChildren && (
             <span className="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-indigo-100 text-indigo-700">
@@ -97,7 +96,7 @@ export function AgentStatusDisplay({
           )}
         </div>
         <div className="flex gap-2">
-          {run.status === "running" ? (
+          {isActive ? (
             <button
               onClick={onStop}
               className="px-3 py-1.5 text-sm rounded-md border border-red-300 text-red-600 hover:bg-red-50"

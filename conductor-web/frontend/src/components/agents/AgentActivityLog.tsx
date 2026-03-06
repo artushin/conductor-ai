@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import type { AgentEvent, AgentRun } from "../../api/types";
+import { FEEDBACK_MARKER } from "../../utils/agentStats";
 
 const kindConfig: Record<
   string,
@@ -153,11 +154,14 @@ export function AgentActivityLog({ events, runs, isRunning }: AgentActivityLogPr
       prevKind !== null && prevKind !== event.kind && events[i - 1].run_id === event.run_id;
 
     const stepLabel = event.kind === "prompt" ? extractStepLabel(event.summary) : null;
-    const displayLabel = stepLabel ? "STEP" : cfg.label;
+    const isFeedback = event.summary.startsWith(FEEDBACK_MARKER);
+    const displayLabel = stepLabel ? "STEP" : isFeedback ? "WAIT" : cfg.label;
     const displayText = stepLabel ?? event.summary;
     const effectiveCfg = stepLabel
       ? { badge: "bg-fuchsia-900 text-fuchsia-300", text: "text-fuchsia-300", border: "border-l-fuchsia-500" }
-      : cfg;
+      : isFeedback
+        ? { badge: "bg-purple-900 text-purple-300", text: "text-purple-300", border: "border-l-purple-500" }
+        : cfg;
 
     elements.push(
       <div

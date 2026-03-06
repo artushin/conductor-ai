@@ -1220,13 +1220,9 @@ fn run_agent(
     // Build effective prompt with optional startup context
     let config = load_config().unwrap_or_default();
     let effective_prompt = if config.general.inject_startup_context {
-        match build_startup_context(conn, &run.worktree_id, run_id, worktree_path) {
-            Some(context) => {
-                eprintln!("[conductor] Injecting session context into prompt");
-                format!("{context}\n\n---\n\n{prompt}")
-            }
-            None => prompt.to_string(),
-        }
+        let context = build_startup_context(conn, &run.worktree_id, run_id, worktree_path);
+        eprintln!("[conductor] Injecting session context into prompt");
+        format!("{context}\n\n---\n\n{prompt}")
     } else {
         prompt.to_string()
     };
@@ -1403,6 +1399,44 @@ fn run_agent(
                         Ok(db_ev) => last_event_id = Some(db_ev.id),
                         Err(e) => eprintln!("[conductor] Warning: could not persist event: {e}"),
                     }
+
+                    // Detect feedback request markers in agent text output.
+                    if ev.kind == "text" {
+                        if let Some(feedback_prompt) =
+                            conductor_core::agent::parse_feedback_marker(&ev.summary)
+                        {
+                            eprintln!("[conductor] Agent requesting feedback: {feedback_prompt}");
+                            match mgr.request_feedback(run_id, feedback_prompt) {
+                                Ok(fb) => {
+                                    eprintln!(
+                                        "[conductor] Waiting for human feedback (id: {})...",
+                                        fb.id
+                                    );
+                                    // Poll for feedback response
+                                    if let Some(response) = wait_for_feedback_response(&mgr, &fb.id)
+                                    {
+                                        eprintln!("[conductor] Feedback received: {response}");
+                                        // Inject feedback as a user event
+                                        let fb_now = chrono::Utc::now().to_rfc3339();
+                                        let _ = mgr.create_event(
+                                            run_id,
+                                            "feedback",
+                                            &format!("Human feedback: {response}"),
+                                            &fb_now,
+                                            None,
+                                        );
+                                    } else {
+                                        eprintln!("[conductor] Feedback dismissed, continuing...");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[conductor] Warning: could not create feedback request: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1466,7 +1500,35 @@ fn run_agent(
     Ok(())
 }
 
+/// Poll the database for a feedback response. Returns the response text if responded,
+/// or None if dismissed. Polls every 2 seconds for up to 1 hour.
+fn wait_for_feedback_response(mgr: &AgentManager, feedback_id: &str) -> Option<String> {
+    let max_polls = 1800; // 2s * 1800 = 1 hour
+    for _ in 0..max_polls {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        match mgr.get_feedback(feedback_id) {
+            Ok(Some(fb)) => match fb.status.as_str() {
+                "responded" => return fb.response,
+                "dismissed" => return None,
+                _ => continue, // still pending
+            },
+            Ok(None) => return None, // feedback request deleted
+            Err(e) => {
+                eprintln!("[conductor] Warning: error polling feedback: {e}");
+                continue;
+            }
+        }
+    }
+
+    eprintln!("[conductor] Feedback request timed out after 1 hour");
+    None
+}
+
 /// Run the orchestration: generate a plan, then spawn child agents for each step.
+/// Note: feedback detection (`[NEEDS_FEEDBACK]`) is intentionally omitted here.
+/// The orchestrator manages a plan and spawns child `run_agent` invocations;
+/// each child has its own event loop that handles feedback markers.
 fn run_orchestrate(
     conn: &rusqlite::Connection,
     config: &conductor_core::config::Config,
@@ -1487,13 +1549,9 @@ fn run_orchestrate(
 
     // Build effective prompt with startup context
     let effective_prompt = if config.general.inject_startup_context {
-        match build_startup_context(conn, &run.worktree_id, run_id, worktree_path) {
-            Some(context) => {
-                eprintln!("[orchestrator] Injecting session context into prompt");
-                format!("{context}\n\n---\n\n{}", run.prompt)
-            }
-            None => run.prompt.clone(),
-        }
+        let context = build_startup_context(conn, &run.worktree_id, run_id, worktree_path);
+        eprintln!("[orchestrator] Injecting session context into prompt");
+        format!("{context}\n\n---\n\n{}", run.prompt)
     } else {
         run.prompt.clone()
     };

@@ -6,7 +6,7 @@ use ratatui::widgets::ListState;
 use ratatui::DefaultTerminal;
 use rusqlite::Connection;
 
-use conductor_core::agent::AgentManager;
+use conductor_core::agent::{AgentManager, FeedbackRequest};
 use conductor_core::config::{save_config, AutoStartAgent, Config, WorkTarget};
 use conductor_core::github;
 use conductor_core::issue_source::IssueSourceManager;
@@ -316,6 +316,8 @@ impl App {
             Action::LaunchAgent => self.handle_launch_agent(),
             Action::OrchestrateAgent => self.handle_orchestrate_agent(),
             Action::StopAgent => self.handle_stop_agent(),
+            Action::SubmitFeedback => self.handle_submit_feedback(),
+            Action::DismissFeedback => self.handle_dismiss_feedback(),
             Action::ViewAgentLog => self.handle_view_agent_log(),
             Action::CopyLastCodeBlock => self.handle_copy_last_code_block(),
             Action::ExpandAgentEvent => self.handle_expand_agent_event(),
@@ -422,6 +424,7 @@ impl App {
                 self.state.data.tickets = payload.tickets;
                 self.state.data.latest_agent_runs = payload.latest_agent_runs;
                 self.state.data.ticket_agent_totals = payload.ticket_agent_totals;
+                self.refresh_pending_feedback();
                 self.state.data.rebuild_maps();
                 self.reload_agent_events();
                 self.clamp_indices();
@@ -466,6 +469,9 @@ impl App {
         self.state.data.tickets = ticket_syncer.list(None).unwrap_or_default();
 
         self.state.data.latest_agent_runs = agent_mgr.latest_runs_by_worktree().unwrap_or_default();
+
+        self.refresh_pending_feedback();
+
         self.state.data.rebuild_maps();
         self.reload_agent_events();
         self.clamp_indices();
@@ -1436,6 +1442,25 @@ impl App {
                     }
                 }
                 let _ = repo_id;
+            }
+            InputAction::FeedbackResponse { feedback_id } => {
+                if value.is_empty() {
+                    return;
+                }
+                let mgr = AgentManager::new(&self.conn);
+                match mgr.submit_feedback(&feedback_id, &value) {
+                    Ok(_) => {
+                        self.state.status_message =
+                            Some("Feedback submitted — agent resumed".to_string());
+                        self.state.data.pending_feedback = None;
+                        self.refresh_data();
+                    }
+                    Err(e) => {
+                        self.state.modal = Modal::Error {
+                            message: format!("Failed to submit feedback: {e}"),
+                        };
+                    }
+                }
             }
         }
     }
@@ -2671,6 +2696,40 @@ impl App {
 
     // ── Agent handlers (tmux-based) ────────────────────────────────────
 
+    fn refresh_pending_feedback(&mut self) {
+        self.state.data.pending_feedback =
+            self.state.selected_worktree_id.as_ref().and_then(|wt_id| {
+                AgentManager::new(&self.conn)
+                    .pending_feedback_for_worktree(wt_id)
+                    .ok()
+                    .flatten()
+            });
+    }
+
+    /// Returns `true` (and sets a status message) if the worktree already has
+    /// an active agent, meaning the caller should abort.
+    fn agent_busy_guard(&mut self, worktree_id: &str) -> bool {
+        let status = self
+            .state
+            .data
+            .latest_agent_runs
+            .get(worktree_id)
+            .map(|run| run.status.as_str());
+        match status {
+            Some("running") => {
+                self.state.status_message =
+                    Some("Agent already running — press x to stop".to_string());
+                true
+            }
+            Some("waiting_for_feedback") => {
+                self.state.status_message =
+                    Some("Agent waiting for feedback — press f to respond".to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_launch_agent(&mut self) {
         let wt = self
             .state
@@ -2684,16 +2743,7 @@ impl App {
             return;
         };
 
-        // Check if there's already a running agent for this worktree
-        let has_running = self
-            .state
-            .data
-            .latest_agent_runs
-            .get(&wt.id)
-            .is_some_and(|run| run.status == "running");
-
-        if has_running {
-            self.state.status_message = Some("Agent already running — press x to stop".to_string());
+        if self.agent_busy_guard(&wt.id) {
             return;
         }
 
@@ -2758,7 +2808,7 @@ impl App {
             return;
         };
 
-        if run.status != "running" {
+        if !run.is_active() {
             return;
         }
 
@@ -2786,6 +2836,53 @@ impl App {
         self.refresh_data();
     }
 
+    fn require_pending_feedback(&mut self) -> Option<FeedbackRequest> {
+        match self.state.data.pending_feedback.clone() {
+            Some(fb) => Some(fb),
+            None => {
+                self.state.status_message = Some("No pending feedback request".to_string());
+                None
+            }
+        }
+    }
+
+    fn handle_submit_feedback(&mut self) {
+        let Some(fb) = self.require_pending_feedback() else {
+            return;
+        };
+
+        // Open a text area modal for the user to type their response
+        let mut textarea = tui_textarea::TextArea::default();
+        textarea.set_placeholder_text("Type your feedback response...");
+
+        self.state.modal = Modal::AgentPrompt {
+            title: format!("Agent Feedback: {}", &fb.prompt),
+            prompt: fb.prompt.clone(),
+            textarea: Box::new(textarea),
+            on_submit: InputAction::FeedbackResponse {
+                feedback_id: fb.id.clone(),
+            },
+        };
+    }
+
+    fn handle_dismiss_feedback(&mut self) {
+        let Some(fb) = self.require_pending_feedback() else {
+            return;
+        };
+
+        let mgr = AgentManager::new(&self.conn);
+        match mgr.dismiss_feedback(&fb.id) {
+            Ok(()) => {
+                self.state.status_message = Some("Feedback dismissed — agent resumed".to_string());
+                self.state.data.pending_feedback = None;
+                self.refresh_data();
+            }
+            Err(e) => {
+                self.state.status_message = Some(format!("Failed to dismiss feedback: {e}"));
+            }
+        }
+    }
+
     fn handle_orchestrate_agent(&mut self) {
         let wt = self
             .state
@@ -2799,16 +2896,7 @@ impl App {
             return;
         };
 
-        // Check if there's already a running agent for this worktree
-        let has_running = self
-            .state
-            .data
-            .latest_agent_runs
-            .get(&wt.id)
-            .is_some_and(|run| run.status == "running");
-
-        if has_running {
-            self.state.status_message = Some("Agent already running — press x to stop".to_string());
+        if self.agent_busy_guard(&wt.id) {
             return;
         }
 

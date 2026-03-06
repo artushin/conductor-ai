@@ -8,6 +8,7 @@ import { TimeAgo } from "../components/shared/TimeAgo";
 import { ConfirmDialog } from "../components/shared/ConfirmDialog";
 import { LoadingSpinner } from "../components/shared/LoadingSpinner";
 import { AgentPromptModal } from "../components/agents/AgentPromptModal";
+import { isActiveRun } from "../utils/agentStats";
 import { ModelPicker } from "../components/shared/ModelPicker";
 import { AgentStatusDisplay } from "../components/agents/AgentStatusDisplay";
 import { AgentActivityLog } from "../components/agents/AgentActivityLog";
@@ -72,6 +73,7 @@ export function WorktreeDetailPage() {
     : null;
 
   const isActive = worktree?.status === "active";
+  const isRunning = latestRun ? isActiveRun(latestRun) : false;
 
   // Tickets available for linking: same repo, not already linked to this worktree
   const availableTickets = tickets?.filter(
@@ -113,12 +115,12 @@ export function WorktreeDetailPage() {
     refreshAgent();
   }, [refreshAgent]);
 
-  // Poll for updates when agent is running
+  // Poll for updates when agent is running or waiting for feedback
   useEffect(() => {
-    if (latestRun?.status !== "running") return;
+    if (!isRunning) return;
     const interval = setInterval(refreshAgent, 5000);
     return () => clearInterval(interval);
-  }, [latestRun?.status, refreshAgent]);
+  }, [isRunning, refreshAgent]);
 
   // SSE: auto-refresh worktrees, tickets, and agent data on relevant events
   const sseHandlers = useMemo(() => {
@@ -295,8 +297,6 @@ export function WorktreeDetailPage() {
       </div>
     );
   }
-
-  const isRunning = latestRun?.status === "running";
 
   return (
     <div className="space-y-6">
