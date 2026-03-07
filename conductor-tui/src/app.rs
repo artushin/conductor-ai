@@ -1,4 +1,6 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -73,6 +75,8 @@ pub struct App {
     conn: Connection,
     config: Config,
     bg_tx: Option<BackgroundSender>,
+    /// Guard to prevent multiple concurrent workflow poll threads.
+    workflow_poll_in_flight: Arc<AtomicBool>,
 }
 
 impl App {
@@ -82,6 +86,7 @@ impl App {
             conn,
             config,
             bg_tx: None,
+            workflow_poll_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -148,7 +153,13 @@ impl App {
         }
 
         match action {
-            Action::None | Action::Tick => {
+            Action::None => return false,
+            Action::Tick => {
+                // On workflow views, poll workflow data asynchronously
+                // to avoid blocking the main loop with FS + DB I/O.
+                if matches!(self.state.view, View::Workflows | View::WorkflowRunDetail) {
+                    self.poll_workflow_data_async();
+                }
                 return false;
             }
             Action::Quit => self.state.should_quit = true,
@@ -186,6 +197,25 @@ impl App {
             Action::GoToTickets => {
                 self.state.view = View::Tickets;
                 self.state.ticket_index = 0;
+            }
+            Action::GoToWorkflows => {
+                // Navigate to workflows view; need a worktree context
+                let wt_id = self
+                    .state
+                    .selected_worktree_id
+                    .clone()
+                    .or_else(|| self.state.selected_worktree().map(|w| w.id.clone()));
+                if let Some(wt_id) = wt_id {
+                    self.state.selected_worktree_id = Some(wt_id);
+                    self.state.view = View::Workflows;
+                    self.state.workflows_focus = crate::state::WorkflowsFocus::Defs;
+                    self.state.workflow_def_index = 0;
+                    self.state.workflow_run_index = 0;
+                    self.reload_workflow_data();
+                } else {
+                    self.state.status_message =
+                        Some("Select a worktree first to view workflows".to_string());
+                }
             }
 
             // Filter
@@ -414,6 +444,35 @@ impl App {
                 }
             }
 
+            // Workflow actions
+            Action::RunWorkflow => self.handle_run_workflow(),
+            Action::CancelWorkflow => self.handle_cancel_workflow(),
+            Action::ApproveGate => self.handle_approve_gate(),
+            Action::RejectGate => self.handle_reject_gate(),
+            Action::GateInputChar(c) => {
+                if let Modal::GateAction {
+                    ref mut feedback, ..
+                } = self.state.modal
+                {
+                    feedback.push(c);
+                }
+            }
+            Action::GateInputBackspace => {
+                if let Modal::GateAction {
+                    ref mut feedback, ..
+                } = self.state.modal
+                {
+                    feedback.pop();
+                }
+            }
+            Action::WorkflowDataRefreshed(payload) => {
+                self.state.data.workflow_defs = payload.workflow_defs;
+                self.state.data.workflow_runs = payload.workflow_runs;
+                self.state.data.workflow_steps = payload.workflow_steps;
+                self.clamp_workflow_indices();
+                return matches!(self.state.view, View::Workflows | View::WorkflowRunDetail);
+            }
+
             // PendingG is handled above before the match
             Action::PendingG => unreachable!(),
 
@@ -428,9 +487,12 @@ impl App {
                 self.state.data.rebuild_maps();
                 self.reload_agent_events();
                 self.clamp_indices();
-                // Redraw when viewing worktree detail so the activity pane
-                // updates live; other views refresh silently.
-                return self.state.view == View::WorktreeDetail;
+                // Redraw when viewing worktree detail / workflows so the
+                // activity pane updates live; other views refresh silently.
+                return matches!(
+                    self.state.view,
+                    View::WorktreeDetail | View::Workflows | View::WorkflowRunDetail
+                );
             }
             Action::TicketSyncComplete { repo_slug, count } => {
                 self.state.status_message = Some(format!("Synced {count} tickets for {repo_slug}"));
@@ -647,6 +709,20 @@ impl App {
             View::Tickets => {
                 self.state.view = View::Dashboard;
             }
+            View::Workflows => {
+                // Go back to worktree detail if we came from there
+                if self.state.selected_worktree_id.is_some() {
+                    self.state.view = View::WorktreeDetail;
+                    *self.state.agent_list_state.borrow_mut() = ListState::default();
+                    self.reload_agent_events();
+                } else {
+                    self.state.view = View::Dashboard;
+                }
+            }
+            View::WorkflowRunDetail => {
+                self.state.view = View::Workflows;
+                self.state.selected_workflow_run_id = None;
+            }
         }
     }
 
@@ -657,6 +733,9 @@ impl App {
             }
             View::RepoDetail => {
                 self.state.repo_detail_focus = self.state.repo_detail_focus.toggle();
+            }
+            View::Workflows => {
+                self.state.workflows_focus = self.state.workflows_focus.toggle();
             }
             _ => {}
         }
@@ -669,6 +748,9 @@ impl App {
             }
             View::RepoDetail => {
                 self.state.repo_detail_focus = self.state.repo_detail_focus.toggle();
+            }
+            View::Workflows => {
+                self.state.workflows_focus = self.state.workflows_focus.toggle();
             }
             _ => {}
         }
@@ -990,7 +1072,31 @@ impl App {
                     };
                 }
             }
-            _ => {}
+            View::Workflows => {
+                use crate::state::WorkflowsFocus;
+                match self.state.workflows_focus {
+                    WorkflowsFocus::Defs => {
+                        // Run selected workflow definition
+                        self.handle_run_workflow();
+                    }
+                    WorkflowsFocus::Runs => {
+                        // Enter workflow run detail
+                        if let Some(run) = self
+                            .state
+                            .data
+                            .workflow_runs
+                            .get(self.state.workflow_run_index)
+                        {
+                            let run_id = run.id.clone();
+                            self.state.selected_workflow_run_id = Some(run_id);
+                            self.state.view = View::WorkflowRunDetail;
+                            self.state.workflow_step_index = 0;
+                            self.reload_workflow_steps();
+                        }
+                    }
+                }
+            }
+            View::WorkflowRunDetail | View::WorktreeDetail => {}
         }
     }
 
@@ -1106,6 +1212,25 @@ impl App {
                                     message: format!("Failed to save config: {e}"),
                                 };
                             }
+                        }
+                    }
+                }
+                ConfirmAction::CancelWorkflow { workflow_run_id } => {
+                    use conductor_core::workflow::{WorkflowManager, WorkflowRunStatus};
+                    let wf_mgr = WorkflowManager::new(&self.conn);
+                    match wf_mgr.update_workflow_status(
+                        &workflow_run_id,
+                        WorkflowRunStatus::Cancelled,
+                        Some("Cancelled by user"),
+                    ) {
+                        Ok(()) => {
+                            self.state.status_message = Some("Workflow run cancelled".to_string());
+                            self.reload_workflow_data();
+                        }
+                        Err(e) => {
+                            self.state.modal = Modal::Error {
+                                message: format!("Cancel failed: {e}"),
+                            };
                         }
                     }
                 }
@@ -3587,6 +3712,275 @@ impl App {
                 "Imported {imported} repo(s), {} error(s)",
                 errors.len()
             ));
+        }
+    }
+
+    // ── Workflow handlers ──────────────────────────────────────────────
+
+    /// Dispatch workflow data loading to a background thread. The result
+    /// arrives as a `WorkflowDataRefreshed` action, avoiding synchronous
+    /// FS + DB I/O on the main loop tick.
+    fn poll_workflow_data_async(&self) {
+        let Some(ref tx) = self.bg_tx else { return };
+        let wt_id = match self.state.selected_worktree_id {
+            Some(ref id) => id.clone(),
+            None => return,
+        };
+
+        // Skip if a poll is already in flight to avoid thread pile-up.
+        if self
+            .workflow_poll_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let wt = self.state.data.worktrees.iter().find(|w| w.id == wt_id);
+        let Some(wt) = wt else {
+            self.workflow_poll_in_flight.store(false, Ordering::SeqCst);
+            return;
+        };
+        let worktree_path = wt.path.clone();
+        let repo_path = self
+            .state
+            .data
+            .repos
+            .iter()
+            .find(|r| r.id == wt.repo_id)
+            .map(|r| r.local_path.clone())
+            .unwrap_or_default();
+        let selected_run_id = self.state.selected_workflow_run_id.clone();
+
+        let in_flight = Arc::clone(&self.workflow_poll_in_flight);
+        crate::background::spawn_workflow_poll_once_guarded(
+            tx.clone(),
+            wt_id,
+            worktree_path,
+            repo_path,
+            selected_run_id,
+            in_flight,
+        );
+    }
+
+    fn reload_workflow_data(&mut self) {
+        use conductor_core::workflow::WorkflowManager;
+
+        let wt_id = match self.state.selected_worktree_id {
+            Some(ref id) => id.clone(),
+            None => return,
+        };
+
+        // Load defs from filesystem via manager
+        let wt = self.state.data.worktrees.iter().find(|w| w.id == wt_id);
+        if let Some(wt) = wt {
+            let repo_path = self
+                .state
+                .data
+                .repos
+                .iter()
+                .find(|r| r.id == wt.repo_id)
+                .map(|r| r.local_path.as_str())
+                .unwrap_or("");
+            self.state.data.workflow_defs =
+                WorkflowManager::list_defs(&wt.path, repo_path).unwrap_or_default();
+        }
+
+        // Load runs from DB
+        let wf_mgr = WorkflowManager::new(&self.conn);
+        self.state.data.workflow_runs = wf_mgr.list_workflow_runs(&wt_id).unwrap_or_default();
+
+        // Load steps for the currently selected run
+        self.reload_workflow_steps();
+        self.clamp_workflow_indices();
+    }
+
+    fn reload_workflow_steps(&mut self) {
+        use conductor_core::workflow::WorkflowManager;
+
+        if let Some(ref run_id) = self.state.selected_workflow_run_id {
+            let wf_mgr = WorkflowManager::new(&self.conn);
+            self.state.data.workflow_steps = wf_mgr.get_workflow_steps(run_id).unwrap_or_default();
+        } else {
+            self.state.data.workflow_steps.clear();
+        }
+    }
+
+    fn clamp_workflow_indices(&mut self) {
+        let def_len = self.state.data.workflow_defs.len();
+        if def_len > 0 && self.state.workflow_def_index >= def_len {
+            self.state.workflow_def_index = def_len - 1;
+        }
+        let run_len = self.state.data.workflow_runs.len();
+        if run_len > 0 && self.state.workflow_run_index >= run_len {
+            self.state.workflow_run_index = run_len - 1;
+        }
+        let step_len = self.state.data.workflow_steps.len();
+        if step_len > 0 && self.state.workflow_step_index >= step_len {
+            self.state.workflow_step_index = step_len - 1;
+        }
+    }
+
+    fn handle_run_workflow(&mut self) {
+        let def = match self
+            .state
+            .data
+            .workflow_defs
+            .get(self.state.workflow_def_index)
+        {
+            Some(d) => d.clone(),
+            None => {
+                self.state.status_message = Some("No workflow definition selected".to_string());
+                return;
+            }
+        };
+
+        let wt = match self
+            .state
+            .selected_worktree_id
+            .as_ref()
+            .and_then(|id| self.state.data.worktrees.iter().find(|w| &w.id == id))
+        {
+            Some(w) => w.clone(),
+            None => {
+                self.state.status_message = Some("No worktree selected".to_string());
+                return;
+            }
+        };
+
+        let repo_path = self
+            .state
+            .data
+            .repos
+            .iter()
+            .find(|r| r.id == wt.repo_id)
+            .map(|r| r.local_path.clone())
+            .unwrap_or_default();
+
+        let config = self.config.clone();
+        let bg_tx = self.bg_tx.clone();
+        let workflow_name = def.name.clone();
+
+        // Spawn workflow execution in a background thread
+        std::thread::spawn(move || {
+            use conductor_core::workflow::{
+                execute_workflow_standalone, WorkflowExecConfig, WorkflowExecStandalone,
+            };
+
+            let params = WorkflowExecStandalone {
+                config,
+                workflow: def.clone(),
+                worktree_id: wt.id.clone(),
+                worktree_path: wt.path.clone(),
+                repo_path,
+                model: None,
+                exec_config: WorkflowExecConfig::default(),
+                inputs: std::collections::HashMap::new(),
+            };
+
+            let result = execute_workflow_standalone(&params);
+
+            if let Some(ref tx) = bg_tx {
+                let msg = match result {
+                    Ok(res) => {
+                        if res.all_succeeded {
+                            format!("Workflow '{}' completed successfully", def.name)
+                        } else {
+                            format!("Workflow '{}' completed with failures", def.name)
+                        }
+                    }
+                    Err(e) => format!("Workflow '{}' failed: {e}", def.name),
+                };
+                let _ = tx.send(Action::BackgroundSuccess { message: msg });
+            }
+        });
+
+        self.state.status_message = Some(format!("Starting workflow '{workflow_name}'…"));
+    }
+
+    fn handle_cancel_workflow(&mut self) {
+        let run = match self
+            .state
+            .selected_workflow_run_id
+            .as_ref()
+            .and_then(|id| self.state.data.workflow_runs.iter().find(|r| &r.id == id))
+        {
+            Some(r) => r.clone(),
+            None => {
+                self.state.status_message = Some("No workflow run selected".to_string());
+                return;
+            }
+        };
+
+        self.state.modal = Modal::Confirm {
+            title: "Cancel Workflow".to_string(),
+            message: format!("Cancel workflow run '{}'?", run.workflow_name),
+            on_confirm: ConfirmAction::CancelWorkflow {
+                workflow_run_id: run.id.clone(),
+            },
+        };
+    }
+
+    fn handle_approve_gate(&mut self) {
+        use conductor_core::workflow::WorkflowManager;
+
+        // If we're in GateAction modal, use its data
+        if let Modal::GateAction {
+            ref step_id,
+            ref feedback,
+            ..
+        } = self.state.modal
+        {
+            let wf_mgr = WorkflowManager::new(&self.conn);
+            let fb = if feedback.is_empty() {
+                None
+            } else {
+                Some(feedback.as_str())
+            };
+            match wf_mgr.approve_gate(step_id, "tui-user", fb) {
+                Ok(()) => {
+                    self.state.status_message = Some("Gate approved".to_string());
+                }
+                Err(e) => {
+                    self.state.status_message = Some(format!("Gate approval failed: {e}"));
+                }
+            }
+            self.state.modal = Modal::None;
+            self.reload_workflow_steps();
+            return;
+        }
+
+        // Otherwise, find the waiting gate and show the GateAction modal
+        if let Some(ref run_id) = self.state.selected_workflow_run_id {
+            let wf_mgr = WorkflowManager::new(&self.conn);
+            if let Ok(Some(step)) = wf_mgr.find_waiting_gate(run_id) {
+                self.state.modal = Modal::GateAction {
+                    run_id: run_id.clone(),
+                    step_id: step.id.clone(),
+                    gate_prompt: step.gate_prompt.unwrap_or_default(),
+                    feedback: String::new(),
+                };
+            } else {
+                self.state.status_message = Some("No waiting gate found".to_string());
+            }
+        }
+    }
+
+    fn handle_reject_gate(&mut self) {
+        use conductor_core::workflow::WorkflowManager;
+
+        if let Modal::GateAction { ref step_id, .. } = self.state.modal {
+            let wf_mgr = WorkflowManager::new(&self.conn);
+            match wf_mgr.reject_gate(step_id, "tui-user") {
+                Ok(()) => {
+                    self.state.status_message = Some("Gate rejected".to_string());
+                }
+                Err(e) => {
+                    self.state.status_message = Some(format!("Gate rejection failed: {e}"));
+                }
+            }
+            self.state.modal = Modal::None;
+            self.reload_workflow_steps();
         }
     }
 }

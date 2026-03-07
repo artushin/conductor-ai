@@ -11,7 +11,7 @@ use conductor_core::repo::RepoManager;
 use conductor_core::tickets::TicketSyncer;
 use conductor_core::worktree::WorktreeManager;
 
-use crate::action::{Action, DataRefreshedPayload};
+use crate::action::{Action, DataRefreshedPayload, WorkflowDataPayload};
 use crate::event::BackgroundSender;
 
 /// Spawn the DB poller thread. Polls every `interval` and sends DataRefreshed events.
@@ -185,6 +185,108 @@ fn sync_github_repo(
             error: e.to_string(),
         },
     }
+}
+
+/// Spawn the workflow data poller. Polls workflow runs/steps for the given
+/// worktree and run IDs every `interval` and sends WorkflowDataRefreshed events.
+#[allow(dead_code)]
+pub fn spawn_workflow_poller(
+    tx: BackgroundSender,
+    interval: Duration,
+    worktree_id: String,
+    worktree_path: String,
+    repo_path: String,
+    selected_run_id: Option<String>,
+) {
+    thread::spawn(move || loop {
+        thread::sleep(interval);
+        if let Some(action) = poll_workflow_data(
+            &worktree_id,
+            &worktree_path,
+            &repo_path,
+            selected_run_id.as_deref(),
+        ) {
+            if !tx.send(action) {
+                break;
+            }
+        }
+    });
+}
+
+fn poll_workflow_data(
+    worktree_id: &str,
+    worktree_path: &str,
+    repo_path: &str,
+    selected_run_id: Option<&str>,
+) -> Option<Action> {
+    use conductor_core::workflow::WorkflowManager;
+
+    let db = db_path();
+    let conn = open_database(&db).ok()?;
+
+    let defs = WorkflowManager::list_defs(worktree_path, repo_path).unwrap_or_default();
+    let wf_mgr = WorkflowManager::new(&conn);
+    let runs = wf_mgr.list_workflow_runs(worktree_id).unwrap_or_default();
+    let steps = if let Some(run_id) = selected_run_id {
+        wf_mgr.get_workflow_steps(run_id).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    Some(Action::WorkflowDataRefreshed(Box::new(
+        WorkflowDataPayload {
+            workflow_defs: defs,
+            workflow_runs: runs,
+            workflow_steps: steps,
+        },
+    )))
+}
+
+/// One-shot async workflow data poll. Spawns a thread that loads defs, runs,
+/// and steps and sends a `WorkflowDataRefreshed` action back.
+#[allow(dead_code)]
+pub fn spawn_workflow_poll_once(
+    tx: BackgroundSender,
+    worktree_id: String,
+    worktree_path: String,
+    repo_path: String,
+    selected_run_id: Option<String>,
+) {
+    thread::spawn(move || {
+        if let Some(action) = poll_workflow_data(
+            &worktree_id,
+            &worktree_path,
+            &repo_path,
+            selected_run_id.as_deref(),
+        ) {
+            let _ = tx.send(action);
+        }
+    });
+}
+
+/// Like [`spawn_workflow_poll_once`] but clears an `AtomicBool` guard when done,
+/// so the caller can prevent concurrent polls.
+pub fn spawn_workflow_poll_once_guarded(
+    tx: BackgroundSender,
+    worktree_id: String,
+    worktree_path: String,
+    repo_path: String,
+    selected_run_id: Option<String>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    thread::spawn(move || {
+        let result = poll_workflow_data(
+            &worktree_id,
+            &worktree_path,
+            &repo_path,
+            selected_run_id.as_deref(),
+        );
+        // Clear the guard before sending so the next tick can enqueue a new poll.
+        in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(action) = result {
+            let _ = tx.send(action);
+        }
+    });
 }
 
 /// Spawn a one-shot background operation for blocking tasks.
