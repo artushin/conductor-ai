@@ -1,6 +1,7 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::Path;
 use std::process::Command;
 
@@ -8,6 +9,32 @@ use crate::config::Config;
 use crate::db::query_collect;
 use crate::error::{ConductorError, Result};
 use crate::repo::RepoManager;
+
+/// Typed representation of the three worktree lifecycle states stored in the DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeStatus {
+    Active,
+    Merged,
+    Abandoned,
+}
+
+impl WorktreeStatus {
+    /// Return the canonical lowercase string stored in the database.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorktreeStatus::Active => "active",
+            WorktreeStatus::Merged => "merged",
+            WorktreeStatus::Abandoned => "abandoned",
+        }
+    }
+}
+
+impl fmt::Display for WorktreeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worktree {
@@ -28,7 +55,7 @@ pub struct Worktree {
 
 impl Worktree {
     pub fn is_active(&self) -> bool {
-        self.status == "active"
+        self.status == WorktreeStatus::Active.as_str()
     }
 
     /// Resolve the effective base branch: the worktree's own base, or the repo default.
@@ -87,7 +114,7 @@ impl<'a> WorktreeManager<'a> {
             .optional()?;
 
         match existing_status {
-            Some(ref s) if s == "active" => {
+            Some(ref s) if s == WorktreeStatus::Active.as_str() => {
                 return Err(ConductorError::WorktreeAlreadyExists {
                     slug: wt_slug.clone(),
                 });
@@ -136,7 +163,7 @@ impl<'a> WorktreeManager<'a> {
             branch,
             path: wt_path.to_string_lossy().to_string(),
             ticket_id: ticket_id.map(|s| s.to_string()),
-            status: "active".to_string(),
+            status: WorktreeStatus::Active.to_string(),
             created_at: now,
             completed_at: None,
             model: None,
@@ -304,7 +331,11 @@ impl<'a> WorktreeManager<'a> {
         });
         let is_merged = ticket_closed
             || is_branch_merged(&repo.local_path, &worktree.branch, &repo.default_branch);
-        let new_status = if is_merged { "merged" } else { "abandoned" };
+        let new_status = if is_merged {
+            WorktreeStatus::Merged
+        } else {
+            WorktreeStatus::Abandoned
+        };
         let now = Utc::now().to_rfc3339();
 
         // Remove git worktree
@@ -320,7 +351,7 @@ impl<'a> WorktreeManager<'a> {
         // Soft-delete: update status + completed_at instead of deleting the row
         self.conn.execute(
             "UPDATE worktrees SET status = ?1, completed_at = ?2 WHERE id = ?3",
-            params![new_status, now, worktree.id],
+            params![new_status.as_str(), now, worktree.id],
         )?;
 
         Ok(Worktree {
@@ -330,15 +361,15 @@ impl<'a> WorktreeManager<'a> {
         })
     }
 
-    pub fn update_status(&self, worktree_id: &str, status: &str) -> Result<()> {
-        let completed_at = if status != "active" {
+    pub fn update_status(&self, worktree_id: &str, status: WorktreeStatus) -> Result<()> {
+        let completed_at = if status != WorktreeStatus::Active {
             Some(Utc::now().to_rfc3339())
         } else {
             None
         };
         self.conn.execute(
             "UPDATE worktrees SET status = ?1, completed_at = ?2 WHERE id = ?3",
-            params![status, completed_at, worktree_id],
+            params![status.as_str(), completed_at, worktree_id],
         )?;
         Ok(())
     }
@@ -908,5 +939,76 @@ mod tests {
 
         // Verify we're now on main and have the extra file
         assert!(local.join("extra.txt").exists());
+    }
+
+    #[test]
+    fn test_worktree_status_as_str() {
+        assert_eq!(WorktreeStatus::Active.as_str(), "active");
+        assert_eq!(WorktreeStatus::Merged.as_str(), "merged");
+        assert_eq!(WorktreeStatus::Abandoned.as_str(), "abandoned");
+    }
+
+    #[test]
+    fn test_worktree_status_display() {
+        assert_eq!(WorktreeStatus::Active.to_string(), "active");
+        assert_eq!(WorktreeStatus::Merged.to_string(), "merged");
+        assert_eq!(WorktreeStatus::Abandoned.to_string(), "abandoned");
+    }
+
+    #[test]
+    fn test_update_status_to_merged_sets_completed_at() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        mgr.update_status("wt1", WorktreeStatus::Merged).unwrap();
+
+        let wt = mgr.get_by_id("wt1").unwrap();
+        assert_eq!(wt.status, "merged");
+        assert!(wt.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_update_status_to_abandoned_sets_completed_at() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        mgr.update_status("wt1", WorktreeStatus::Abandoned).unwrap();
+
+        let wt = mgr.get_by_id("wt1").unwrap();
+        assert_eq!(wt.status, "abandoned");
+        assert!(wt.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_update_status_to_active_clears_completed_at() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at, completed_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'merged', '2024-01-01T00:00:00Z', '2024-02-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        mgr.update_status("wt1", WorktreeStatus::Active).unwrap();
+
+        let wt = mgr.get_by_id("wt1").unwrap();
+        assert_eq!(wt.status, "active");
+        assert!(wt.completed_at.is_none());
     }
 }
