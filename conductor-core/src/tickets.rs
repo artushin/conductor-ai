@@ -5,6 +5,7 @@ use tracing::warn;
 
 use crate::db::query_collect;
 use crate::error::{ConductorError, Result};
+use crate::worktree::WorktreeManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticket {
@@ -48,6 +49,14 @@ impl Ticket {
 pub struct TicketSyncer<'a> {
     conn: &'a Connection,
 }
+
+const CLOSED_TICKET_ARTIFACTS_SQL: &str = "SELECT r.local_path, w.path, w.branch
+     FROM worktrees w
+     JOIN repos r ON r.id = w.repo_id
+     WHERE w.repo_id = ?1
+       AND w.status != 'merged'
+       AND w.ticket_id IS NOT NULL
+       AND w.ticket_id IN (SELECT id FROM tickets WHERE state = 'closed')";
 
 impl<'a> TicketSyncer<'a> {
     pub fn new(conn: &'a Connection) -> Self {
@@ -219,10 +228,20 @@ impl<'a> TicketSyncer<'a> {
     }
 
     /// After syncing tickets, mark any linked worktrees whose ticket is now
-    /// closed by setting their status to `'merged'`. Called as part of the
-    /// ticket sync flow, typically after [`TicketSyncer::close_missing_tickets`].
+    /// closed by setting their status to `'merged'`. Also removes the git
+    /// worktree directory and branch for each affected worktree (best-effort).
+    /// Called as part of the ticket sync flow, typically after
+    /// [`TicketSyncer::close_missing_tickets`].
     /// Returns the number of worktrees updated.
     pub fn mark_worktrees_for_closed_tickets(&self, repo_id: &str) -> Result<usize> {
+        // Collect git paths before updating so we can clean up worktree dirs and branches.
+        let artifacts: Vec<(String, String, String)> = query_collect(
+            self.conn,
+            CLOSED_TICKET_ARTIFACTS_SQL,
+            params![repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
         let count = self.conn.execute(
             "UPDATE worktrees SET status = 'merged'
              WHERE repo_id = ?1
@@ -231,6 +250,11 @@ impl<'a> TicketSyncer<'a> {
              AND ticket_id IN (SELECT id FROM tickets WHERE state = 'closed')",
             params![repo_id],
         )?;
+
+        for (repo_path, worktree_path, branch) in artifacts {
+            WorktreeManager::remove_artifacts(&repo_path, &worktree_path, &branch);
+        }
+
         Ok(count)
     }
 }
@@ -546,6 +570,122 @@ mod tests {
         let count = syncer.mark_worktrees_for_closed_tickets("r1").unwrap();
         assert_eq!(count, 0);
         assert_eq!(get_worktree_status(&conn, "wt1"), "active");
+    }
+
+    #[test]
+    fn test_mark_worktrees_skips_open_ticket() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        // Insert an open ticket and link a worktree to it
+        let tickets = vec![make_ticket("1", "Issue 1")];
+        syncer.upsert_tickets("r1", &tickets).unwrap();
+        let ticket_id: String = conn
+            .query_row("SELECT id FROM tickets WHERE source_id = '1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        insert_worktree(&conn, "wt1", "r1", Some(&ticket_id), "active");
+
+        // Do NOT close the ticket — it stays open
+        let count = syncer.mark_worktrees_for_closed_tickets("r1").unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(get_worktree_status(&conn, "wt1"), "active");
+    }
+
+    #[test]
+    fn test_mark_worktrees_artifacts_query_returns_correct_paths() {
+        // Verify the artifact-collection JOIN query (CLOSED_TICKET_ARTIFACTS_SQL)
+        // returns the expected (local_path, worktree_path, branch) for a closed-ticket worktree.
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let tickets = vec![make_ticket("1", "Issue 1")];
+        syncer.upsert_tickets("r1", &tickets).unwrap();
+        let ticket_id: String = conn
+            .query_row("SELECT id FROM tickets WHERE source_id = '1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        insert_worktree(&conn, "wt1", "r1", Some(&ticket_id), "active");
+        syncer
+            .close_missing_tickets("r1", "github", &["999"])
+            .unwrap();
+
+        // Use the same constant the implementation uses so this test stays in sync.
+        let artifacts: Vec<(String, String, String)> = conn
+            .prepare(CLOSED_TICKET_ARTIFACTS_SQL)
+            .unwrap()
+            .query_map(rusqlite::params!["r1"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].0, "/tmp/repo"); // repo local_path from setup_db
+        assert_eq!(artifacts[0].1, "/tmp/wt-wt1"); // worktree path from insert_worktree
+        assert_eq!(artifacts[0].2, "feat/wt1"); // branch from insert_worktree
+    }
+
+    #[test]
+    fn test_mark_worktrees_artifacts_skips_already_merged() {
+        // mark_worktrees_for_closed_tickets must not attempt artifact cleanup for
+        // worktrees whose status is already 'merged' (verified via CLOSED_TICKET_ARTIFACTS_SQL).
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let tickets = vec![make_ticket("1", "Issue 1")];
+        syncer.upsert_tickets("r1", &tickets).unwrap();
+        let ticket_id: String = conn
+            .query_row("SELECT id FROM tickets WHERE source_id = '1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        insert_worktree(&conn, "wt1", "r1", Some(&ticket_id), "merged");
+        syncer
+            .close_missing_tickets("r1", "github", &["999"])
+            .unwrap();
+
+        // Use the same constant the implementation uses so this test stays in sync.
+        let artifacts: Vec<(String, String, String)> = conn
+            .prepare(CLOSED_TICKET_ARTIFACTS_SQL)
+            .unwrap()
+            .query_map(rusqlite::params!["r1"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(artifacts.len(), 0);
+    }
+
+    #[test]
+    fn test_mark_worktrees_for_closed_tickets_end_to_end() {
+        // Verify that mark_worktrees_for_closed_tickets completes successfully
+        // in the closed-ticket scenario, updating DB state and exercising the
+        // artifact-cleanup loop (remove_git_artifacts is best-effort and no-ops
+        // on non-existent paths, so this is safe in tests).
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let tickets = vec![make_ticket("1", "Issue 1")];
+        syncer.upsert_tickets("r1", &tickets).unwrap();
+        let ticket_id: String = conn
+            .query_row("SELECT id FROM tickets WHERE source_id = '1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        insert_worktree(&conn, "wt1", "r1", Some(&ticket_id), "active");
+        syncer
+            .close_missing_tickets("r1", "github", &["999"])
+            .unwrap();
+
+        let count = syncer.mark_worktrees_for_closed_tickets("r1").unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(get_worktree_status(&conn, "wt1"), "merged");
     }
 
     #[test]
