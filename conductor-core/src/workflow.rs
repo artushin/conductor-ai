@@ -25,6 +25,7 @@ use crate::workflow_dsl::{
 };
 
 // Re-export DSL types so consumers go through `workflow::` instead of `workflow_dsl::` directly.
+use crate::schema_config::{self, OutputSchema};
 pub use crate::workflow_dsl::{
     collect_agent_names, collect_workflow_refs, detect_workflow_cycles, AgentRef, InputDecl,
     WorkflowDef, WorkflowTrigger, MAX_WORKFLOW_DEPTH,
@@ -53,7 +54,8 @@ const STEP_COLUMNS: &str =
     "id, workflow_run_id, step_name, role, can_commit, condition_expr, status, \
      child_run_id, position, started_at, ended_at, result_text, condition_met, \
      iteration, parallel_group_id, context_out, markers_out, retry_count, \
-     gate_type, gate_prompt, gate_timeout, gate_approved_by, gate_approved_at, gate_feedback";
+     gate_type, gate_prompt, gate_timeout, gate_approved_by, gate_approved_at, gate_feedback, \
+     structured_output";
 
 /// Column list for `workflow_runs` SELECT queries (used by `row_to_workflow_run`).
 const RUN_COLUMNS: &str =
@@ -102,6 +104,53 @@ pub fn parse_conductor_output(text: &str) -> Option<ConductorOutput> {
     let json_str = text[json_start..json_start + end].trim();
 
     serde_json::from_str(json_str).ok()
+}
+
+/// Resolve a schema by name using the standard search order.
+fn resolve_schema(state: &ExecutionState<'_>, name: &str) -> Result<OutputSchema> {
+    let schema_ref = schema_config::SchemaRef::from_str_value(name);
+    schema_config::load_schema(
+        &state.worktree_path,
+        &state.repo_path,
+        &schema_ref,
+        Some(&state.workflow_name),
+    )
+}
+
+/// Interpret agent output using a schema (if present) or generic `CONDUCTOR_OUTPUT` parsing.
+///
+/// Returns `(markers, context, structured_json)`. The `succeeded` flag controls whether
+/// a schema validation failure is treated as an error (`Err`) or silently falls back.
+fn interpret_agent_output(
+    result_text: Option<&str>,
+    schema: Option<&OutputSchema>,
+    succeeded: bool,
+) -> std::result::Result<(Vec<String>, String, Option<String>), String> {
+    if let Some(s) = schema {
+        match result_text.map(|text| schema_config::parse_structured_output(text, s)) {
+            Some(Ok(structured)) => Ok((
+                structured.markers,
+                structured.context,
+                Some(structured.json_string),
+            )),
+            Some(Err(e)) if succeeded => {
+                // Structured output validation failed on a successful run — caller should retry
+                Err(format!("structured output validation: {e}"))
+            }
+            _ => {
+                // No output block found or parsing error on a failed run — fall back
+                let fallback = result_text
+                    .and_then(parse_conductor_output)
+                    .unwrap_or_default();
+                Ok((fallback.markers, fallback.context, None))
+            }
+        }
+    } else {
+        let output = result_text
+            .and_then(parse_conductor_output)
+            .unwrap_or_default();
+        Ok((output.markers, output.context, None))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +302,8 @@ pub struct WorkflowRunStep {
     pub gate_approved_by: Option<String>,
     pub gate_approved_at: Option<String>,
     pub gate_feedback: Option<String>,
+    /// Full structured output JSON (when schema was used).
+    pub structured_output: Option<String>,
 }
 
 /// A single entry in a step's metadata, either a key-value field or a
@@ -384,6 +435,8 @@ pub struct StepResult {
     pub markers: Vec<String>,
     pub context: String,
     pub child_run_id: Option<String>,
+    /// Raw JSON string of structured output (when schema was used).
+    pub structured_output: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +562,31 @@ impl<'a> WorkflowManager<'a> {
         markers_out: Option<&str>,
         retry_count: Option<i64>,
     ) -> Result<()> {
+        self.update_step_status_full(
+            step_id,
+            status,
+            child_run_id,
+            result_text,
+            context_out,
+            markers_out,
+            retry_count,
+            None,
+        )
+    }
+
+    /// Update a step's status with all fields including structured_output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_step_status_full(
+        &self,
+        step_id: &str,
+        status: WorkflowStepStatus,
+        child_run_id: Option<&str>,
+        result_text: Option<&str>,
+        context_out: Option<&str>,
+        markers_out: Option<&str>,
+        retry_count: Option<i64>,
+        structured_output: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let is_starting = status == WorkflowStepStatus::Running;
         let is_terminal = matches!(
@@ -527,8 +605,9 @@ impl<'a> WorkflowManager<'a> {
         } else if is_terminal {
             self.conn.execute(
                 "UPDATE workflow_run_steps SET status = ?1, child_run_id = ?2, ended_at = ?3, \
-                 result_text = ?4, context_out = ?5, markers_out = ?6, retry_count = COALESCE(?7, retry_count) \
-                 WHERE id = ?8",
+                 result_text = ?4, context_out = ?5, markers_out = ?6, \
+                 retry_count = COALESCE(?7, retry_count), structured_output = ?8 \
+                 WHERE id = ?9",
                 params![
                     status,
                     child_run_id,
@@ -537,6 +616,7 @@ impl<'a> WorkflowManager<'a> {
                     context_out,
                     markers_out,
                     retry_count,
+                    structured_output,
                     step_id,
                 ],
             )?;
@@ -751,6 +831,7 @@ fn row_to_workflow_step(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRunStep
         gate_approved_by: row.get(21)?,
         gate_approved_at: row.get(22)?,
         gate_feedback: row.get(23)?,
+        structured_output: row.get(24)?,
     })
 }
 
@@ -785,14 +866,23 @@ fn build_variable_map<'a>(state: &'a ExecutionState<'_>) -> HashMap<&'a str, Str
     if let Some(ref feedback) = state.last_gate_feedback {
         vars.insert("gate_feedback", feedback.clone());
     }
+    // prior_output: raw JSON from the last step's structured output (if any)
+    if let Some(last_output) = state.last_structured_output.as_ref() {
+        vars.insert("prior_output", last_output.clone());
+    }
     vars
 }
 
 /// Build a fully-substituted agent prompt from the execution state and agent definition.
 ///
-/// Handles: input variables, prior_context, prior_contexts, gate_feedback,
-/// dry-run prefix for committing agents, and CONDUCTOR_OUTPUT instruction.
-fn build_agent_prompt(state: &ExecutionState<'_>, agent_def: &agent_config::AgentDef) -> String {
+/// Handles: input variables, prior_context, prior_contexts, prior_output,
+/// gate_feedback, dry-run prefix for committing agents, and CONDUCTOR_OUTPUT
+/// instruction (generic or schema-specific).
+fn build_agent_prompt(
+    state: &ExecutionState<'_>,
+    agent_def: &agent_config::AgentDef,
+    schema: Option<&schema_config::OutputSchema>,
+) -> String {
     let vars = build_variable_map(state);
     let mut prompt = substitute_variables(&agent_def.prompt, &vars);
 
@@ -800,7 +890,17 @@ fn build_agent_prompt(state: &ExecutionState<'_>, agent_def: &agent_config::Agen
         prompt = format!("DO NOT commit or push any changes. This is a dry run.\n\n{prompt}");
     }
 
-    prompt.push_str(CONDUCTOR_OUTPUT_INSTRUCTION);
+    // Append output instructions: schema-specific if a schema is provided,
+    // otherwise the generic CONDUCTOR_OUTPUT instruction.
+    match schema {
+        Some(s) => {
+            prompt.push('\n');
+            prompt.push_str(&schema_config::generate_prompt_instructions(s));
+        }
+        None => {
+            prompt.push_str(CONDUCTOR_OUTPUT_INSTRUCTION);
+        }
+    }
     prompt
 }
 
@@ -835,6 +935,8 @@ struct ExecutionState<'a> {
     total_turns: i64,
     total_duration_ms: i64,
     last_gate_feedback: Option<String>,
+    /// Raw JSON from the most recent step's structured output (for `{{prior_output}}`).
+    last_structured_output: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1035,7 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         total_turns: 0,
         total_duration_ms: 0,
         last_gate_feedback: None,
+        last_structured_output: None,
     };
 
     // Execute main body
@@ -1107,6 +1210,7 @@ fn run_on_fail_agent(
         agent: on_fail_agent.clone(),
         retries: 0,
         on_fail: None,
+        output: None,
     };
     if let Err(e) = execute_call(state, &on_fail_node, iteration) {
         eprintln!(
@@ -1139,6 +1243,7 @@ fn record_step_failure(
         markers: Vec::new(),
         context: String::new(),
         child_run_id: None,
+        structured_output: None,
     };
     state.step_results.insert(step_key, step_result);
 
@@ -1166,6 +1271,7 @@ fn record_step_success(
     context: String,
     child_run_id: Option<String>,
     iteration: u32,
+    structured_output: Option<String>,
 ) {
     if let Some(cost) = cost_usd {
         state.total_cost += cost;
@@ -1175,6 +1281,11 @@ fn record_step_success(
     }
     if let Some(dur) = duration_ms {
         state.total_duration_ms += dur;
+    }
+
+    // Update last_structured_output for {{prior_output}} substitution
+    if structured_output.is_some() {
+        state.last_structured_output = structured_output.clone();
     }
 
     let step_result = StepResult {
@@ -1187,6 +1298,7 @@ fn record_step_success(
         markers,
         context: context.clone(),
         child_run_id,
+        structured_output,
     };
     state.step_results.insert(step_key, step_result);
 
@@ -1228,6 +1340,19 @@ fn resolve_child_inputs(
 // ---------------------------------------------------------------------------
 
 fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32) -> Result<()> {
+    execute_call_with_schema(state, node, iteration, node.output.as_deref())
+}
+
+/// Inner implementation of execute_call that accepts an optional schema override.
+///
+/// The `schema_override` parameter allows parallel blocks to pass their block-level
+/// output schema to individual calls.
+fn execute_call_with_schema(
+    state: &mut ExecutionState<'_>,
+    node: &CallNode,
+    iteration: u32,
+    schema_name: Option<&str>,
+) -> Result<()> {
     let pos = state.position;
     state.position += 1;
 
@@ -1239,12 +1364,14 @@ fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32)
         Some(&state.workflow_name),
     )?;
     let agent_label = node.agent.label();
-    // step_key is the short name used as the step_results map key so that
-    // if/while conditions can reference this step by name regardless of whether
-    // the agent was referenced by name or by explicit path.
     let step_key = node.agent.step_key();
 
-    let prompt = build_agent_prompt(state, &agent_def);
+    // Load output schema if specified
+    let schema = schema_name
+        .map(|name| resolve_schema(state, name))
+        .transpose()?;
+
+    let prompt = build_agent_prompt(state, &agent_def, schema.as_ref());
     let step_model = agent_def.model.as_deref().or(state.model.as_deref());
 
     // Retry loop
@@ -1324,14 +1451,33 @@ fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32)
             Ok(completed_run) => {
                 let succeeded = completed_run.status == AgentRunStatus::Completed;
 
-                // Parse CONDUCTOR_OUTPUT
-                let output = completed_run
-                    .result_text
-                    .as_deref()
-                    .and_then(parse_conductor_output)
-                    .unwrap_or_default();
+                // Parse output: structured (schema) or generic (markers + context)
+                let (markers, context, structured_json) = match interpret_agent_output(
+                    completed_run.result_text.as_deref(),
+                    schema.as_ref(),
+                    succeeded,
+                ) {
+                    Ok(result) => result,
+                    Err(validation_err) => {
+                        eprintln!(
+                            "[workflow] Step '{}' structured output validation failed: {validation_err}",
+                            agent_label,
+                        );
+                        state.wf_mgr.update_step_status(
+                            &step_id,
+                            WorkflowStepStatus::Failed,
+                            Some(&completed_run.id),
+                            completed_run.result_text.as_deref(),
+                            None,
+                            None,
+                            Some(attempt as i64),
+                        )?;
+                        last_error = validation_err;
+                        continue;
+                    }
+                };
 
-                let markers_json = serde_json::to_string(&output.markers).unwrap_or_default();
+                let markers_json = serde_json::to_string(&markers).unwrap_or_default();
 
                 if succeeded {
                     eprintln!(
@@ -1339,17 +1485,18 @@ fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32)
                         agent_label,
                         completed_run.cost_usd.unwrap_or(0.0),
                         completed_run.num_turns.unwrap_or(0),
-                        output.markers,
+                        markers,
                     );
 
-                    state.wf_mgr.update_step_status(
+                    state.wf_mgr.update_step_status_full(
                         &step_id,
                         WorkflowStepStatus::Completed,
                         Some(&completed_run.id),
                         completed_run.result_text.as_deref(),
-                        Some(&output.context),
+                        Some(&context),
                         Some(&markers_json),
                         Some(attempt as i64),
+                        structured_json.as_deref(),
                     )?;
 
                     record_step_success(
@@ -1360,10 +1507,11 @@ fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32)
                         completed_run.cost_usd,
                         completed_run.num_turns,
                         completed_run.duration_ms,
-                        output.markers,
-                        output.context,
+                        markers,
+                        context,
                         Some(completed_run.id),
                         iteration,
+                        structured_json,
                     );
 
                     return Ok(());
@@ -1384,7 +1532,7 @@ fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32)
                         WorkflowStepStatus::Failed,
                         Some(&completed_run.id),
                         completed_run.result_text.as_deref(),
-                        Some(&output.context),
+                        Some(&context),
                         Some(&markers_json),
                         Some(attempt as i64),
                     )?;
@@ -1572,6 +1720,7 @@ fn execute_call_workflow(
                         context,
                         Some(result.workflow_run_id),
                         iteration,
+                        None,
                     );
 
                     return Ok(());
@@ -1825,12 +1974,21 @@ fn execute_parallel(
         node.min_success,
     );
 
+    // Load block-level schema (if any)
+    let block_schema = node
+        .output
+        .as_deref()
+        .map(|name| resolve_schema(state, name))
+        .transpose()?;
+
     // Spawn all agents
     struct ParallelChild {
         agent_name: String,
         child_run_id: String,
         step_id: String,
         window_name: String,
+        /// Resolved schema for this child (computed at spawn time).
+        schema: Option<schema_config::OutputSchema>,
     }
 
     let mut children = Vec::new();
@@ -1847,7 +2005,15 @@ fn execute_parallel(
             Some(&state.workflow_name),
         )?;
 
-        let prompt = build_agent_prompt(state, &agent_def);
+        // Determine schema for this call: per-call override > block-level
+        let call_schema = node
+            .call_outputs
+            .get(&i)
+            .map(|name| resolve_schema(state, name))
+            .transpose()?;
+        let effective_schema = call_schema.as_ref().or(block_schema.as_ref());
+
+        let prompt = build_agent_prompt(state, &agent_def, effective_schema);
         let step_model = agent_def.model.as_deref().or(state.model.as_deref());
         let step_id = state.wf_mgr.insert_step(
             &state.workflow_run_id,
@@ -1907,6 +2073,7 @@ fn execute_parallel(
             child_run_id: child_run.id,
             step_id,
             window_name,
+            schema: call_schema.or_else(|| block_schema.clone()),
         });
     }
 
@@ -1968,31 +2135,46 @@ fn execute_parallel(
                         completed.insert(i);
                         let succeeded = run.status == AgentRunStatus::Completed;
 
-                        let output = run
-                            .result_text
-                            .as_deref()
-                            .and_then(parse_conductor_output)
-                            .unwrap_or_default();
-                        let markers_json =
-                            serde_json::to_string(&output.markers).unwrap_or_default();
+                        // In parallel blocks, schema validation failures fall back
+                        // to generic parsing (no retry mechanism for individual calls).
+                        let (markers, context, structured_json) = interpret_agent_output(
+                            run.result_text.as_deref(),
+                            child.schema.as_ref(),
+                            succeeded,
+                        )
+                        .unwrap_or_else(|e| {
+                            eprintln!(
+                                "[workflow] parallel: '{}' schema validation failed, falling back: {e}",
+                                child.agent_name
+                            );
+                            let fb = run
+                                .result_text
+                                .as_deref()
+                                .and_then(parse_conductor_output)
+                                .unwrap_or_default();
+                            (fb.markers, fb.context, None)
+                        });
+
+                        let markers_json = serde_json::to_string(&markers).unwrap_or_default();
 
                         let step_status = if succeeded {
                             successes += 1;
-                            merged_markers.extend(output.markers.iter().cloned());
+                            merged_markers.extend(markers.iter().cloned());
                             WorkflowStepStatus::Completed
                         } else {
                             failures += 1;
                             WorkflowStepStatus::Failed
                         };
 
-                        if let Err(e) = state.wf_mgr.update_step_status(
+                        if let Err(e) = state.wf_mgr.update_step_status_full(
                             &child.step_id,
                             step_status,
                             Some(&child.child_run_id),
                             run.result_text.as_deref(),
-                            Some(&output.context),
+                            Some(&context),
                             Some(&markers_json),
                             None,
+                            structured_json.as_deref(),
                         ) {
                             eprintln!(
                                 "[workflow] parallel: failed to update step status for '{}': {e}",
@@ -2096,6 +2278,7 @@ fn execute_parallel(
         markers: merged_markers,
         context: String::new(),
         child_run_id: None,
+        structured_output: None,
     };
     state
         .step_results
@@ -2573,6 +2756,69 @@ mod tests {
     }
 
     #[test]
+    fn test_update_step_status_full_with_structured_output() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+
+        let mgr = WorkflowManager::new(&conn);
+        let run = mgr
+            .create_workflow_run("test", "w1", &parent.id, false, "manual", None)
+            .unwrap();
+        let step_id = mgr
+            .insert_step(&run.id, "review", "reviewer", false, 0, 0)
+            .unwrap();
+
+        let structured_json = r#"{"approved":true,"summary":"All good"}"#;
+        mgr.update_step_status_full(
+            &step_id,
+            WorkflowStepStatus::Completed,
+            None,
+            Some("result text"),
+            Some("All good"),
+            Some(r#"[]"#),
+            Some(0),
+            Some(structured_json),
+        )
+        .unwrap();
+
+        let step = mgr.get_step_by_id(&step_id).unwrap().unwrap();
+        assert_eq!(step.structured_output.as_deref(), Some(structured_json));
+        assert_eq!(step.context_out.as_deref(), Some("All good"));
+        assert_eq!(step.result_text.as_deref(), Some("result text"));
+    }
+
+    #[test]
+    fn test_update_step_status_full_without_structured_output() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+
+        let mgr = WorkflowManager::new(&conn);
+        let run = mgr
+            .create_workflow_run("test", "w1", &parent.id, false, "manual", None)
+            .unwrap();
+        let step_id = mgr
+            .insert_step(&run.id, "review", "reviewer", false, 0, 0)
+            .unwrap();
+
+        mgr.update_step_status_full(
+            &step_id,
+            WorkflowStepStatus::Completed,
+            None,
+            Some("result text"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let step = mgr.get_step_by_id(&step_id).unwrap().unwrap();
+        assert!(step.structured_output.is_none());
+    }
+
+    #[test]
     fn test_gate_approve() {
         let conn = setup_db();
         let agent_mgr = AgentManager::new(&conn);
@@ -2957,6 +3203,7 @@ And here is my actual output:
             gate_approved_by: None,
             gate_approved_at: None,
             gate_feedback: None,
+            structured_output: None,
         };
         let entries = step.metadata_fields();
         assert_eq!(entries.len(), 6); // 4 always-present + Started + Ended
@@ -3035,6 +3282,7 @@ And here is my actual output:
             gate_approved_by: None,
             gate_approved_at: None,
             gate_feedback: Some("Looks good".into()),
+            structured_output: None,
         };
         let entries = step.metadata_fields();
         assert!(entries.contains(&MetadataEntry::Field {
@@ -3215,6 +3463,7 @@ And here is my actual output:
             total_turns: 0,
             total_duration_ms: 0,
             last_gate_feedback: None,
+            last_structured_output: None,
         }
     }
 
@@ -3255,6 +3504,19 @@ And here is my actual output:
         assert!(!vars.contains_key("gate_feedback"));
         // prior_context should be empty string when no contexts
         assert_eq!(vars.get("prior_context").unwrap(), "");
+        // prior_output should be absent when no structured output
+        assert!(!vars.contains_key("prior_output"));
+    }
+
+    #[test]
+    fn test_build_variable_map_includes_prior_output() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+        let json = r#"{"approved":true,"summary":"All clear"}"#.to_string();
+        state.last_structured_output = Some(json.clone());
+
+        let vars = build_variable_map(&state);
+        assert_eq!(vars.get("prior_output").unwrap(), &json);
     }
 
     // -----------------------------------------------------------------------
@@ -3370,6 +3632,7 @@ And here is my actual output:
                 markers: vec!["build_ok".to_string()],
                 context: String::new(),
                 child_run_id: None,
+                structured_output: None,
             },
         );
 
@@ -3401,6 +3664,7 @@ And here is my actual output:
                 markers: vec!["has_errors".to_string()],
                 context: String::new(),
                 child_run_id: None,
+                structured_output: None,
             },
         );
 
@@ -3428,5 +3692,71 @@ And here is my actual output:
 
         // Should succeed (step not found → unwrap_or(false) → !false → body runs)
         execute_unless(&mut state, &node).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // interpret_agent_output tests
+    // -----------------------------------------------------------------------
+
+    fn make_test_schema() -> OutputSchema {
+        schema_config::parse_schema_content(
+            "fields:\n  approved: boolean\n  summary: string\n",
+            "test",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_interpret_agent_output_schema_valid() {
+        let schema = make_test_schema();
+        let text = "<<<CONDUCTOR_OUTPUT>>>\n{\"approved\": true, \"summary\": \"all good\"}\n<<<END_CONDUCTOR_OUTPUT>>>";
+        let (markers, context, json) =
+            interpret_agent_output(Some(text), Some(&schema), true).unwrap();
+        assert_eq!(context, "all good");
+        assert!(json.is_some());
+        // approved=true → no not_approved marker
+        assert!(!markers.contains(&"not_approved".to_string()));
+    }
+
+    #[test]
+    fn test_interpret_agent_output_schema_validation_fails_succeeded() {
+        let schema = make_test_schema();
+        // Missing required field "approved"
+        let text = "<<<CONDUCTOR_OUTPUT>>>\n{\"summary\": \"oops\"}\n<<<END_CONDUCTOR_OUTPUT>>>";
+        let result = interpret_agent_output(Some(text), Some(&schema), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("structured output validation"));
+    }
+
+    #[test]
+    fn test_interpret_agent_output_schema_validation_fails_not_succeeded_falls_back() {
+        let schema = make_test_schema();
+        // Missing required field — but succeeded=false so it falls back
+        let text = "<<<CONDUCTOR_OUTPUT>>>\n{\"summary\": \"oops\"}\n<<<END_CONDUCTOR_OUTPUT>>>";
+        let (markers, context, json) =
+            interpret_agent_output(Some(text), Some(&schema), false).unwrap();
+        // Falls back to generic parse_conductor_output which doesn't find markers/context
+        assert!(json.is_none());
+        assert!(markers.is_empty());
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_interpret_agent_output_no_schema_generic_parsing() {
+        let text = "<<<CONDUCTOR_OUTPUT>>>\n{\"markers\": [\"done\"], \"context\": \"finished\"}\n<<<END_CONDUCTOR_OUTPUT>>>";
+        let (markers, context, json) = interpret_agent_output(Some(text), None, true).unwrap();
+        assert_eq!(markers, vec!["done"]);
+        assert_eq!(context, "finished");
+        assert!(json.is_none());
+    }
+
+    #[test]
+    fn test_interpret_agent_output_no_text() {
+        let schema = make_test_schema();
+        // result_text is None with schema — falls back
+        let (markers, context, json) = interpret_agent_output(None, Some(&schema), false).unwrap();
+        assert!(markers.is_empty());
+        assert!(context.is_empty());
+        assert!(json.is_none());
     }
 }
