@@ -423,6 +423,7 @@ impl App {
             Action::LaunchAgent => self.handle_launch_agent(),
             Action::OrchestrateAgent => self.handle_orchestrate_agent(),
             Action::StopAgent => self.handle_stop_agent(),
+            Action::AttachAgent => self.handle_attach_agent(),
             Action::SubmitFeedback => self.handle_submit_feedback(),
             Action::DismissFeedback => self.handle_dismiss_feedback(),
             Action::ViewAgentLog => self.handle_view_agent_log(),
@@ -3234,6 +3235,29 @@ impl App {
 
         self.state.status_message = Some("Agent cancelled".to_string());
         self.refresh_data();
+    }
+
+    fn handle_attach_agent(&mut self) {
+        let wt_id = self.state.selected_worktree_id.as_ref();
+        let run = wt_id.and_then(|id| self.state.data.latest_agent_runs.get(id));
+
+        let tmux_window = run.and_then(|r| {
+            if r.is_active() {
+                r.tmux_window.as_deref()
+            } else {
+                None
+            }
+        });
+
+        let Some(window) = tmux_window else {
+            self.state.status_message = Some("No active agent to attach to".to_string());
+            return;
+        };
+
+        let mgr = AgentManager::new(&self.conn);
+        if let Err(e) = mgr.attach_agent_window(window) {
+            self.state.status_message = Some(format!("Failed to attach: {e}"));
+        }
     }
 
     fn require_pending_feedback(&mut self) -> Option<FeedbackRequest> {
