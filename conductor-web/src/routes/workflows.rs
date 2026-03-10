@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use conductor_core::error::ConductorError;
 use conductor_core::repo::RepoManager;
 use conductor_core::workflow::{
-    execute_workflow, InputDecl, WorkflowDef, WorkflowExecConfig, WorkflowExecInput,
-    WorkflowManager, WorkflowRun, WorkflowRunStatus, WorkflowRunStep,
+    execute_workflow, validate_resume_preconditions, InputDecl, WorkflowDef, WorkflowExecConfig,
+    WorkflowExecInput, WorkflowManager, WorkflowResumeStandalone, WorkflowRun, WorkflowRunStatus,
+    WorkflowRunStep,
 };
 use conductor_core::worktree::WorktreeManager;
 
@@ -63,6 +64,13 @@ pub struct RunWorkflowRequest {
     pub model: Option<String>,
     pub dry_run: Option<bool>,
     pub inputs: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+pub struct ResumeWorkflowRequest {
+    pub from_step: Option<String>,
+    pub model: Option<String>,
+    pub restart: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -179,7 +187,7 @@ pub async fn run_workflow(
                     .events
                     .emit(ConductorEvent::WorkflowRunStatusChanged {
                         run_id: res.workflow_run_id,
-                        worktree_id: wt_id,
+                        worktree_id: res.worktree_id,
                         status: status.to_string(),
                     });
             }
@@ -260,6 +268,74 @@ pub async fn cancel_workflow(
 
     Ok(Json(
         serde_json::json!({ "status": "cancelled", "run_id": id }),
+    ))
+}
+
+/// POST /api/workflows/runs/{id}/resume
+pub async fn resume_workflow_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ResumeWorkflowRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let config = state.config.read().await.clone();
+    let model = req.model.clone();
+    let from_step = req.from_step.clone();
+    let restart = req.restart.unwrap_or(false);
+
+    // Validate the run exists and is in a resumable state before spawning
+    {
+        let db = state.db.lock().await;
+        let mgr = WorkflowManager::new(&db);
+        let run = mgr.get_workflow_run(&id)?.ok_or_else(|| {
+            ApiError(ConductorError::Workflow(format!(
+                "Workflow run not found: {id}"
+            )))
+        })?;
+        validate_resume_preconditions(&run.status, restart, from_step.as_deref())
+            .map_err(ApiError)?;
+    } // DB lock released here
+
+    // Spawn blocking task with its own DB connection (same pattern as run_workflow)
+    let state_clone = state.clone();
+    let run_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let params = WorkflowResumeStandalone {
+            config,
+            workflow_run_id: run_id,
+            model,
+            from_step,
+            restart,
+        };
+
+        let result = conductor_core::workflow::resume_workflow_standalone(&params);
+
+        match result {
+            Ok(res) => {
+                let status = if res.all_succeeded {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                state_clone
+                    .events
+                    .emit(ConductorEvent::WorkflowRunStatusChanged {
+                        run_id: res.workflow_run_id,
+                        worktree_id: res.worktree_id,
+                        status: status.to_string(),
+                    });
+            }
+            Err(e) => {
+                tracing::error!("Workflow resume failed: {e}");
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "resuming",
+            "run_id": id,
+        })),
     ))
 }
 

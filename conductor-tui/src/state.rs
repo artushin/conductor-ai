@@ -366,6 +366,9 @@ pub enum ConfirmAction {
     CancelWorkflow {
         workflow_run_id: String,
     },
+    ResumeWorkflow {
+        workflow_run_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1069,6 +1072,7 @@ mod tests {
             ended_at: None,
             result_summary: None,
             definition_snapshot: None,
+            inputs: std::collections::HashMap::new(),
         }
     }
 

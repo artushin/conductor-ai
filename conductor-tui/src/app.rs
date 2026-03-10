@@ -567,6 +567,7 @@ impl App {
 
             // Workflow actions
             Action::RunWorkflow => self.handle_run_workflow(),
+            Action::ResumeWorkflow => self.handle_resume_workflow(),
             Action::CancelWorkflow => self.handle_cancel_workflow(),
             Action::ApproveGate => self.handle_approve_gate(),
             Action::RejectGate => self.handle_reject_gate(),
@@ -1506,6 +1507,43 @@ impl App {
                         };
                     }
                 }
+            }
+            ConfirmAction::ResumeWorkflow { workflow_run_id } => {
+                let config = self.config.clone();
+                let bg_tx = self.bg_tx.clone();
+                let run_id = workflow_run_id.clone();
+
+                std::thread::spawn(move || {
+                    use conductor_core::workflow::{
+                        resume_workflow_standalone, WorkflowResumeStandalone,
+                    };
+
+                    let params = WorkflowResumeStandalone {
+                        config,
+                        workflow_run_id: run_id,
+                        model: None,
+                        from_step: None,
+                        restart: false,
+                    };
+
+                    let result = resume_workflow_standalone(&params);
+
+                    if let Some(ref tx) = bg_tx {
+                        let msg = match result {
+                            Ok(res) => {
+                                if res.all_succeeded {
+                                    "Workflow resumed and completed successfully".to_string()
+                                } else {
+                                    "Workflow resumed but finished with failures".to_string()
+                                }
+                            }
+                            Err(e) => format!("Resume failed: {e}"),
+                        };
+                        let _ = tx.send(Action::BackgroundSuccess { message: msg });
+                    }
+                });
+
+                self.state.status_message = Some("Resuming workflow…".to_string());
             }
             ConfirmAction::DeleteIssueSource {
                 source_id,
@@ -4383,6 +4421,36 @@ impl App {
 
         self.workflow_threads.push(handle);
         self.state.status_message = Some(format!("Starting workflow '{workflow_name}'…"));
+    }
+
+    fn handle_resume_workflow(&mut self) {
+        let run = match self
+            .state
+            .selected_workflow_run_id
+            .as_ref()
+            .and_then(|id| self.state.data.workflow_runs.iter().find(|r| &r.id == id))
+        {
+            Some(r) => r.clone(),
+            None => {
+                self.state.status_message = Some("No workflow run selected".to_string());
+                return;
+            }
+        };
+
+        if let Err(e) =
+            conductor_core::workflow::validate_resume_preconditions(&run.status, false, None)
+        {
+            self.state.status_message = Some(e.to_string());
+            return;
+        }
+
+        self.state.modal = Modal::Confirm {
+            title: "Resume Workflow".to_string(),
+            message: format!("Resume workflow run '{}'?", run.workflow_name),
+            on_confirm: ConfirmAction::ResumeWorkflow {
+                workflow_run_id: run.id.clone(),
+            },
+        };
     }
 
     fn handle_cancel_workflow(&mut self) {

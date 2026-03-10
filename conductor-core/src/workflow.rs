@@ -62,7 +62,7 @@ const STEP_COLUMNS: &str =
 /// Column list for `workflow_runs` SELECT queries (used by `row_to_workflow_run`).
 const RUN_COLUMNS: &str =
     "id, workflow_name, worktree_id, parent_run_id, status, dry_run, trigger, \
-     started_at, ended_at, result_summary, definition_snapshot";
+     started_at, ended_at, result_summary, definition_snapshot, inputs";
 
 /// Instruction appended to every agent prompt for structured output.
 pub const CONDUCTOR_OUTPUT_INSTRUCTION: &str = r#"
@@ -293,6 +293,7 @@ pub struct WorkflowRun {
     pub ended_at: Option<String>,
     pub result_summary: Option<String>,
     pub definition_snapshot: Option<String>,
+    pub inputs: HashMap<String, String>,
 }
 
 /// A workflow step execution record from the database.
@@ -440,6 +441,7 @@ impl Default for WorkflowExecConfig {
 #[derive(Debug, Clone)]
 pub struct WorkflowResult {
     pub workflow_run_id: String,
+    pub worktree_id: String,
     pub workflow_name: String,
     pub all_succeeded: bool,
     pub total_cost: f64,
@@ -518,7 +520,24 @@ impl<'a> WorkflowManager<'a> {
             ended_at: None,
             result_summary: None,
             definition_snapshot: definition_snapshot.map(String::from),
+            inputs: HashMap::new(),
         })
+    }
+
+    /// Persist the input variables for a workflow run.
+    pub fn set_workflow_run_inputs(
+        &self,
+        run_id: &str,
+        inputs: &HashMap<String, String>,
+    ) -> Result<()> {
+        let inputs_json = serde_json::to_string(inputs).map_err(|e| {
+            ConductorError::Workflow(format!("Failed to serialize workflow inputs: {e}"))
+        })?;
+        self.conn.execute(
+            "UPDATE workflow_runs SET inputs = ?1 WHERE id = ?2",
+            params![inputs_json, run_id],
+        )?;
+        Ok(())
     }
 
     pub fn update_workflow_status(
@@ -872,10 +891,73 @@ impl<'a> WorkflowManager<'a> {
     ) -> Result<WorkflowDef> {
         workflow_dsl::load_workflow_by_name(worktree_path, repo_path, name)
     }
+
+    const SQL_RESET_FAILED: &'static str = "UPDATE workflow_run_steps \
+         SET status = 'pending', started_at = NULL, ended_at = NULL, result_text = NULL, \
+         context_out = NULL, markers_out = NULL, structured_output = NULL, child_run_id = NULL \
+         WHERE workflow_run_id = ?1 AND status IN ('failed', 'running', 'timed_out')";
+
+    const SQL_RESET_COMPLETED: &'static str = "UPDATE workflow_run_steps \
+         SET status = 'pending', started_at = NULL, ended_at = NULL, result_text = NULL, \
+         context_out = NULL, markers_out = NULL, structured_output = NULL, child_run_id = NULL \
+         WHERE workflow_run_id = ?1 AND status = 'completed'";
+
+    const SQL_RESET_FROM_POS: &'static str = "UPDATE workflow_run_steps \
+         SET status = 'pending', started_at = NULL, ended_at = NULL, result_text = NULL, \
+         context_out = NULL, markers_out = NULL, structured_output = NULL, child_run_id = NULL \
+         WHERE workflow_run_id = ?1 AND position >= ?2";
+
+    /// Reset all non-completed steps for a workflow run back to `pending`.
+    ///
+    /// Used before resuming so that failed/running/timed_out steps get re-executed.
+    pub fn reset_failed_steps(&self, workflow_run_id: &str) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(Self::SQL_RESET_FAILED, params![workflow_run_id])?;
+        Ok(count as u64)
+    }
+
+    /// Reset all completed steps for a workflow run back to `pending`.
+    ///
+    /// Used for full restart (--restart) to re-run from scratch.
+    pub fn reset_completed_steps(&self, workflow_run_id: &str) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(Self::SQL_RESET_COMPLETED, params![workflow_run_id])?;
+        Ok(count as u64)
+    }
+
+    /// Reset all steps at or after a given position back to `pending`.
+    ///
+    /// Used for --from-step to re-run from a specific step onwards.
+    pub fn reset_steps_from_position(&self, workflow_run_id: &str, position: i64) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(Self::SQL_RESET_FROM_POS, params![workflow_run_id, position])?;
+        Ok(count as u64)
+    }
+
+    /// Return the set of completed step keys as `(step_name, iteration)` pairs.
+    ///
+    /// Used to build the skip set for resume.
+    pub fn get_completed_step_keys(&self, workflow_run_id: &str) -> Result<HashSet<StepKey>> {
+        let steps = self.get_workflow_steps(workflow_run_id)?;
+        Ok(completed_keys_from_steps(&steps))
+    }
 }
 
 fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRun> {
     let dry_run_int: i64 = row.get(5)?;
+    let inputs_json: Option<String> = row.get(11)?;
+    let inputs: HashMap<String, String> = inputs_json
+        .as_deref()
+        .map(|s| {
+            serde_json::from_str(s).unwrap_or_else(|e| {
+                tracing::warn!("Malformed inputs JSON in workflow run: {e}");
+                HashMap::new()
+            })
+        })
+        .unwrap_or_default();
     Ok(WorkflowRun {
         id: row.get(0)?,
         workflow_name: row.get(1)?,
@@ -888,6 +970,7 @@ fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRun> {
         ended_at: row.get(8)?,
         result_summary: row.get(9)?,
         definition_snapshot: row.get(10)?,
+        inputs,
     })
 }
 
@@ -1009,6 +1092,36 @@ fn build_agent_prompt(
 // Execution state
 // ---------------------------------------------------------------------------
 
+/// A step key is a `(name, iteration)` pair used for skip-set and step-map lookups.
+type StepKey = (String, u32);
+
+/// Extract completed step keys from a slice of step records.
+///
+/// Shared by [`WorkflowManager::get_completed_step_keys`] and [`resume_workflow`]
+/// so the key-building logic lives in one place.
+fn completed_keys_from_steps(steps: &[WorkflowRunStep]) -> HashSet<StepKey> {
+    steps
+        .iter()
+        .filter(|s| s.status == WorkflowStepStatus::Completed)
+        .map(|s| (s.step_name.clone(), s.iteration as u32))
+        .collect()
+}
+
+/// Pre-loaded context for resuming a workflow run.
+///
+/// Separated from [`ExecutionState`] so that fresh runs carry no resume
+/// overhead and the borrow-splitting between "read completed data" and
+/// "mutate execution state" is explicit.
+struct ResumeContext {
+    /// Step keys to skip (e.g. `("lint", 0)`).
+    skip_completed: HashSet<StepKey>,
+    /// Completed step records keyed by step key, for O(1) restore.
+    step_map: HashMap<StepKey, WorkflowRunStep>,
+    /// Pre-loaded child agent runs keyed by run ID, avoiding N+1 queries
+    /// when accumulating costs during restore.
+    child_runs: HashMap<String, crate::agent::AgentRun>,
+}
+
 /// Mutable runtime state for a workflow execution.
 struct ExecutionState<'a> {
     conn: &'a Connection,
@@ -1042,6 +1155,8 @@ struct ExecutionState<'a> {
     block_output: Option<String>,
     /// Block-level prompt snippet refs inherited from an enclosing `do {}` block.
     block_with: Vec<String>,
+    /// Resume context — `None` for fresh runs, `Some` when resuming.
+    resume_ctx: Option<ResumeContext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1255,11 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         Some(&snapshot_json),
     )?;
 
+    // Persist inputs so they can be restored on resume
+    if !input.inputs.is_empty() {
+        wf_mgr.set_workflow_run_inputs(&wf_run.id, &input.inputs)?;
+    }
+
     // Mark as running
     wf_mgr.update_workflow_status(&wf_run.id, WorkflowRunStatus::Running, None)?;
 
@@ -1170,11 +1290,23 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         last_structured_output: None,
         block_output: None,
         block_with: Vec::new(),
+        resume_ctx: None,
     };
 
+    run_workflow_engine(&mut state, workflow)
+}
+
+/// Shared orchestration: execute body → always block → build summary → finalize.
+///
+/// Both `execute_workflow` and `resume_workflow` delegate here after constructing
+/// their `ExecutionState`.
+fn run_workflow_engine(
+    state: &mut ExecutionState<'_>,
+    workflow: &WorkflowDef,
+) -> Result<WorkflowResult> {
     // Execute main body
     let mut body_error: Option<String> = None;
-    let body_result = execute_nodes(&mut state, &workflow.body);
+    let body_result = execute_nodes(state, &workflow.body);
     if let Err(ref e) = body_result {
         let msg = e.to_string();
         tracing::error!("Body execution error: {msg}");
@@ -1189,38 +1321,48 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         } else {
             "failed"
         };
-        // Inject {{workflow_status}} into inputs for always steps
         state
             .inputs
             .insert("workflow_status".to_string(), workflow_status.to_string());
-        let always_result = execute_nodes(&mut state, &workflow.always);
+        let always_result = execute_nodes(state, &workflow.always);
         if let Err(ref e) = always_result {
             tracing::warn!("Always block error (non-fatal): {e}");
-            // Don't change all_succeeded for always failures
         }
     }
 
     // Build summary
-    let mut summary = build_workflow_summary(&state);
+    let mut summary = build_workflow_summary(state);
     if let Some(ref err) = body_error {
         summary.push_str(&format!("\nError: {err}"));
     }
 
     // Finalize
+    let wf_run_id = state.workflow_run_id.clone();
+    let parent_run_id = state.parent_run_id.clone();
     if state.all_succeeded {
-        agent_mgr.update_run_completed(
-            &parent_run.id,
+        state.agent_mgr.update_run_completed(
+            &parent_run_id,
             None,
             Some(&summary),
             Some(state.total_cost),
             Some(state.total_turns),
             Some(state.total_duration_ms),
         )?;
-        wf_mgr.update_workflow_status(&wf_run.id, WorkflowRunStatus::Completed, Some(&summary))?;
+        state.wf_mgr.update_workflow_status(
+            &wf_run_id,
+            WorkflowRunStatus::Completed,
+            Some(&summary),
+        )?;
         tracing::info!("Workflow '{}' completed successfully", workflow.name);
     } else {
-        agent_mgr.update_run_failed(&parent_run.id, &summary)?;
-        wf_mgr.update_workflow_status(&wf_run.id, WorkflowRunStatus::Failed, Some(&summary))?;
+        state
+            .agent_mgr
+            .update_run_failed(&parent_run_id, &summary)?;
+        state.wf_mgr.update_workflow_status(
+            &wf_run_id,
+            WorkflowRunStatus::Failed,
+            Some(&summary),
+        )?;
         tracing::warn!("Workflow '{}' finished with failures", workflow.name);
     }
 
@@ -1232,7 +1374,8 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
     );
 
     Ok(WorkflowResult {
-        workflow_run_id: wf_run.id,
+        workflow_run_id: wf_run_id,
+        worktree_id: state.worktree_id.clone(),
         workflow_name: workflow.name.clone(),
         all_succeeded: state.all_succeeded,
         total_cost: state.total_cost,
@@ -1275,6 +1418,240 @@ pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<Wo
     };
 
     execute_workflow(&input)
+}
+
+/// Owned inputs for [`resume_workflow_standalone`], avoiding lifetime issues
+/// when spawning background threads.
+pub struct WorkflowResumeStandalone {
+    pub config: Config,
+    pub workflow_run_id: String,
+    pub model: Option<String>,
+    pub from_step: Option<String>,
+    pub restart: bool,
+}
+
+/// Validate resume preconditions that can be checked from status alone.
+///
+/// Shared by the core `resume_workflow` function and the web endpoint so that
+/// validation rules and error strings stay in a single place.
+pub fn validate_resume_preconditions(
+    status: &WorkflowRunStatus,
+    restart: bool,
+    from_step: Option<&str>,
+) -> Result<()> {
+    if matches!(status, WorkflowRunStatus::Completed) && !restart {
+        return Err(ConductorError::Workflow(
+            "Cannot resume a completed workflow run. Use --restart to re-run from the beginning."
+                .to_string(),
+        ));
+    }
+    if matches!(status, WorkflowRunStatus::Running) {
+        return Err(ConductorError::Workflow(
+            "Cannot resume a workflow run that is already running.".to_string(),
+        ));
+    }
+    if matches!(status, WorkflowRunStatus::Cancelled) {
+        return Err(ConductorError::Workflow(
+            "Cannot resume a cancelled workflow run.".to_string(),
+        ));
+    }
+    if restart && from_step.is_some() {
+        return Err(ConductorError::Workflow(
+            "Cannot use --restart and --from-step together: --restart re-runs all steps, \
+             --from-step resumes from a specific step."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resume a workflow in a self-contained manner: opens its own database
+/// connection. Designed for use in background threads.
+pub fn resume_workflow_standalone(params: &WorkflowResumeStandalone) -> Result<WorkflowResult> {
+    let db = crate::config::db_path();
+    let conn = crate::db::open_database(&db)?;
+
+    let input = WorkflowResumeInput {
+        conn: &conn,
+        config: &params.config,
+        workflow_run_id: &params.workflow_run_id,
+        model: params.model.as_deref(),
+        from_step: params.from_step.as_deref(),
+        restart: params.restart,
+    };
+
+    resume_workflow(&input)
+}
+
+/// Input parameters for resuming a workflow run.
+pub struct WorkflowResumeInput<'a> {
+    pub conn: &'a Connection,
+    pub config: &'a Config,
+    pub workflow_run_id: &'a str,
+    /// Optional model override for agent steps.
+    pub model: Option<&'a str>,
+    /// Resume from a specific step name (re-runs steps from that point).
+    pub from_step: Option<&'a str>,
+    /// Restart from the beginning (clear all step results).
+    pub restart: bool,
+}
+
+/// Resume a failed or stalled workflow run from the point of failure.
+///
+/// Loads the workflow definition from the run's `definition_snapshot`, rebuilds
+/// the skip set from completed steps, resets failed steps to pending, and
+/// re-enters the execution loop.
+pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult> {
+    let conn = input.conn;
+    let config = input.config;
+    let wf_mgr = WorkflowManager::new(conn);
+    let wt_mgr = WorktreeManager::new(conn, config);
+
+    // Load and validate the workflow run
+    let wf_run = wf_mgr
+        .get_workflow_run(input.workflow_run_id)?
+        .ok_or_else(|| {
+            ConductorError::Workflow(format!("Workflow run not found: {}", input.workflow_run_id))
+        })?;
+
+    validate_resume_preconditions(&wf_run.status, input.restart, input.from_step)?;
+
+    // Load all steps once (avoids N+1 queries later)
+    let all_steps = wf_mgr.get_workflow_steps(&wf_run.id)?;
+
+    // Validate --from-step early (fail-fast before heavier worktree/snapshot operations)
+    if let Some(from_step) = input.from_step {
+        if !input.restart && !all_steps.iter().any(|s| s.step_name == from_step) {
+            return Err(ConductorError::Workflow(format!(
+                "Step '{}' not found in workflow run '{}'",
+                from_step, wf_run.id
+            )));
+        }
+    }
+
+    // Deserialize definition from snapshot
+    let snapshot = wf_run.definition_snapshot.as_deref().ok_or_else(|| {
+        ConductorError::Workflow(format!(
+            "Workflow run '{}' has no definition snapshot — cannot resume.",
+            wf_run.id
+        ))
+    })?;
+    let workflow: WorkflowDef = serde_json::from_str(snapshot).map_err(|e| {
+        ConductorError::Workflow(format!("Failed to deserialize workflow snapshot: {e}"))
+    })?;
+
+    // Resolve worktree info
+    let worktree = wt_mgr.get_by_id(&wf_run.worktree_id)?;
+    let repo = crate::repo::RepoManager::new(conn, config).get_by_id(&worktree.repo_id)?;
+
+    // Build the skip set
+    let skip_completed = if input.restart {
+        // Restart: clear all step results — skip nothing
+        wf_mgr.reset_failed_steps(&wf_run.id)?;
+        wf_mgr.reset_completed_steps(&wf_run.id)?;
+        HashSet::new()
+    } else {
+        let mut keys = completed_keys_from_steps(&all_steps);
+
+        // Handle --from-step: remove completed keys at or after the specified step
+        if let Some(from_step) = input.from_step {
+            // Safety: from_step existence was validated above
+            let pos = all_steps
+                .iter()
+                .find(|s| s.step_name == from_step)
+                .expect("from_step validated above")
+                .position;
+
+            let to_remove: Vec<StepKey> = all_steps
+                .iter()
+                .filter(|s| s.position >= pos && s.status == WorkflowStepStatus::Completed)
+                .map(|s| (s.step_name.clone(), s.iteration as u32))
+                .collect();
+            for key in to_remove {
+                keys.remove(&key);
+            }
+            // Reset those steps in DB
+            wf_mgr.reset_steps_from_position(&wf_run.id, pos)?;
+        }
+
+        // Reset non-completed steps
+        wf_mgr.reset_failed_steps(&wf_run.id)?;
+        keys
+    };
+
+    // Build the step map from `all_steps` (only the keys still in skip_completed
+    // survived any --from-step pruning, so filter by membership).
+    let step_map: HashMap<StepKey, WorkflowRunStep> = all_steps
+        .into_iter()
+        .filter(|s| s.status == WorkflowStepStatus::Completed)
+        .map(|s| {
+            let key = (s.step_name.clone(), s.iteration as u32);
+            (key, s)
+        })
+        .filter(|(key, _)| skip_completed.contains(key))
+        .collect();
+
+    // Batch-load child agent runs in a single query to avoid N+1 during cost accumulation
+    let agent_mgr = AgentManager::new(conn);
+    let child_run_ids: Vec<&str> = step_map
+        .values()
+        .filter_map(|s| s.child_run_id.as_deref())
+        .collect();
+    let child_runs = agent_mgr.get_runs_by_ids(&child_run_ids)?;
+
+    let resume_ctx = if skip_completed.is_empty() {
+        None
+    } else {
+        Some(ResumeContext {
+            skip_completed,
+            step_map,
+            child_runs,
+        })
+    };
+
+    // Reset run status to Running
+    wf_mgr.update_workflow_status(&wf_run.id, WorkflowRunStatus::Running, None)?;
+
+    tracing::info!(
+        "Resuming workflow '{}' (run {}), {} completed steps to skip",
+        workflow.name,
+        wf_run.id,
+        resume_ctx
+            .as_ref()
+            .map_or(0, |ctx| ctx.skip_completed.len()),
+    );
+
+    let mut state = ExecutionState {
+        conn,
+        config,
+        workflow_run_id: wf_run.id.clone(),
+        workflow_name: workflow.name.clone(),
+        worktree_id: wf_run.worktree_id.clone(),
+        worktree_path: worktree.path.clone(),
+        worktree_slug: worktree.slug.clone(),
+        repo_path: repo.local_path.clone(),
+        model: input.model.map(String::from),
+        exec_config: WorkflowExecConfig::default(),
+        inputs: wf_run.inputs.clone(),
+        agent_mgr: AgentManager::new(conn),
+        wf_mgr: WorkflowManager::new(conn),
+        parent_run_id: wf_run.parent_run_id.clone(),
+        depth: 0,
+        step_results: HashMap::new(),
+        contexts: Vec::new(),
+        position: 0,
+        all_succeeded: true,
+        total_cost: 0.0,
+        total_turns: 0,
+        total_duration_ms: 0,
+        last_gate_feedback: None,
+        last_structured_output: None,
+        block_output: None,
+        block_with: Vec::new(),
+        resume_ctx,
+    };
+
+    run_workflow_engine(&mut state, &workflow)
 }
 
 /// Walk a list of workflow nodes, dispatching to the appropriate handler.
@@ -1522,6 +1899,17 @@ fn execute_call_with_schema(
     let pos = state.position;
     state.position += 1;
 
+    let step_key_check = node.agent.step_key();
+    if should_skip(state, &step_key_check, iteration) {
+        tracing::info!(
+            "Skipping completed step '{}' (iteration {})",
+            step_key_check,
+            iteration
+        );
+        restore_step(state, &step_key_check, iteration);
+        return Ok(());
+    }
+
     // Load agent definition
     let agent_def = agent_config::load_agent(
         &state.worktree_path,
@@ -1763,6 +2151,14 @@ fn execute_call_workflow(
     let pos = state.position;
     state.position += 1;
 
+    // Skip completed sub-workflow steps on resume
+    let wf_step_name = format!("workflow:{}", node.workflow);
+    if should_skip(state, &wf_step_name, iteration) {
+        tracing::info!("Skipping completed sub-workflow '{}'", node.workflow);
+        restore_step(state, &wf_step_name, iteration);
+        return Ok(());
+    }
+
     let child_depth = state.depth + 1;
     if child_depth > workflow_dsl::MAX_WORKFLOW_DEPTH {
         let msg = format!(
@@ -1798,7 +2194,7 @@ fn execute_call_workflow(
     for attempt in 0..max_attempts {
         let step_id = state.wf_mgr.insert_step(
             &state.workflow_run_id,
-            &format!("workflow:{}", node.workflow),
+            &wf_step_name,
             "workflow",
             false,
             pos,
@@ -2170,7 +2566,13 @@ fn check_max_iterations(
 }
 
 fn execute_while(state: &mut ExecutionState<'_>, node: &WhileNode) -> Result<()> {
-    let mut iteration = 0u32;
+    // On resume, determine the last completed iteration so we can fast-forward
+    let start_iteration = if state.resume_ctx.is_some() {
+        find_max_completed_while_iteration(state, node)
+    } else {
+        0u32
+    };
+    let mut iteration = start_iteration;
     let mut prev_marker_sets: Vec<HashSet<String>> = Vec::new();
 
     loop {
@@ -2380,11 +2782,21 @@ fn execute_parallel(
     }
 
     let mut children = Vec::new();
+    let mut skipped_count = 0u32;
 
     for (i, agent_ref) in node.calls.iter().enumerate() {
         let pos = pos_base + i as i64;
         state.position = pos + 1;
         let agent_label = agent_ref.label();
+
+        // Skip completed agents on resume
+        let agent_step_key = agent_ref.step_key();
+        if should_skip(state, &agent_step_key, iteration) {
+            tracing::info!("parallel: skipping completed agent '{}'", agent_label);
+            restore_step(state, &agent_step_key, iteration);
+            skipped_count += 1;
+            continue;
+        }
 
         let agent_def = agent_config::load_agent(
             &state.worktree_path,
@@ -2654,17 +3066,18 @@ fn execute_parallel(
         thread::sleep(state.exec_config.poll_interval);
     }
 
-    // Apply min_success policy
-    let min_required = node.min_success.unwrap_or(children.len() as u32);
+    // Apply min_success policy (skipped-on-resume agents count as successes)
+    let effective_successes = successes + skipped_count;
+    let total_agents = children.len() as u32 + skipped_count;
+    let min_required = node.min_success.unwrap_or(total_agents);
     tracing::info!(
-        "parallel: {successes} succeeded, {failures} failed out of {} agents",
-        children.len()
+        "parallel: {successes} succeeded, {failures} failed, {skipped_count} skipped (resume) out of {total_agents} agents",
     );
-    if successes < min_required {
+    if effective_successes < min_required {
         tracing::warn!(
             "parallel: only {}/{} succeeded (min_success={})",
-            successes,
-            children.len(),
+            effective_successes,
+            total_agents,
             min_required
         );
         state.all_succeeded = false;
@@ -2673,7 +3086,7 @@ fn execute_parallel(
     // Store merged markers as a synthetic result
     let synthetic_result = StepResult {
         step_name: format!("parallel:{}", group_id),
-        status: if successes >= min_required {
+        status: if effective_successes >= min_required {
             WorkflowStepStatus::Completed
         } else {
             WorkflowStepStatus::Failed
@@ -2697,6 +3110,13 @@ fn execute_parallel(
 fn execute_gate(state: &mut ExecutionState<'_>, node: &GateNode, iteration: u32) -> Result<()> {
     let pos = state.position;
     state.position += 1;
+
+    // Skip completed gates on resume — restore feedback for downstream steps
+    if should_skip(state, &node.name, iteration) {
+        tracing::info!("Skipping completed gate '{}'", node.name);
+        restore_step(state, &node.name, iteration);
+        return Ok(());
+    }
 
     // Dry-run: auto-approve all gates
     if state.exec_config.dry_run {
@@ -3042,6 +3462,165 @@ fn sanitize_tmux_name(name: &str) -> String {
         .collect()
 }
 
+/// Extract all leaf-node step keys from a workflow node.
+///
+/// Recurses into control-flow nodes (if/unless/while/always) and collects
+/// keys from all trackable leaves: `Call`, `Parallel` agents, `Gate`, and
+/// `CallWorkflow`.
+fn collect_leaf_step_keys(node: &WorkflowNode) -> Vec<String> {
+    match node {
+        WorkflowNode::Call(c) => vec![c.agent.step_key()],
+        WorkflowNode::Parallel(p) => p.calls.iter().map(|a| a.step_key()).collect(),
+        WorkflowNode::Gate(g) => vec![g.name.clone()],
+        WorkflowNode::CallWorkflow(cw) => vec![format!("workflow:{}", cw.workflow)],
+        WorkflowNode::If(n) => n.body.iter().flat_map(collect_leaf_step_keys).collect(),
+        WorkflowNode::Unless(n) => n.body.iter().flat_map(collect_leaf_step_keys).collect(),
+        WorkflowNode::While(n) => n.body.iter().flat_map(collect_leaf_step_keys).collect(),
+        WorkflowNode::DoWhile(n) => n.body.iter().flat_map(collect_leaf_step_keys).collect(),
+        WorkflowNode::Do(n) => n.body.iter().flat_map(collect_leaf_step_keys).collect(),
+        WorkflowNode::Always(n) => n.body.iter().flat_map(collect_leaf_step_keys).collect(),
+    }
+}
+
+/// Find the starting iteration for a while loop on resume.
+///
+/// Looks at the skip_completed set for step keys that match body nodes of the
+/// while loop. Returns the max iteration that has all body nodes completed,
+/// so the loop resumes from the iteration where it failed.
+fn find_max_completed_while_iteration(state: &ExecutionState<'_>, node: &WhileNode) -> u32 {
+    let skip_set = match state.resume_ctx {
+        Some(ref ctx) => &ctx.skip_completed,
+        None => return 0,
+    };
+
+    // Collect step keys from all trackable body nodes
+    let body_keys: Vec<String> = node.body.iter().flat_map(collect_leaf_step_keys).collect();
+
+    if body_keys.is_empty() {
+        return 0;
+    }
+
+    // Find the highest iteration where all body nodes are completed
+    let mut iter = 0u32;
+    loop {
+        let all_done = body_keys
+            .iter()
+            .all(|k| skip_set.contains(&(k.clone(), iter)));
+        if !all_done {
+            break;
+        }
+        iter += 1;
+    }
+    // iter is now the first incomplete iteration — start there
+    iter
+}
+
+/// Check whether a step should be skipped on resume.
+fn should_skip(state: &ExecutionState<'_>, step_name: &str, iteration: u32) -> bool {
+    state.resume_ctx.as_ref().is_some_and(|ctx| {
+        ctx.skip_completed
+            .contains(&(step_name.to_owned(), iteration))
+    })
+}
+
+/// Temporarily take the `ResumeContext` out of `state` so we can borrow `state`
+/// mutably while reading from the context's maps.
+fn restore_step(state: &mut ExecutionState<'_>, key: &str, iteration: u32) {
+    let ctx = state.resume_ctx.take();
+    if let Some(ref ctx) = ctx {
+        restore_completed_step(state, ctx, key, iteration);
+    }
+    state.resume_ctx = ctx;
+}
+
+/// Restore a completed step's results from the resume context into the
+/// execution state.
+///
+/// Rebuilds `step_results` and `contexts` for completed steps so that
+/// downstream variable substitution (e.g. `{{prior_context}}`) works correctly.
+fn restore_completed_step(
+    state: &mut ExecutionState<'_>,
+    ctx: &ResumeContext,
+    step_key: &str,
+    iteration: u32,
+) {
+    let completed_step = ctx.step_map.get(&(step_key.to_owned(), iteration));
+
+    let Some(step) = completed_step else {
+        tracing::warn!(
+            "resume: step '{step_key}:{iteration}' in skip set but not found in resume context \
+             — downstream variable substitution may be incorrect"
+        );
+        return;
+    };
+
+    let markers: Vec<String> = step
+        .markers_out
+        .as_deref()
+        .and_then(|m| {
+            serde_json::from_str(m)
+                .map_err(|e| {
+                    tracing::warn!(
+                        "resume: failed to deserialize markers for step '{}': {e}",
+                        step_key
+                    );
+                    e
+                })
+                .ok()
+        })
+        .unwrap_or_default();
+    let context = step.context_out.clone().unwrap_or_default();
+
+    // Accumulate costs from the pre-loaded child agent run
+    if let Some(ref child_run_id) = step.child_run_id {
+        if let Some(run) = ctx.child_runs.get(child_run_id) {
+            if let Some(cost) = run.cost_usd {
+                state.total_cost += cost;
+            }
+            if let Some(turns) = run.num_turns {
+                state.total_turns += turns;
+            }
+            if let Some(dur) = run.duration_ms {
+                state.total_duration_ms += dur;
+            }
+        } else {
+            tracing::warn!(
+                "resume: child agent run '{child_run_id}' for step '{step_key}' not found \
+                 — cost/turns/duration will be excluded from resumed run totals"
+            );
+        }
+    }
+
+    // Restore gate feedback if this was a gate step
+    if let Some(ref feedback) = step.gate_feedback {
+        state.last_gate_feedback = Some(feedback.clone());
+    }
+
+    if step.structured_output.is_some() {
+        state.last_structured_output = step.structured_output.clone();
+    }
+
+    let step_result = StepResult {
+        step_name: step_key.to_string(),
+        status: WorkflowStepStatus::Completed,
+        result_text: step.result_text.clone(),
+        cost_usd: None,
+        num_turns: None,
+        duration_ms: None,
+        markers,
+        context: context.clone(),
+        child_run_id: step.child_run_id.clone(),
+        structured_output: step.structured_output.clone(),
+    };
+    state.step_results.insert(step_key.to_string(), step_result);
+
+    state.contexts.push(ContextEntry {
+        step: step_key.to_string(),
+        iteration,
+        context,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3340,6 +3919,7 @@ mod tests {
             last_structured_output: None,
             block_output: None,
             block_with: Vec::new(),
+            resume_ctx: None,
         };
         (state, run_id)
     }
@@ -4133,6 +4713,7 @@ And here is my actual output:
             last_structured_output: None,
             block_output: None,
             block_with: Vec::new(),
+            resume_ctx: None,
         }
     }
 
@@ -4519,6 +5100,7 @@ And here is my actual output:
             last_structured_output: None,
             block_output: None,
             block_with: Vec::new(),
+            resume_ctx: None,
         }
     }
 
@@ -5324,5 +5906,1051 @@ And here is my actual output:
 
         let result = bubble_up_child_step_results(&wf_mgr, &run_id);
         assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume-related tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a workflow run with steps in various statuses.
+    fn setup_run_with_steps(conn: &Connection) -> (String, WorkflowManager<'_>) {
+        let agent_mgr = AgentManager::new(conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let mgr = WorkflowManager::new(conn);
+        let run = mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", None)
+            .unwrap();
+
+        // Step 0: completed
+        let s0 = mgr
+            .insert_step(&run.id, "step-a", "actor", false, 0, 0)
+            .unwrap();
+        mgr.update_step_status(
+            &s0,
+            WorkflowStepStatus::Completed,
+            None,
+            Some("result-a"),
+            Some("ctx-a"),
+            Some(r#"["marker_a"]"#),
+            Some(0),
+        )
+        .unwrap();
+
+        // Step 1: failed
+        let s1 = mgr
+            .insert_step(&run.id, "step-b", "actor", false, 1, 0)
+            .unwrap();
+        mgr.update_step_status(
+            &s1,
+            WorkflowStepStatus::Failed,
+            None,
+            Some("error"),
+            None,
+            None,
+            Some(0),
+        )
+        .unwrap();
+
+        // Step 2: running (stalled)
+        let s2 = mgr
+            .insert_step(&run.id, "step-c", "actor", false, 2, 0)
+            .unwrap();
+        mgr.update_step_status(
+            &s2,
+            WorkflowStepStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        (run.id, mgr)
+    }
+
+    #[test]
+    fn test_reset_failed_steps() {
+        let conn = setup_db();
+        let (run_id, mgr) = setup_run_with_steps(&conn);
+
+        let count = mgr.reset_failed_steps(&run_id).unwrap();
+        // Should reset both 'failed' and 'running' steps
+        assert_eq!(count, 2);
+
+        let steps = mgr.get_workflow_steps(&run_id).unwrap();
+        assert_eq!(steps[0].status, WorkflowStepStatus::Completed); // unchanged
+        assert_eq!(steps[1].status, WorkflowStepStatus::Pending); // was failed
+        assert!(steps[1].result_text.is_none()); // cleared
+        assert_eq!(steps[2].status, WorkflowStepStatus::Pending); // was running
+    }
+
+    #[test]
+    fn test_reset_completed_steps() {
+        let conn = setup_db();
+        let (run_id, mgr) = setup_run_with_steps(&conn);
+
+        let count = mgr.reset_completed_steps(&run_id).unwrap();
+        assert_eq!(count, 1);
+
+        let steps = mgr.get_workflow_steps(&run_id).unwrap();
+        assert_eq!(steps[0].status, WorkflowStepStatus::Pending); // was completed
+        assert!(steps[0].result_text.is_none()); // cleared
+        assert!(steps[0].context_out.is_none()); // cleared
+    }
+
+    #[test]
+    fn test_reset_steps_from_position() {
+        let conn = setup_db();
+        let (run_id, mgr) = setup_run_with_steps(&conn);
+
+        // Reset from position 1 onwards
+        let count = mgr.reset_steps_from_position(&run_id, 1).unwrap();
+        assert_eq!(count, 2); // positions 1 and 2
+
+        let steps = mgr.get_workflow_steps(&run_id).unwrap();
+        assert_eq!(steps[0].status, WorkflowStepStatus::Completed); // position 0 unchanged
+        assert_eq!(steps[1].status, WorkflowStepStatus::Pending);
+        assert_eq!(steps[2].status, WorkflowStepStatus::Pending);
+    }
+
+    #[test]
+    fn test_get_completed_step_keys() {
+        let conn = setup_db();
+        let (run_id, mgr) = setup_run_with_steps(&conn);
+
+        let keys = mgr.get_completed_step_keys(&run_id).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&("step-a".to_string(), 0)));
+        // Failed/running steps should not be in the set
+        assert!(!keys.contains(&("step-b".to_string(), 0)));
+        assert!(!keys.contains(&("step-c".to_string(), 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // find_max_completed_while_iteration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_max_completed_while_iteration_none_completed() {
+        let conn = setup_db();
+        let state = make_test_state(&conn);
+
+        let node = WhileNode {
+            step: "check".to_string(),
+            marker: "needs_work".to_string(),
+            max_iterations: 5,
+            stuck_after: None,
+            on_max_iter: crate::workflow_dsl::OnMaxIter::Fail,
+            body: vec![WorkflowNode::Call(CallNode {
+                agent: crate::workflow_dsl::AgentRef::Name("step-a".to_string()),
+                retries: 0,
+                on_fail: None,
+                output: None,
+                with: vec![],
+            })],
+        };
+
+        // No resume context → returns 0
+        assert_eq!(find_max_completed_while_iteration(&state, &node), 0);
+    }
+
+    #[test]
+    fn test_find_max_completed_while_iteration_two_completed() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        let skip: HashSet<StepKey> = [("step-a".to_string(), 0), ("step-a".to_string(), 1)]
+            .into_iter()
+            .collect();
+        state.resume_ctx = Some(ResumeContext {
+            skip_completed: skip,
+            step_map: HashMap::new(),
+            child_runs: HashMap::new(),
+        });
+
+        let node = WhileNode {
+            step: "check".to_string(),
+            marker: "needs_work".to_string(),
+            max_iterations: 5,
+            stuck_after: None,
+            on_max_iter: crate::workflow_dsl::OnMaxIter::Fail,
+            body: vec![WorkflowNode::Call(CallNode {
+                agent: crate::workflow_dsl::AgentRef::Name("step-a".to_string()),
+                retries: 0,
+                on_fail: None,
+                output: None,
+                with: vec![],
+            })],
+        };
+
+        // Iterations 0 and 1 completed → start from 2
+        assert_eq!(find_max_completed_while_iteration(&state, &node), 2);
+    }
+
+    #[test]
+    fn test_find_max_completed_while_iteration_empty_body() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        state.resume_ctx = Some(ResumeContext {
+            skip_completed: HashSet::new(),
+            step_map: HashMap::new(),
+            child_runs: HashMap::new(),
+        });
+
+        let node = WhileNode {
+            step: "check".to_string(),
+            marker: "needs_work".to_string(),
+            max_iterations: 5,
+            stuck_after: None,
+            on_max_iter: crate::workflow_dsl::OnMaxIter::Fail,
+            body: vec![], // no call nodes
+        };
+
+        // Empty body → returns 0
+        assert_eq!(find_max_completed_while_iteration(&state, &node), 0);
+    }
+
+    #[test]
+    fn test_find_max_completed_while_iteration_partial_body() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        // Two body nodes, but only one completed for iteration 0
+        let skip: HashSet<StepKey> = [("step-a".to_string(), 0)].into_iter().collect();
+        state.resume_ctx = Some(ResumeContext {
+            skip_completed: skip,
+            step_map: HashMap::new(),
+            child_runs: HashMap::new(),
+        });
+        // step-b:0 is NOT in skip_completed
+
+        let node = WhileNode {
+            step: "check".to_string(),
+            marker: "needs_work".to_string(),
+            max_iterations: 5,
+            stuck_after: None,
+            on_max_iter: crate::workflow_dsl::OnMaxIter::Fail,
+            body: vec![
+                WorkflowNode::Call(CallNode {
+                    agent: crate::workflow_dsl::AgentRef::Name("step-a".to_string()),
+                    retries: 0,
+                    on_fail: None,
+                    output: None,
+                    with: vec![],
+                }),
+                WorkflowNode::Call(CallNode {
+                    agent: crate::workflow_dsl::AgentRef::Name("step-b".to_string()),
+                    retries: 0,
+                    on_fail: None,
+                    output: None,
+                    with: vec![],
+                }),
+            ],
+        };
+
+        // Only partial completion → start from 0
+        assert_eq!(find_max_completed_while_iteration(&state, &node), 0);
+    }
+
+    #[test]
+    fn test_find_max_completed_while_iteration_with_parallel_and_gate() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        let skip: HashSet<StepKey> = [
+            ("agent-a".to_string(), 0),
+            ("agent-b".to_string(), 0),
+            ("approval".to_string(), 0),
+        ]
+        .into_iter()
+        .collect();
+        state.resume_ctx = Some(ResumeContext {
+            skip_completed: skip,
+            step_map: HashMap::new(),
+            child_runs: HashMap::new(),
+        });
+
+        let node = WhileNode {
+            step: "check".to_string(),
+            marker: "needs_work".to_string(),
+            max_iterations: 5,
+            stuck_after: None,
+            on_max_iter: crate::workflow_dsl::OnMaxIter::Fail,
+            body: vec![
+                WorkflowNode::Parallel(ParallelNode {
+                    fail_fast: true,
+                    min_success: None,
+                    calls: vec![
+                        crate::workflow_dsl::AgentRef::Name("agent-a".to_string()),
+                        crate::workflow_dsl::AgentRef::Name("agent-b".to_string()),
+                    ],
+                    output: None,
+                    call_outputs: HashMap::new(),
+                    with: vec![],
+                    call_with: HashMap::new(),
+                }),
+                WorkflowNode::Gate(GateNode {
+                    name: "approval".to_string(),
+                    gate_type: crate::workflow_dsl::GateType::HumanApproval,
+                    prompt: None,
+                    min_approvals: 1,
+                    timeout_secs: 300,
+                    on_timeout: crate::workflow_dsl::OnTimeout::Fail,
+                }),
+            ],
+        };
+
+        // Iteration 0 fully completed → start from 1
+        assert_eq!(find_max_completed_while_iteration(&state, &node), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // restore_completed_step tests
+    // -----------------------------------------------------------------------
+
+    /// Helper to build a WorkflowRunStep for testing without listing every field.
+    fn make_test_step(
+        step_name: &str,
+        status: WorkflowStepStatus,
+        result_text: Option<&str>,
+        context_out: Option<&str>,
+        markers_out: Option<&str>,
+        child_run_id: Option<&str>,
+        structured_output: Option<&str>,
+    ) -> WorkflowRunStep {
+        WorkflowRunStep {
+            id: "s1".to_string(),
+            workflow_run_id: "run1".to_string(),
+            step_name: step_name.to_string(),
+            role: "actor".to_string(),
+            can_commit: false,
+            condition_expr: None,
+            status,
+            child_run_id: child_run_id.map(String::from),
+            position: 0,
+            started_at: None,
+            ended_at: None,
+            result_text: result_text.map(String::from),
+            condition_met: None,
+            iteration: 0,
+            parallel_group_id: None,
+            context_out: context_out.map(String::from),
+            markers_out: markers_out.map(String::from),
+            retry_count: 0,
+            gate_type: None,
+            gate_prompt: None,
+            gate_timeout: None,
+            gate_approved_by: None,
+            gate_approved_at: None,
+            gate_feedback: None,
+            structured_output: structured_output.map(String::from),
+        }
+    }
+
+    /// Helper to build a ResumeContext from a step map.
+    fn make_resume_ctx(
+        step_map: HashMap<StepKey, WorkflowRunStep>,
+        child_runs: HashMap<String, crate::agent::AgentRun>,
+    ) -> ResumeContext {
+        let skip_completed = step_map.keys().cloned().collect();
+        ResumeContext {
+            skip_completed,
+            step_map,
+            child_runs,
+        }
+    }
+
+    #[test]
+    fn test_restore_completed_step_basic() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        let step = make_test_step(
+            "review",
+            WorkflowStepStatus::Completed,
+            Some("looks good"),
+            Some("reviewed code"),
+            Some(r#"["approved"]"#),
+            None,
+            Some(r#"{"verdict":"approve"}"#),
+        );
+        let ctx = make_resume_ctx(
+            [(("review".to_string(), 0), step)].into_iter().collect(),
+            HashMap::new(),
+        );
+
+        restore_completed_step(&mut state, &ctx, "review", 0);
+
+        // Verify step_results populated
+        let result = state.step_results.get("review").unwrap();
+        assert_eq!(result.status, WorkflowStepStatus::Completed);
+        assert_eq!(result.result_text.as_deref(), Some("looks good"));
+        assert_eq!(result.markers, vec!["approved"]);
+        assert_eq!(result.context, "reviewed code");
+
+        // Verify contexts populated
+        assert_eq!(state.contexts.len(), 1);
+        assert_eq!(state.contexts[0].step, "review");
+        assert_eq!(state.contexts[0].context, "reviewed code");
+
+        // Verify structured output updated
+        assert_eq!(
+            state.last_structured_output.as_deref(),
+            Some(r#"{"verdict":"approve"}"#)
+        );
+    }
+
+    #[test]
+    fn test_restore_completed_step_not_found() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        let ctx = make_resume_ctx(HashMap::new(), HashMap::new());
+        restore_completed_step(&mut state, &ctx, "nonexistent", 0);
+
+        // Should be a no-op (with warning logged)
+        assert!(state.step_results.is_empty());
+        assert!(state.contexts.is_empty());
+    }
+
+    #[test]
+    fn test_restore_completed_step_accumulates_costs() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+
+        // Create a child agent run with cost data
+        let child_run = agent_mgr
+            .create_run("w1", "test agent", None, None)
+            .unwrap();
+        agent_mgr
+            .update_run_completed(
+                &child_run.id,
+                None,
+                Some("done"),
+                Some(0.05),
+                Some(3),
+                Some(5000),
+            )
+            .unwrap();
+
+        let mut state = make_test_state(&conn);
+        state.total_cost = 0.10;
+        state.total_turns = 5;
+        state.total_duration_ms = 10000;
+
+        // Re-fetch the child run so we have the full AgentRun with costs
+        let loaded_run = agent_mgr.get_run(&child_run.id).unwrap().unwrap();
+
+        let step = make_test_step(
+            "build",
+            WorkflowStepStatus::Completed,
+            Some("built"),
+            Some("build output"),
+            None,
+            Some(&child_run.id),
+            None,
+        );
+        let ctx = make_resume_ctx(
+            [(("build".to_string(), 0), step)].into_iter().collect(),
+            [(child_run.id.clone(), loaded_run)].into_iter().collect(),
+        );
+
+        restore_completed_step(&mut state, &ctx, "build", 0);
+
+        // Costs should be accumulated from the child run
+        assert!((state.total_cost - 0.15).abs() < 0.001);
+        assert_eq!(state.total_turns, 8);
+        assert_eq!(state.total_duration_ms, 15000);
+    }
+
+    #[test]
+    fn test_restore_completed_step_restores_gate_feedback() {
+        let conn = setup_db();
+        let mut state = make_test_state(&conn);
+
+        let mut step = make_test_step(
+            "approval-gate",
+            WorkflowStepStatus::Completed,
+            Some("approved"),
+            None,
+            None,
+            None,
+            None,
+        );
+        step.gate_feedback = Some("LGTM, ship it".to_string());
+
+        let ctx = make_resume_ctx(
+            [(("approval-gate".to_string(), 0), step)]
+                .into_iter()
+                .collect(),
+            HashMap::new(),
+        );
+
+        restore_completed_step(&mut state, &ctx, "approval-gate", 0);
+
+        // Gate feedback should be restored for downstream steps
+        assert_eq!(state.last_gate_feedback.as_deref(), Some("LGTM, ship it"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resume_workflow validation tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a Config suitable for resume tests.
+    fn make_resume_config() -> &'static Config {
+        Box::leak(Box::new(Config::default()))
+    }
+
+    #[test]
+    fn test_resume_rejects_completed_run() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Completed, Some("done"))
+            .unwrap();
+
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: None,
+            restart: false,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot resume a completed"),
+            "Expected completed-run error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_cancelled_run() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Cancelled, None)
+            .unwrap();
+
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: None,
+            restart: false,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot resume a cancelled"),
+            "Expected cancelled-run error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_running_run() {
+        let err =
+            validate_resume_preconditions(&WorkflowRunStatus::Running, false, None).unwrap_err();
+        assert!(
+            err.to_string().contains("already running"),
+            "Expected running-run error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_restart_and_from_step_together() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Failed, Some("error"))
+            .unwrap();
+
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: Some("step-one"),
+            restart: true,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--restart and --from-step together"),
+            "Expected conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_missing_snapshot() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        // Create run with no definition_snapshot
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", None)
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Failed, Some("error"))
+            .unwrap();
+
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: None,
+            restart: false,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("no definition snapshot"),
+            "Expected missing-snapshot error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_nonexistent_run() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: "nonexistent-id",
+            model: None,
+            from_step: None,
+            restart: false,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "Expected not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_nonexistent_from_step() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Failed, Some("error"))
+            .unwrap();
+
+        // Add a step so the run has steps to search through
+        let s0 = wf_mgr
+            .insert_step(&run.id, "step-a", "actor", false, 0, 0)
+            .unwrap();
+        wf_mgr
+            .update_step_status(
+                &s0,
+                WorkflowStepStatus::Completed,
+                None,
+                Some("ok"),
+                None,
+                None,
+                Some(0),
+            )
+            .unwrap();
+
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: Some("nonexistent-step"),
+            restart: false,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("not found in workflow run"),
+            "Expected step-not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_workflow_run_inputs_round_trip() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+
+        // Initially inputs should be empty (no inputs set yet)
+        let fetched = wf_mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert!(fetched.inputs.is_empty(), "Expected no inputs initially");
+
+        // Write inputs and read back
+        let mut inputs = HashMap::new();
+        inputs.insert("key1".to_string(), "value1".to_string());
+        inputs.insert("key2".to_string(), "value2".to_string());
+        wf_mgr.set_workflow_run_inputs(&run.id, &inputs).unwrap();
+
+        let fetched = wf_mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.inputs.get("key1").map(String::as_str),
+            Some("value1")
+        );
+        assert_eq!(
+            fetched.inputs.get("key2").map(String::as_str),
+            Some("value2")
+        );
+        assert_eq!(fetched.inputs.len(), 2);
+    }
+
+    #[test]
+    fn test_row_to_workflow_run_malformed_inputs_json_returns_empty() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+
+        // Directly write invalid JSON into the inputs column to simulate corruption
+        conn.execute(
+            "UPDATE workflow_runs SET inputs = ?1 WHERE id = ?2",
+            rusqlite::params!["not-valid-json", &run.id],
+        )
+        .unwrap();
+
+        // Reading back should return an empty HashMap (not panic), matching the
+        // unwrap_or_else + warn fallback in row_to_workflow_run.
+        let fetched = wf_mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert!(
+            fetched.inputs.is_empty(),
+            "Expected empty inputs on malformed JSON, got: {:?}",
+            fetched.inputs
+        );
+    }
+
+    #[test]
+    fn test_restart_resets_all_steps() {
+        let conn = setup_db();
+        let (run_id, mgr) = setup_run_with_steps(&conn);
+
+        // Verify initial state: 1 completed, 1 failed, 1 running
+        let steps = mgr.get_workflow_steps(&run_id).unwrap();
+        assert_eq!(steps[0].status, WorkflowStepStatus::Completed);
+        assert_eq!(steps[1].status, WorkflowStepStatus::Failed);
+        assert_eq!(steps[2].status, WorkflowStepStatus::Running);
+
+        // Restart resets both failed+running and completed steps
+        mgr.reset_failed_steps(&run_id).unwrap();
+        mgr.reset_completed_steps(&run_id).unwrap();
+
+        let steps = mgr.get_workflow_steps(&run_id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            WorkflowStepStatus::Pending,
+            "completed step should be reset"
+        );
+        assert!(steps[0].result_text.is_none(), "result should be cleared");
+        assert!(steps[0].context_out.is_none(), "context should be cleared");
+        assert!(steps[0].markers_out.is_none(), "markers should be cleared");
+        assert_eq!(
+            steps[1].status,
+            WorkflowStepStatus::Pending,
+            "failed step should be reset"
+        );
+        assert_eq!(
+            steps[2].status,
+            WorkflowStepStatus::Pending,
+            "running step should be reset"
+        );
+
+        // skip set should be empty after restart
+        let keys = mgr.get_completed_step_keys(&run_id).unwrap();
+        assert!(
+            keys.is_empty(),
+            "no completed steps should remain after restart"
+        );
+    }
+
+    /// Exercises the full --from-step DB orchestration path:
+    /// - skip-set pruning (keys at/after pos removed)
+    /// - step_map filtered to only surviving skip keys
+    /// - DB reset: steps at/after the target step become Pending
+    /// - steps before the target step remain Completed
+    #[test]
+    fn test_from_step_skip_set_and_step_map() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let mgr = WorkflowManager::new(&conn);
+        let run = mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", None)
+            .unwrap();
+
+        // Insert 3 completed steps at positions 0, 1, 2
+        let s0 = mgr
+            .insert_step(&run.id, "step-a", "actor", false, 0, 0)
+            .unwrap();
+        mgr.update_step_status(
+            &s0,
+            WorkflowStepStatus::Completed,
+            None,
+            Some("result-a"),
+            Some("ctx-a"),
+            None,
+            Some(0),
+        )
+        .unwrap();
+
+        let s1 = mgr
+            .insert_step(&run.id, "step-b", "actor", false, 1, 0)
+            .unwrap();
+        mgr.update_step_status(
+            &s1,
+            WorkflowStepStatus::Completed,
+            None,
+            Some("result-b"),
+            Some("ctx-b"),
+            None,
+            Some(0),
+        )
+        .unwrap();
+
+        let s2 = mgr
+            .insert_step(&run.id, "step-c", "actor", false, 2, 0)
+            .unwrap();
+        mgr.update_step_status(
+            &s2,
+            WorkflowStepStatus::Completed,
+            None,
+            Some("result-c"),
+            Some("ctx-c"),
+            None,
+            Some(0),
+        )
+        .unwrap();
+
+        // Snapshot all_steps before any resets (mirrors resume_workflow: load once upfront)
+        let all_steps = mgr.get_workflow_steps(&run.id).unwrap();
+
+        // Simulate the --from-step "step-b" (position 1) branch of resume_workflow
+        let mut keys = completed_keys_from_steps(&all_steps);
+        assert_eq!(
+            keys.len(),
+            3,
+            "all three steps should be in completed keys initially"
+        );
+
+        let pos = all_steps
+            .iter()
+            .find(|s| s.step_name == "step-b")
+            .unwrap()
+            .position;
+        assert_eq!(pos, 1);
+
+        // Prune keys at/after the from-step position (mirrors resume_workflow)
+        let to_remove: Vec<StepKey> = all_steps
+            .iter()
+            .filter(|s| s.position >= pos && s.status == WorkflowStepStatus::Completed)
+            .map(|s| (s.step_name.clone(), s.iteration as u32))
+            .collect();
+        for key in to_remove {
+            keys.remove(&key);
+        }
+
+        // Reset DB state for steps at/after pos, then reset any failed/running steps
+        mgr.reset_steps_from_position(&run.id, pos).unwrap();
+        mgr.reset_failed_steps(&run.id).unwrap();
+
+        // skip_completed should contain only ("step-a", 0)
+        assert_eq!(keys.len(), 1, "only step-a:0 should survive pruning");
+        assert!(
+            keys.contains(&("step-a".to_string(), 0)),
+            "step-a:0 must be in skip set"
+        );
+        assert!(
+            !keys.contains(&("step-b".to_string(), 0)),
+            "step-b:0 must be pruned from skip set"
+        );
+        assert!(
+            !keys.contains(&("step-c".to_string(), 0)),
+            "step-c:0 must be pruned from skip set"
+        );
+
+        // DB state: step-a stays Completed, step-b and step-c are reset to Pending
+        let updated = mgr.get_workflow_steps(&run.id).unwrap();
+        assert_eq!(
+            updated[0].status,
+            WorkflowStepStatus::Completed,
+            "step-a (pos 0) must remain Completed"
+        );
+        assert_eq!(
+            updated[1].status,
+            WorkflowStepStatus::Pending,
+            "step-b (pos 1, the from-step) must be reset to Pending"
+        );
+        assert_eq!(
+            updated[2].status,
+            WorkflowStepStatus::Pending,
+            "step-c (pos 2) must be reset to Pending"
+        );
+
+        // step_map built from all_steps filtered by surviving skip keys
+        // (mirrors resume_workflow)
+        let step_map: HashMap<StepKey, WorkflowRunStep> = all_steps
+            .into_iter()
+            .filter(|s| s.status == WorkflowStepStatus::Completed)
+            .map(|s| {
+                let key = (s.step_name.clone(), s.iteration as u32);
+                (key, s)
+            })
+            .filter(|(key, _)| keys.contains(key))
+            .collect();
+
+        assert!(
+            step_map.contains_key(&("step-a".to_string(), 0)),
+            "step_map must include step-a:0 (will be skipped on resume)"
+        );
+        assert!(
+            !step_map.contains_key(&("step-b".to_string(), 0)),
+            "step_map must not include step-b:0 (will be re-executed)"
+        );
+        assert!(
+            !step_map.contains_key(&("step-c".to_string(), 0)),
+            "step_map must not include step-c:0 (will be re-executed)"
+        );
+    }
+
+    #[test]
+    fn test_resume_allows_restart_on_completed_run() {
+        let conn = setup_db();
+        let config = make_resume_config();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run("w1", "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", "w1", &parent.id, false, "manual", Some("{}"))
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Completed, Some("done"))
+            .unwrap();
+
+        // Without restart, completed run should be rejected
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: None,
+            restart: false,
+        };
+        assert!(resume_workflow(&input).is_err());
+
+        // With restart, completed run should pass the status check
+        // (will fail later due to missing worktree, but the status check should pass)
+        let input = WorkflowResumeInput {
+            conn: &conn,
+            config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: None,
+            restart: true,
+        };
+        let err = resume_workflow(&input).unwrap_err();
+        // Should fail on worktree resolution, NOT on "Cannot resume a completed"
+        assert!(
+            !err.to_string().contains("Cannot resume a completed"),
+            "restart=true should bypass the completed-run check, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parallel min_success with skipped-on-resume agents
+    // -----------------------------------------------------------------------
+
+    /// Validates that the min_success calculation in execute_parallel correctly
+    /// counts skipped-on-resume agents as successes for both the warning logic
+    /// and the synthetic step status.
+    ///
+    /// This is a logic-level regression test: execute_parallel uses
+    /// `effective_successes = successes + skipped_count` and
+    /// `total_agents = children.len() + skipped_count`, and the synthetic step
+    /// status must use `effective_successes >= min_required` (not raw `successes`).
+    #[test]
+    fn test_parallel_min_success_with_skipped_resume_agents() {
+        // Scenario: 3 agents in a parallel block, min_success = 3.
+        // On resume, 2 agents were already completed (skipped), 1 new agent succeeds.
+        let successes: u32 = 1; // newly succeeded
+        let skipped_count: u32 = 2; // completed on previous run
+        let children_len: u32 = 1; // only the non-skipped agent was spawned
+
+        let effective_successes = successes + skipped_count; // 3
+        let total_agents = children_len + skipped_count; // 3
+        let min_required: u32 = 3; // all must succeed
+
+        // The synthetic step should be Completed, not Failed
+        let status = if effective_successes >= min_required {
+            WorkflowStepStatus::Completed
+        } else {
+            WorkflowStepStatus::Failed
+        };
+        assert_eq!(
+            status,
+            WorkflowStepStatus::Completed,
+            "skipped agents must count toward min_success"
+        );
+
+        // Verify the all_succeeded flag would NOT be set to false
+        let all_succeeded = effective_successes >= min_required;
+        assert!(
+            all_succeeded,
+            "effective_successes ({effective_successes}) should meet min_required ({min_required})"
+        );
+
+        // Verify default min_success (None → total_agents) also works
+        let default_min = total_agents;
+        assert!(
+            effective_successes >= default_min,
+            "default min_success should be met when all agents (including skipped) succeed"
+        );
+
+        // Edge case: one new agent fails, only skipped agents succeeded
+        let successes_fail: u32 = 0;
+        let effective_fail = successes_fail + skipped_count; // 2
+        let status_fail = if effective_fail >= min_required {
+            WorkflowStepStatus::Completed
+        } else {
+            WorkflowStepStatus::Failed
+        };
+        assert_eq!(
+            status_fail,
+            WorkflowStepStatus::Failed,
+            "should fail when effective successes don't meet min_required"
+        );
     }
 }

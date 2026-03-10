@@ -739,6 +739,43 @@ impl<'a> AgentManager<'a> {
         }
     }
 
+    /// Batch-load multiple agent runs by ID in a single query.
+    ///
+    /// Returns a map from run ID → `AgentRun`. Missing IDs are silently skipped.
+    /// Plan steps are **not** loaded (callers only need cost/turn/duration data).
+    pub fn get_runs_by_ids(&self, ids: &[&str]) -> Result<HashMap<String, AgentRun>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Build "?1, ?2, …" in a single allocation sized up-front.
+        let mut placeholders = String::with_capacity(ids.len() * 4);
+        for i in 1..=ids.len() {
+            if i > 1 {
+                placeholders.push_str(", ");
+            }
+            placeholders.push('?');
+            placeholders.push_str(&i.to_string());
+        }
+        let sql = format!(
+            "SELECT id, worktree_id, claude_session_id, prompt, status, result_text, \
+             cost_usd, num_turns, duration_ms, started_at, ended_at, tmux_window, log_file, \
+             model, plan, parent_run_id \
+             FROM agent_runs WHERE id IN ({placeholders})"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(&*params, row_to_agent_run)?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let run = row?;
+            map.insert(run.id.clone(), run);
+        }
+        Ok(map)
+    }
+
     pub fn update_run_completed(
         &self,
         run_id: &str,
@@ -3560,6 +3597,54 @@ mod tests {
             mgr.get_run(&r3.id).unwrap().unwrap().status,
             AgentRunStatus::Completed
         );
+    }
+
+    // ── get_runs_by_ids tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_get_runs_by_ids_returns_matching() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let r1 = mgr.create_run("w1", "Task 1", None, None).unwrap();
+        let r2 = mgr.create_run("w1", "Task 2", None, None).unwrap();
+        let r3 = mgr.create_run("w1", "Task 3", None, None).unwrap();
+
+        let ids = vec![r1.id.as_str(), r2.id.as_str()];
+        let result = mgr.get_runs_by_ids(&ids).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key(&r1.id));
+        assert!(result.contains_key(&r2.id));
+        assert!(!result.contains_key(&r3.id));
+        assert_eq!(result[&r1.id].prompt, "Task 1");
+        assert_eq!(result[&r2.id].prompt, "Task 2");
+    }
+
+    #[test]
+    fn test_get_runs_by_ids_empty_input() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let _r1 = mgr.create_run("w1", "Task 1", None, None).unwrap();
+
+        let result = mgr.get_runs_by_ids(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_runs_by_ids_missing_ids_skipped() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let r1 = mgr.create_run("w1", "Task 1", None, None).unwrap();
+
+        let ids = vec![r1.id.as_str(), "nonexistent-id-xyz"];
+        let result = mgr.get_runs_by_ids(&ids).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key(&r1.id));
+        assert!(!result.contains_key("nonexistent-id-xyz"));
     }
 
     #[test]
