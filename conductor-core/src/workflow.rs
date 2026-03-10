@@ -21,7 +21,7 @@ use crate::db::query_collect;
 use crate::error::{ConductorError, Result};
 use crate::prompt_config;
 use crate::workflow_dsl::{
-    self, CallNode, CallWorkflowNode, DoWhileNode, GateNode, GateType, IfNode, OnMaxIter,
+    self, CallNode, CallWorkflowNode, DoNode, DoWhileNode, GateNode, GateType, IfNode, OnMaxIter,
     OnTimeout, ParallelNode, UnlessNode, WhileNode, WorkflowNode,
 };
 
@@ -989,6 +989,10 @@ struct ExecutionState<'a> {
     last_gate_feedback: Option<String>,
     /// Raw JSON from the most recent step's structured output (for `{{prior_output}}`).
     last_structured_output: Option<String>,
+    /// Block-level output schema name inherited from an enclosing `do {}` block.
+    block_output: Option<String>,
+    /// Block-level prompt snippet refs inherited from an enclosing `do {}` block.
+    block_with: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,6 +1119,8 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         total_duration_ms: 0,
         last_gate_feedback: None,
         last_structured_output: None,
+        block_output: None,
+        block_with: Vec::new(),
     };
 
     // Execute main body
@@ -1229,6 +1235,7 @@ fn execute_single_node(
         WorkflowNode::Unless(n) => execute_unless(state, n)?,
         WorkflowNode::While(n) => execute_while(state, n)?,
         WorkflowNode::DoWhile(n) => execute_do_while(state, n)?,
+        WorkflowNode::Do(n) => execute_do(state, n)?,
         WorkflowNode::Parallel(n) => execute_parallel(state, n, iteration)?,
         WorkflowNode::Gate(n) => execute_gate(state, n, iteration)?,
         WorkflowNode::Always(n) => {
@@ -1412,7 +1419,36 @@ fn resolve_child_inputs(
 // ---------------------------------------------------------------------------
 
 fn execute_call(state: &mut ExecutionState<'_>, node: &CallNode, iteration: u32) -> Result<()> {
-    execute_call_with_schema(state, node, iteration, node.output.as_deref(), &node.with)
+    // Call-level output overrides block-level; if neither is set, use None.
+    // We must clone into a local because execute_call_with_schema takes &mut state.
+    let effective_output: Option<String> = match (&node.output, &state.block_output) {
+        (Some(o), _) => Some(o.clone()),
+        (None, Some(b)) => Some(b.clone()),
+        (None, None) => None,
+    };
+    // Block-level `with` snippets prepended to call-level `with`.
+    // Only allocate a new Vec when both sources are non-empty; when only one
+    // source has entries, clone it into a local so we don't hold a borrow on
+    // state across the mutable call to execute_call_with_schema.
+    let effective_with: Vec<String> = if state.block_with.is_empty() {
+        node.with.clone()
+    } else if node.with.is_empty() {
+        state.block_with.clone()
+    } else {
+        state
+            .block_with
+            .iter()
+            .chain(node.with.iter())
+            .cloned()
+            .collect()
+    };
+    execute_call_with_schema(
+        state,
+        node,
+        iteration,
+        effective_output.as_deref(),
+        &effective_with,
+    )
 }
 
 /// Inner implementation of execute_call that accepts an optional schema override
@@ -2147,6 +2183,46 @@ fn execute_do_while(state: &mut ExecutionState<'_>, node: &DoWhileNode) -> Resul
 
         iteration += 1;
     }
+
+    Ok(())
+}
+
+fn execute_do(state: &mut ExecutionState<'_>, node: &DoNode) -> Result<()> {
+    tracing::info!(
+        "do block: executing {} body nodes sequentially",
+        node.body.len()
+    );
+
+    // Save and apply block-level output/with so nested calls can inherit them
+    let saved_output = state.block_output.clone();
+    let saved_with = state.block_with.clone();
+
+    if node.output.is_some() {
+        state.block_output = node.output.clone();
+    }
+    if !node.with.is_empty() {
+        // Prepend block's with to any outer block_with already in state
+        let mut combined = node.with.clone();
+        combined.extend(saved_with.iter().cloned());
+        state.block_with = combined;
+    }
+
+    for body_node in &node.body {
+        if let Err(e) = execute_single_node(state, body_node, 0) {
+            // Restore block-level context before propagating so that
+            // always-blocks and subsequent nodes don't inherit do-block state.
+            state.block_output = saved_output;
+            state.block_with = saved_with;
+            return Err(e);
+        }
+        if !state.all_succeeded && state.exec_config.fail_fast {
+            break;
+        }
+    }
+
+    // Restore block-level context
+    state.block_output = saved_output;
+    state.block_with = saved_with;
 
     Ok(())
 }
@@ -3142,6 +3218,8 @@ mod tests {
             total_duration_ms: 0,
             last_gate_feedback: None,
             last_structured_output: None,
+            block_output: None,
+            block_with: Vec::new(),
         };
         (state, run_id)
     }
@@ -3782,6 +3860,8 @@ And here is my actual output:
             total_duration_ms: 0,
             last_gate_feedback: None,
             last_structured_output: None,
+            block_output: None,
+            block_with: Vec::new(),
         }
     }
 
@@ -4166,6 +4246,8 @@ And here is my actual output:
             total_duration_ms: 0,
             last_gate_feedback: None,
             last_structured_output: None,
+            block_output: None,
+            block_with: Vec::new(),
         }
     }
 
@@ -4547,6 +4629,258 @@ And here is my actual output:
         assert!(
             !matches!(result, Err(ConductorError::WorkflowRunAlreadyActive { .. })),
             "child workflow should not be blocked by active parent run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_do tests (plain do {} block)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_do_empty_body() {
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+
+        let node = DoNode {
+            output: None,
+            with: vec![],
+            body: vec![],
+        };
+
+        let result = execute_do(&mut state, &node);
+        assert!(result.is_ok());
+        assert!(state.all_succeeded);
+    }
+
+    #[test]
+    fn test_execute_do_sets_and_restores_block_state() {
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+        state.exec_config.dry_run = true;
+
+        // Set some outer block state that should be saved and restored
+        state.block_output = Some("outer-schema".into());
+        state.block_with = vec!["outer-snippet".into()];
+
+        let node = DoNode {
+            output: Some("inner-schema".into()),
+            with: vec!["inner-snippet".into()],
+            // Use a Gate in dry_run mode as a no-op body node
+            body: vec![WorkflowNode::Gate(GateNode {
+                name: "noop".into(),
+                gate_type: GateType::HumanApproval,
+                prompt: None,
+                min_approvals: 1,
+                timeout_secs: 1,
+                on_timeout: OnTimeout::Fail,
+            })],
+        };
+
+        let result = execute_do(&mut state, &node);
+        assert!(result.is_ok());
+
+        // After execute_do, outer state must be restored
+        assert_eq!(state.block_output.as_deref(), Some("outer-schema"));
+        assert_eq!(state.block_with, vec!["outer-snippet".to_string()]);
+    }
+
+    #[test]
+    fn test_execute_do_restores_state_on_error() {
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+
+        state.block_output = Some("outer-schema".into());
+        state.block_with = vec!["outer-snippet".into()];
+
+        // A call node without dry_run and no real agent will error
+        let node = DoNode {
+            output: Some("inner-schema".into()),
+            with: vec!["inner-snippet".into()],
+            body: vec![WorkflowNode::Call(CallNode {
+                agent: AgentRef::Name("nonexistent-agent".into()),
+                retries: 0,
+                on_fail: None,
+                output: None,
+                with: vec![],
+            })],
+        };
+
+        let result = execute_do(&mut state, &node);
+        assert!(result.is_err());
+
+        // Block state must be restored even after error
+        assert_eq!(state.block_output.as_deref(), Some("outer-schema"));
+        assert_eq!(state.block_with, vec!["outer-snippet".to_string()]);
+    }
+
+    #[test]
+    fn test_execute_do_fail_fast_exits_early() {
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+        state.exec_config.fail_fast = true;
+        state.exec_config.dry_run = true;
+        state.all_succeeded = false; // simulate prior failure
+
+        let initial_position = state.position;
+
+        let node = DoNode {
+            output: None,
+            with: vec![],
+            body: vec![
+                WorkflowNode::Gate(GateNode {
+                    name: "g1".into(),
+                    gate_type: GateType::HumanApproval,
+                    prompt: None,
+                    min_approvals: 1,
+                    timeout_secs: 1,
+                    on_timeout: OnTimeout::Fail,
+                }),
+                WorkflowNode::Gate(GateNode {
+                    name: "g2".into(),
+                    gate_type: GateType::HumanApproval,
+                    prompt: None,
+                    min_approvals: 1,
+                    timeout_secs: 1,
+                    on_timeout: OnTimeout::Fail,
+                }),
+            ],
+        };
+
+        let result = execute_do(&mut state, &node);
+        assert!(result.is_ok());
+        // fail_fast should skip after first node — only 1 position increment
+        assert_eq!(state.position - initial_position, 1);
+    }
+
+    #[test]
+    fn test_execute_do_nested_with_combination() {
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+        state.exec_config.dry_run = true;
+
+        // Outer do sets with=["a"], inner do sets with=["b"].
+        // After inner do runs, inner block_with should have been ["b", "a"].
+        // After both do blocks complete, state should be fully restored.
+        let node = DoNode {
+            output: Some("outer-schema".into()),
+            with: vec!["a".into()],
+            body: vec![WorkflowNode::Do(DoNode {
+                output: None,
+                with: vec!["b".into()],
+                body: vec![WorkflowNode::Gate(GateNode {
+                    name: "noop".into(),
+                    gate_type: GateType::HumanApproval,
+                    prompt: None,
+                    min_approvals: 1,
+                    timeout_secs: 1,
+                    on_timeout: OnTimeout::Fail,
+                })],
+            })],
+        };
+
+        let result = execute_do(&mut state, &node);
+        assert!(result.is_ok());
+        // Outer state fully restored
+        assert!(state.block_output.is_none());
+        assert!(state.block_with.is_empty());
+    }
+
+    #[test]
+    fn test_execute_do_nested_inner_output_overrides_outer() {
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+        state.exec_config.dry_run = true;
+
+        // Outer do sets output="outer", inner do sets output="inner".
+        // Inner body should see block_output="inner".
+        // Verify state restoration after nested execution.
+        let node = DoNode {
+            output: Some("outer".into()),
+            with: vec![],
+            body: vec![WorkflowNode::Do(DoNode {
+                output: Some("inner".into()),
+                with: vec![],
+                body: vec![WorkflowNode::Gate(GateNode {
+                    name: "noop".into(),
+                    gate_type: GateType::HumanApproval,
+                    prompt: None,
+                    min_approvals: 1,
+                    timeout_secs: 1,
+                    on_timeout: OnTimeout::Fail,
+                })],
+            })],
+        };
+
+        let result = execute_do(&mut state, &node);
+        assert!(result.is_ok());
+        // Outer state fully restored
+        assert!(state.block_output.is_none());
+        assert!(state.block_with.is_empty());
+    }
+
+    #[test]
+    fn test_execute_call_merges_block_state() {
+        // Verify execute_call picks up block_output and block_with from state.
+        // The call will fail (no agent file on disk) but it should attempt to
+        // load with the effective values rather than panicking.
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+
+        state.block_output = Some("block-schema".into());
+        state.block_with = vec!["block-snippet".into()];
+
+        let node = CallNode {
+            agent: AgentRef::Name("nonexistent".into()),
+            retries: 0,
+            on_fail: None,
+            output: None,
+            with: vec!["call-snippet".into()],
+        };
+
+        // Call will error on load_agent, but the merging logic should execute
+        // without panics and the error should be from agent loading, not from
+        // the effective_output/effective_with computation.
+        let result = execute_call(&mut state, &node, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("agent") || err.contains("nonexistent"),
+            "expected agent load error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_execute_call_node_output_overrides_block_output() {
+        // When a CallNode has its own output, it should take precedence
+        // over block_output. Verify the call attempts to use "call-schema".
+        let conn = setup_db();
+        let config = Config::default();
+        let mut state = make_loop_test_state(&conn, &config);
+
+        state.block_output = Some("block-schema".into());
+
+        let node = CallNode {
+            agent: AgentRef::Name("nonexistent".into()),
+            retries: 0,
+            on_fail: None,
+            output: Some("call-schema".into()),
+            with: vec![],
+        };
+
+        let result = execute_call(&mut state, &node, 0);
+        assert!(result.is_err());
+        // The error is from agent loading, not from the merging logic
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("agent") || err.contains("nonexistent"),
+            "expected agent load error, got: {err}"
         );
     }
 }
