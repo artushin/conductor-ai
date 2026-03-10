@@ -1707,7 +1707,7 @@ workflow ticket-to-pr {
     ticket_id required
   }
 
-  call plan
+  call plan { output = "task-plan" }
 
   call implement {
     retries = 2
@@ -1716,6 +1716,7 @@ workflow ticket-to-pr {
   call push-and-pr
 
   parallel {
+    output    = "review-findings"
     with      = ["review-diff-scope"]
     fail_fast = false
     call review-architecture
@@ -1727,9 +1728,9 @@ workflow ticket-to-pr {
     call review-db-migrations
   }
 
-  call review-triage
+  call review-aggregator { output = "review-aggregator" }
 
-  while review-triage.has_review_issues {
+  while review-aggregator.has_review_issues {
     max_iterations = 3
     stuck_after    = 2
     on_max_iter    = fail
@@ -1737,6 +1738,7 @@ workflow ticket-to-pr {
     call address-reviews
 
     parallel {
+      output    = "review-findings"
       with      = ["review-diff-scope"]
       fail_fast = false
       call review-architecture
@@ -1748,7 +1750,7 @@ workflow ticket-to-pr {
       call review-db-migrations
     }
 
-    call review-triage
+    call review-aggregator { output = "review-aggregator" }
   }
 }
 "#;
@@ -1757,8 +1759,16 @@ workflow ticket-to-pr {
         assert_eq!(def.trigger, WorkflowTrigger::Manual);
         assert_eq!(def.inputs.len(), 1);
         assert!(def.inputs[0].required);
-        // call plan, call implement, call push-and-pr, parallel, call review-triage, while
+        // call plan, call implement, call push-and-pr, parallel, call review-aggregator, while
         assert_eq!(def.body.len(), 6);
+
+        match &def.body[0] {
+            WorkflowNode::Call(c) => {
+                assert_eq!(c.agent, AgentRef::Name("plan".to_string()));
+                assert_eq!(c.output.as_deref(), Some("task-plan"));
+            }
+            _ => panic!("Expected Call node for plan"),
+        }
 
         match &def.body[1] {
             WorkflowNode::Call(c) => {
@@ -1773,17 +1783,26 @@ workflow ticket-to-pr {
                 assert_eq!(p.calls.len(), 7);
                 assert!(!p.fail_fast);
                 assert_eq!(p.with, vec!["review-diff-scope".to_string()]);
+                assert_eq!(p.output.as_deref(), Some("review-findings"));
             }
             _ => panic!("Expected Parallel node"),
         }
 
+        match &def.body[4] {
+            WorkflowNode::Call(c) => {
+                assert_eq!(c.agent, AgentRef::Name("review-aggregator".to_string()));
+                assert_eq!(c.output.as_deref(), Some("review-aggregator"));
+            }
+            _ => panic!("Expected Call node for review-aggregator"),
+        }
+
         match &def.body[5] {
             WorkflowNode::While(w) => {
-                assert_eq!(w.step, "review-triage");
+                assert_eq!(w.step, "review-aggregator");
                 assert_eq!(w.marker, "has_review_issues");
                 assert_eq!(w.max_iterations, 3);
                 assert_eq!(w.stuck_after, Some(2));
-                // address-reviews, parallel, review-triage
+                // address-reviews, parallel, review-aggregator
                 assert_eq!(w.body.len(), 3);
             }
             _ => panic!("Expected While node"),
