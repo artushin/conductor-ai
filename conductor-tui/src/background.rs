@@ -54,6 +54,12 @@ pub fn poll_data() -> Option<Action> {
             LAST_REAP.store(now, Ordering::Relaxed);
             let _ = agent_mgr.reap_orphaned_runs();
             let _ = wt_mgr.reap_stale_worktrees();
+            let wf_mgr = conductor_core::workflow::WorkflowManager::new(&conn);
+            match wf_mgr.recover_stuck_steps() {
+                Ok(n) if n > 0 => tracing::debug!("Recovered {n} stuck workflow step(s)"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("recover_stuck_steps failed: {e}"),
+            }
         }
     }
 
