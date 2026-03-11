@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentManager, AgentRunStatus};
@@ -62,7 +62,8 @@ const STEP_COLUMNS: &str =
 /// Column list for `workflow_runs` SELECT queries (used by `row_to_workflow_run`).
 const RUN_COLUMNS: &str =
     "id, workflow_name, worktree_id, parent_run_id, status, dry_run, trigger, \
-     started_at, ended_at, result_summary, definition_snapshot, inputs, ticket_id, repo_id";
+     started_at, ended_at, result_summary, definition_snapshot, inputs, ticket_id, repo_id, \
+     parent_workflow_run_id";
 
 /// Instruction appended to every agent prompt for structured output.
 pub const CONDUCTOR_OUTPUT_INSTRUCTION: &str = r#"
@@ -297,6 +298,8 @@ pub struct WorkflowRun {
     pub inputs: HashMap<String, String>,
     pub ticket_id: Option<String>,
     pub repo_id: Option<String>,
+    /// Link to the parent workflow run when this is a sub-workflow invocation.
+    pub parent_workflow_run_id: Option<String>,
 }
 
 /// A workflow step execution record from the database.
@@ -337,6 +340,10 @@ pub struct WorkflowStepSummary {
     pub step_name: String,
     /// Loop iteration count (0-indexed; 0 = first pass, 1+ = subsequent loop iterations).
     pub iteration: i64,
+    /// Ordered list of workflow names from root down to the workflow containing the
+    /// currently-running step. E.g. `["ticket-to-pr", "review-pr"]` when `review-pr` is
+    /// a sub-workflow of `ticket-to-pr`. Empty for single-level (non-nested) workflows.
+    pub workflow_chain: Vec<String>,
 }
 
 /// A single entry in a step's metadata, either a key-value field or a
@@ -510,6 +517,7 @@ impl<'a> WorkflowManager<'a> {
             dry_run,
             trigger,
             definition_snapshot,
+            None,
         )
     }
 
@@ -525,14 +533,16 @@ impl<'a> WorkflowManager<'a> {
         dry_run: bool,
         trigger: &str,
         definition_snapshot: Option<&str>,
+        parent_workflow_run_id: Option<&str>,
     ) -> Result<WorkflowRun> {
         let id = ulid::Ulid::new().to_string();
         let now = Utc::now().to_rfc3339();
 
         self.conn.execute(
             "INSERT INTO workflow_runs (id, workflow_name, worktree_id, ticket_id, repo_id, \
-             parent_run_id, status, dry_run, trigger, started_at, definition_snapshot) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             parent_run_id, status, dry_run, trigger, started_at, definition_snapshot, \
+             parent_workflow_run_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 workflow_name,
@@ -545,6 +555,7 @@ impl<'a> WorkflowManager<'a> {
                 trigger,
                 now,
                 definition_snapshot,
+                parent_workflow_run_id,
             ],
         )?;
 
@@ -563,6 +574,7 @@ impl<'a> WorkflowManager<'a> {
             inputs: HashMap::new(),
             ticket_id: ticket_id.map(String::from),
             repo_id: repo_id.map(String::from),
+            parent_workflow_run_id: parent_workflow_run_id.map(String::from),
         })
     }
 
@@ -840,6 +852,52 @@ impl<'a> WorkflowManager<'a> {
         )
     }
 
+    /// List recent root workflow runs (those with no parent workflow run) across all
+    /// worktrees, ordered by started_at DESC.  Used in the TUI per-worktree slot so that
+    /// the root run wins over any concurrently-active child run.
+    pub fn list_root_workflow_runs(&self, limit: usize) -> Result<Vec<WorkflowRun>> {
+        query_collect(
+            self.conn,
+            &format!(
+                "SELECT {RUN_COLUMNS} FROM workflow_runs \
+                 WHERE parent_workflow_run_id IS NULL \
+                 ORDER BY started_at DESC LIMIT {limit}"
+            ),
+            params![],
+            row_to_workflow_run,
+        )
+    }
+
+    /// Walk the active child chain starting from `root_run_id` and return the
+    /// ordered list of `(id, workflow_name)` pairs below the root (the root is
+    /// excluded — the caller already has it).
+    ///
+    /// Iterates at most `MAX_WORKFLOW_DEPTH` times to match the execution depth cap.
+    pub fn get_active_chain_for_run(&self, root_run_id: &str) -> Result<Vec<(String, String)>> {
+        const MAX_DEPTH: usize = 5;
+        let mut chain: Vec<(String, String)> = Vec::new();
+        let mut current_id = root_run_id.to_string();
+        for _ in 0..MAX_DEPTH {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT id, workflow_name FROM workflow_runs \
+                 WHERE parent_workflow_run_id = ?1 \
+                   AND status IN ('running', 'waiting') \
+                 LIMIT 1",
+            )?;
+            let result: Option<(String, String)> = stmt
+                .query_row(params![current_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            match result {
+                Some((child_id, child_name)) => {
+                    chain.push((child_id.clone(), child_name));
+                    current_id = child_id;
+                }
+                None => break,
+            }
+        }
+        Ok(chain)
+    }
+
     /// Load runs for a single worktree, or the most recent `global_limit` runs across all
     /// worktrees when `worktree_id` is `None`. Consolidates the scoped-vs-global branching
     /// that would otherwise be duplicated at every call site.
@@ -1022,10 +1080,14 @@ impl<'a> WorkflowManager<'a> {
         Ok(count as usize)
     }
 
-    /// Fetch the currently-running step for each of the given workflow run IDs
-    /// in a single batched query. Returns a map from `workflow_run_id` to a
-    /// `WorkflowStepSummary`. If no active step is found for a run, that run's
-    /// ID is absent from the returned map.
+    /// Fetch the currently-running step for each of the given (root) workflow run IDs.
+    /// Returns a map from root `workflow_run_id` to a `WorkflowStepSummary`.
+    ///
+    /// For each root run the method walks down the active child chain to find the
+    /// deepest active sub-workflow run (the *leaf*), queries its running step, and
+    /// populates `workflow_chain` with the ordered workflow names from the root down
+    /// to (but not including) the leaf's own name — which is already available via
+    /// the `workflow_name` field of the root's `WorkflowRun`.
     ///
     /// An empty `run_ids` slice returns an empty map without hitting the DB.
     pub fn get_step_summaries_for_runs(
@@ -1035,38 +1097,81 @@ impl<'a> WorkflowManager<'a> {
         if run_ids.is_empty() {
             return Ok(HashMap::new());
         }
+
+        // Fetch workflow names for the root runs.
         let placeholders = (1..=run_ids.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "SELECT ws.workflow_run_id, ws.step_name, ws.iteration \
-             FROM workflow_run_steps ws \
-             WHERE ws.workflow_run_id IN ({placeholders}) \
-               AND ws.status = 'running' \
-             ORDER BY ws.position ASC"
-        );
+        let name_sql =
+            format!("SELECT id, workflow_name FROM workflow_runs WHERE id IN ({placeholders})");
         let run_id_strings: Vec<String> = run_ids.iter().map(|s| s.to_string()).collect();
-        let params_ref: Vec<&dyn rusqlite::ToSql> = run_id_strings
+        let name_params: Vec<&dyn rusqlite::ToSql> = run_id_strings
             .iter()
             .map(|s| s as &dyn rusqlite::ToSql)
             .collect();
-        let mut stmt = self.conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_ref.as_slice())?;
+        let mut name_stmt = self.conn.prepare_cached(&name_sql)?;
+        let mut name_rows = name_stmt.query(name_params.as_slice())?;
+        let mut root_names: HashMap<String, String> = HashMap::new();
+        while let Some(row) = name_rows.next()? {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            root_names.insert(id, name);
+        }
+
         let mut map: HashMap<String, WorkflowStepSummary> = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let run_id: String = row.get(0)?;
-            // Take only the first (lowest position) running step per run.
-            if map.contains_key(&run_id) {
+
+        for root_id in run_ids {
+            let Some(root_name) = root_names.get(*root_id) else {
                 continue;
+            };
+
+            // Walk the active sub-workflow chain from this root.
+            // Returns (id, name) pairs so we already have the leaf run ID.
+            let child_chain = self.get_active_chain_for_run(root_id)?;
+
+            // The leaf run is the deepest active child, or the root itself.
+            let leaf_id = child_chain
+                .last()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| root_id.to_string());
+
+            // Find the running step on the leaf run.
+            let mut step_stmt = self.conn.prepare_cached(
+                "SELECT step_name, iteration FROM workflow_run_steps \
+                 WHERE workflow_run_id = ?1 AND status = 'running' \
+                 ORDER BY position ASC LIMIT 1",
+            )?;
+            let step: Option<(String, i64)> = step_stmt
+                .query_row(params![leaf_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+
+            if let Some((step_name, iteration)) = step {
+                // For single-level (no children), expose an empty vec to keep
+                // existing rendering unchanged. Otherwise build:
+                // root_name + child names excluding the leaf (which owns the step).
+                let workflow_chain = if child_chain.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut wc = vec![root_name.clone()];
+                    // child_chain is (id, name); exclude the last entry (the leaf).
+                    wc.extend(
+                        child_chain[..child_chain.len() - 1]
+                            .iter()
+                            .map(|(_, name)| name.clone()),
+                    );
+                    wc
+                };
+
+                map.insert(
+                    root_id.to_string(),
+                    WorkflowStepSummary {
+                        step_name,
+                        iteration,
+                        workflow_chain,
+                    },
+                );
             }
-            map.insert(
-                run_id,
-                WorkflowStepSummary {
-                    step_name: row.get(1)?,
-                    iteration: row.get(2)?,
-                },
-            );
         }
         Ok(map)
     }
@@ -1112,6 +1217,7 @@ fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRun> {
         .unwrap_or_default();
     let ticket_id: Option<String> = row.get(12)?;
     let repo_id: Option<String> = row.get(13)?;
+    let parent_workflow_run_id: Option<String> = row.get(14)?;
     Ok(WorkflowRun {
         id: row.get(0)?,
         workflow_name: row.get(1)?,
@@ -1127,6 +1233,7 @@ fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRun> {
         inputs,
         ticket_id,
         repo_id,
+        parent_workflow_run_id,
     })
 }
 
@@ -1360,6 +1467,8 @@ pub struct WorkflowExecInput<'a> {
     pub repo_id: Option<&'a str>,
     /// Current nesting depth for sub-workflow calls (0 = top-level).
     pub depth: u32,
+    /// The parent workflow run ID when this is a sub-workflow invocation.
+    pub parent_workflow_run_id: Option<&'a str>,
 }
 
 /// Execute a workflow definition against a worktree.
@@ -1446,6 +1555,7 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         input.exec_config.dry_run,
         &workflow.trigger.to_string(),
         Some(&snapshot_json),
+        input.parent_workflow_run_id,
     )?;
 
     // Build inputs map, injecting implicit ticket/repo variables
@@ -1642,6 +1752,7 @@ pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<Wo
         exec_config: &params.exec_config,
         inputs: params.inputs.clone(),
         depth: 0,
+        parent_workflow_run_id: None,
     };
 
     execute_workflow(&input)
@@ -2530,6 +2641,7 @@ fn execute_call_workflow(
             exec_config: &state.exec_config,
             inputs: child_inputs,
             depth: child_depth,
+            parent_workflow_run_id: Some(&state.workflow_run_id),
         };
 
         match execute_workflow(&child_input) {
@@ -3994,6 +4106,7 @@ mod tests {
                 false,
                 "manual",
                 None,
+                None,
             )
             .unwrap();
 
@@ -4027,6 +4140,7 @@ mod tests {
                 &parent.id,
                 false,
                 "manual",
+                None,
                 None,
             )
             .unwrap();
@@ -5892,6 +6006,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let err = execute_workflow(&input).unwrap_err();
         assert!(
@@ -5931,6 +6046,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         // Guard should pass; empty workflow completes successfully.
         let result = execute_workflow(&input);
@@ -5972,6 +6088,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 1,
+            parent_workflow_run_id: None,
         };
         let result = execute_workflow(&input);
         assert!(
@@ -7604,6 +7721,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result1 = execute_workflow(&input1);
         assert!(
@@ -7630,6 +7748,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result2 = execute_workflow(&input2);
         assert!(
@@ -7915,6 +8034,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -7960,6 +8080,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -8009,6 +8130,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: explicit_inputs,
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -8045,6 +8167,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         assert!(
             execute_workflow(&input).is_err(),
@@ -8072,6 +8195,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         assert!(
             execute_workflow(&input).is_err(),
@@ -8137,6 +8261,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -8186,6 +8311,7 @@ And here is my actual output:
             exec_config: &exec_config,
             inputs: HashMap::new(),
             depth: 0,
+            parent_workflow_run_id: None,
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -8210,6 +8336,186 @@ And here is my actual output:
             resume_result.is_ok(),
             "resume of ticket-targeted run should succeed: {:?}",
             resume_result.err()
+        );
+    }
+
+    // ── helpers shared by chain/step-summary tests ───────────────────────────
+
+    /// Insert a minimal workflow_run directly into the DB for testing chain walks.
+    /// Creates a throwaway agent_run to satisfy the `parent_run_id` FK constraint.
+    fn insert_workflow_run(
+        conn: &Connection,
+        id: &str,
+        name: &str,
+        status: &str,
+        parent_workflow_run_id: Option<&str>,
+    ) {
+        // Create a dummy agent_run so the FK on parent_run_id is satisfied.
+        let agent_mgr = AgentManager::new(conn);
+        let parent = agent_mgr.create_run(None, "workflow", None, None).unwrap();
+        conn.execute(
+            "INSERT INTO workflow_runs \
+             (id, workflow_name, worktree_id, parent_run_id, status, dry_run, trigger, started_at, \
+              parent_workflow_run_id) \
+             VALUES (?1, ?2, NULL, ?3, ?4, 0, 'manual', '2025-01-01T00:00:00Z', ?5)",
+            params![id, name, parent.id, status, parent_workflow_run_id],
+        )
+        .unwrap();
+    }
+
+    /// Insert a workflow_run_step in 'running' status for the given run.
+    fn insert_running_step(conn: &Connection, step_id: &str, run_id: &str, step_name: &str) {
+        conn.execute(
+            "INSERT INTO workflow_run_steps \
+             (id, workflow_run_id, step_name, role, position, status, iteration) \
+             VALUES (?1, ?2, ?3, 'actor', 0, 'running', 1)",
+            params![step_id, run_id, step_name],
+        )
+        .unwrap();
+    }
+
+    // ── list_root_workflow_runs ───────────────────────────────────────────────
+
+    #[test]
+    fn test_list_root_workflow_runs_excludes_children() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        insert_workflow_run(&conn, "child1", "child-wf", "running", Some("root1"));
+
+        let mgr = WorkflowManager::new(&conn);
+        let roots = mgr.list_root_workflow_runs(100).unwrap();
+        let ids: Vec<&str> = roots.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"root1"), "root run should appear");
+        assert!(!ids.contains(&"child1"), "child run must not appear");
+    }
+
+    #[test]
+    fn test_list_root_workflow_runs_empty() {
+        let conn = setup_db();
+        let mgr = WorkflowManager::new(&conn);
+        let roots = mgr.list_root_workflow_runs(100).unwrap();
+        assert!(roots.is_empty());
+    }
+
+    // ── get_active_chain_for_run ──────────────────────────────────────────────
+
+    #[test]
+    fn test_get_active_chain_no_children() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+
+        let mgr = WorkflowManager::new(&conn);
+        let chain = mgr.get_active_chain_for_run("root1").unwrap();
+        assert!(chain.is_empty(), "no children → empty chain");
+    }
+
+    #[test]
+    fn test_get_active_chain_single_child() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        insert_workflow_run(&conn, "child1", "child-wf", "running", Some("root1"));
+
+        let mgr = WorkflowManager::new(&conn);
+        let chain = mgr.get_active_chain_for_run("root1").unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].0, "child1");
+        assert_eq!(chain[0].1, "child-wf");
+    }
+
+    #[test]
+    fn test_get_active_chain_two_deep() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        insert_workflow_run(&conn, "child1", "child-wf", "running", Some("root1"));
+        insert_workflow_run(&conn, "grand1", "grand-wf", "running", Some("child1"));
+
+        let mgr = WorkflowManager::new(&conn);
+        let chain = mgr.get_active_chain_for_run("root1").unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0], ("child1".to_string(), "child-wf".to_string()));
+        assert_eq!(chain[1], ("grand1".to_string(), "grand-wf".to_string()));
+    }
+
+    #[test]
+    fn test_get_active_chain_ignores_terminal_children() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        // completed child — must not appear in active chain
+        insert_workflow_run(&conn, "child1", "child-wf", "completed", Some("root1"));
+
+        let mgr = WorkflowManager::new(&conn);
+        let chain = mgr.get_active_chain_for_run("root1").unwrap();
+        assert!(chain.is_empty(), "completed child must not appear in chain");
+    }
+
+    // ── get_step_summaries_for_runs ───────────────────────────────────────────
+
+    #[test]
+    fn test_get_step_summaries_no_children() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        insert_running_step(&conn, "step1", "root1", "my-step");
+
+        let mgr = WorkflowManager::new(&conn);
+        let summaries = mgr.get_step_summaries_for_runs(&["root1"]).unwrap();
+        let s = summaries.get("root1").expect("summary should exist");
+        assert_eq!(s.step_name, "my-step");
+        assert_eq!(s.iteration, 1);
+        // single-level: chain is empty
+        assert!(s.workflow_chain.is_empty());
+    }
+
+    #[test]
+    fn test_get_step_summaries_with_child_chain() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        insert_workflow_run(&conn, "child1", "child-wf", "running", Some("root1"));
+        // running step is on the child (leaf)
+        insert_running_step(&conn, "step1", "child1", "leaf-step");
+
+        let mgr = WorkflowManager::new(&conn);
+        let summaries = mgr.get_step_summaries_for_runs(&["root1"]).unwrap();
+        let s = summaries.get("root1").expect("summary should exist");
+        assert_eq!(s.step_name, "leaf-step");
+        // workflow_chain is [root_name] because child is the leaf (excluded)
+        assert_eq!(s.workflow_chain, vec!["root-wf"]);
+    }
+
+    #[test]
+    fn test_get_step_summaries_two_deep_chain() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        insert_workflow_run(&conn, "child1", "child-wf", "running", Some("root1"));
+        insert_workflow_run(&conn, "grand1", "grand-wf", "running", Some("child1"));
+        insert_running_step(&conn, "step1", "grand1", "grand-step");
+
+        let mgr = WorkflowManager::new(&conn);
+        let summaries = mgr.get_step_summaries_for_runs(&["root1"]).unwrap();
+        let s = summaries.get("root1").expect("summary should exist");
+        assert_eq!(s.step_name, "grand-step");
+        // root + first child (grand is leaf, excluded)
+        assert_eq!(s.workflow_chain, vec!["root-wf", "child-wf"]);
+    }
+
+    #[test]
+    fn test_get_step_summaries_empty_run_ids() {
+        let conn = setup_db();
+        let mgr = WorkflowManager::new(&conn);
+        let summaries = mgr.get_step_summaries_for_runs(&[]).unwrap();
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn test_get_step_summaries_no_running_step() {
+        let conn = setup_db();
+        insert_workflow_run(&conn, "root1", "root-wf", "running", None);
+        // no steps inserted
+
+        let mgr = WorkflowManager::new(&conn);
+        let summaries = mgr.get_step_summaries_for_runs(&["root1"]).unwrap();
+        assert!(
+            !summaries.contains_key("root1"),
+            "no running step → no entry in map"
         );
     }
 }
