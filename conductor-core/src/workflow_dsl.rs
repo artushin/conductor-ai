@@ -1543,7 +1543,7 @@ where
     validate_nodes(&def.always, &mut always_produced, &mut errors, loader);
 
     // Validate target values
-    const VALID_TARGETS: &[&str] = &["worktree", "ticket", "repo", "pr"];
+    const VALID_TARGETS: &[&str] = &["worktree", "ticket", "repo", "pr", "workflow_run"];
     for target in &def.targets {
         if !VALID_TARGETS.contains(&target.as_str()) {
             errors.push(ValidationError {
@@ -3590,7 +3590,7 @@ workflow test {
 
     #[test]
     fn test_validate_known_targets_accepted() {
-        for target in &["worktree", "ticket", "repo", "pr"] {
+        for target in &["worktree", "ticket", "repo", "pr", "workflow_run"] {
             let input =
                 format!("workflow test {{ meta {{ targets = [\"{target}\"] }} call step }}",);
             let def = parse_workflow_str(&input, "test.wf").unwrap();
