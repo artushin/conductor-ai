@@ -131,6 +131,34 @@ fn derive_worktree_slug(source_id: &str, title: &str) -> String {
     format!("{}-{}", source_id, truncated)
 }
 
+/// Send a workflow execution result through the background channel.
+///
+/// Shared by all three `spawn_*_workflow_in_background` helpers to avoid
+/// duplicating the success/failure dispatch logic.
+fn send_workflow_result(
+    bg_tx: &Option<crate::event::BackgroundSender>,
+    workflow_name: &str,
+    result: conductor_core::error::Result<conductor_core::workflow::WorkflowResult>,
+) {
+    if let Some(ref tx) = bg_tx {
+        match result {
+            Ok(res) => {
+                let msg = if res.all_succeeded {
+                    format!("Workflow '{workflow_name}' completed successfully")
+                } else {
+                    format!("Workflow '{workflow_name}' completed with failures")
+                };
+                tx.send(Action::BackgroundSuccess { message: msg });
+            }
+            Err(e) => {
+                tx.send(Action::BackgroundError {
+                    message: format!("Workflow '{workflow_name}' failed: {e}"),
+                });
+            }
+        }
+    }
+}
+
 pub struct App {
     state: AppState,
     conn: Connection,
@@ -4496,31 +4524,73 @@ impl App {
         } else if self.state.view == View::Dashboard
             && self.state.dashboard_focus == crate::state::DashboardFocus::Repos
         {
-            // Dashboard Repos pane: find the first worktree for selected repo
-            match self.resolve_worktree_for_selected_repo() {
-                Some((wt_id, wt_path, repo_path)) => WorkflowPickerTarget::Worktree {
-                    worktree_id: wt_id,
-                    worktree_path: wt_path,
-                    repo_path,
-                },
+            // Dashboard Repos pane: target is the selected repo
+            let repo = match self
+                .state
+                .selected_repo_id
+                .as_ref()
+                .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))
+            {
+                Some(r) => r.clone(),
                 None => {
-                    self.state.status_message = Some("No worktree found for this repo".to_string());
+                    self.state.status_message = Some("No repo selected".to_string());
                     return;
                 }
+            };
+            WorkflowPickerTarget::Repo {
+                repo_id: repo.id.clone(),
+                repo_path: repo.local_path.clone(),
+                repo_name: repo.slug.clone(),
             }
         } else {
-            // Ticket list contexts: find linked worktree for selected ticket
-            match self.resolve_worktree_for_selected_ticket() {
-                Some((wt_id, wt_path, repo_path)) => WorkflowPickerTarget::Worktree {
-                    worktree_id: wt_id,
-                    worktree_path: wt_path,
-                    repo_path,
-                },
-                None => {
-                    self.state.status_message =
-                        Some("No worktree linked to this ticket".to_string());
+            // Ticket list contexts: target is the selected ticket itself
+            let ticket = match self.state.view {
+                View::Dashboard
+                    if self.state.dashboard_focus == crate::state::DashboardFocus::Tickets =>
+                {
+                    self.state.filtered_tickets.get(self.state.ticket_index)
+                }
+                View::Tickets => self.state.filtered_tickets.get(self.state.ticket_index),
+                View::RepoDetail
+                    if self.state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets =>
+                {
+                    self.state
+                        .filtered_detail_tickets
+                        .get(self.state.detail_ticket_index)
+                }
+                _ => {
+                    self.state.status_message = Some("No ticket selected".to_string());
                     return;
                 }
+            };
+            let ticket = match ticket {
+                Some(t) => t.clone(),
+                None => {
+                    self.state.status_message = Some("No ticket selected".to_string());
+                    return;
+                }
+            };
+            let repo = self
+                .state
+                .data
+                .repos
+                .iter()
+                .find(|r| r.id == ticket.repo_id);
+            let repo_path = match repo {
+                Some(r) => r.local_path.clone(),
+                None => {
+                    self.state.modal = Modal::Error {
+                        message: "Cannot run workflow: ticket's repository is not registered in Conductor.".to_string(),
+                    };
+                    return;
+                }
+            };
+            WorkflowPickerTarget::Ticket {
+                ticket_id: ticket.id.clone(),
+                ticket_title: ticket.title.clone(),
+                ticket_url: ticket.url.clone(),
+                repo_path,
+                repo_id: ticket.repo_id.clone(),
             }
         };
 
@@ -4542,12 +4612,28 @@ impl App {
                 .filter(|d| d.targets.iter().any(|t| t == "worktree"))
                 .cloned()
                 .collect(),
+            WorkflowPickerTarget::Ticket { repo_path, .. } => {
+                conductor_core::workflow::WorkflowManager::list_defs("", repo_path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.targets.iter().any(|t| t == "ticket"))
+                    .collect()
+            }
+            WorkflowPickerTarget::Repo { repo_path, .. } => {
+                conductor_core::workflow::WorkflowManager::list_defs("", repo_path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.targets.iter().any(|t| t == "repo"))
+                    .collect()
+            }
         };
 
         if defs.is_empty() {
             let kind = match &target {
                 WorkflowPickerTarget::Pr { .. } => "PR",
                 WorkflowPickerTarget::Worktree { .. } => "worktree",
+                WorkflowPickerTarget::Ticket { .. } => "ticket",
+                WorkflowPickerTarget::Repo { .. } => "repo",
             };
             self.state.modal = Modal::Error {
                 message: format!(
@@ -4562,62 +4648,6 @@ impl App {
             workflow_defs: defs,
             selected: 0,
         };
-    }
-
-    /// Resolve a worktree target from the currently selected repo (Dashboard Repos pane).
-    fn resolve_worktree_for_selected_repo(&self) -> Option<(String, String, String)> {
-        let repo = self
-            .state
-            .selected_repo_id
-            .as_ref()
-            .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))?;
-        let repo_path = repo.local_path.clone();
-        let wt = self
-            .state
-            .data
-            .worktrees
-            .iter()
-            .find(|w| w.repo_id == repo.id)?;
-        Some((wt.id.clone(), wt.path.clone(), repo_path))
-    }
-
-    /// Resolve a worktree target from the currently selected ticket.
-    fn resolve_worktree_for_selected_ticket(&self) -> Option<(String, String, String)> {
-        // Get the selected ticket (uses filtered lists, matching selected_ticket_url pattern)
-        let ticket = match self.state.view {
-            View::Dashboard
-                if self.state.dashboard_focus == crate::state::DashboardFocus::Tickets =>
-            {
-                self.state.filtered_tickets.get(self.state.ticket_index)
-            }
-            View::Tickets => self.state.filtered_tickets.get(self.state.ticket_index),
-            View::RepoDetail
-                if self.state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets =>
-            {
-                self.state
-                    .filtered_detail_tickets
-                    .get(self.state.detail_ticket_index)
-            }
-            _ => return None,
-        };
-        let ticket = ticket?;
-
-        // Find a worktree linked to this ticket
-        let wt = self
-            .state
-            .data
-            .worktrees
-            .iter()
-            .find(|w| w.ticket_id.as_deref() == Some(&ticket.id))?;
-        let repo_path = self
-            .state
-            .data
-            .repos
-            .iter()
-            .find(|r| r.id == wt.repo_id)
-            .map(|r| r.local_path.clone())
-            .unwrap_or_default();
-        Some((wt.id.clone(), wt.path.clone(), repo_path))
     }
 
     /// Confirm the workflow selection from the generic WorkflowPicker modal.
@@ -4715,6 +4745,21 @@ impl App {
 
                 self.spawn_pr_workflow_in_background(pr_ref, def);
             }
+            WorkflowPickerTarget::Ticket {
+                ticket_id,
+                repo_id,
+                repo_path,
+                ..
+            } => {
+                self.spawn_ticket_workflow_in_background(def, ticket_id, repo_id, repo_path);
+            }
+            WorkflowPickerTarget::Repo {
+                repo_id,
+                repo_path,
+                repo_name,
+            } => {
+                self.spawn_repo_workflow_in_background(def, repo_id, repo_path, repo_name);
+            }
         }
     }
 
@@ -4807,8 +4852,10 @@ impl App {
                 config,
                 workflow: def.clone(),
                 worktree_id: Some(worktree_id),
-                worktree_path,
+                working_dir: worktree_path,
                 repo_path,
+                ticket_id: None,
+                repo_id: None,
                 model: None,
                 exec_config: WorkflowExecConfig {
                     shutdown: Some(shutdown),
@@ -4819,23 +4866,97 @@ impl App {
 
             let result = execute_workflow_standalone(&params);
 
-            if let Some(ref tx) = bg_tx {
-                let msg = match result {
-                    Ok(res) => {
-                        if res.all_succeeded {
-                            format!("Workflow '{}' completed successfully", def.name)
-                        } else {
-                            format!("Workflow '{}' completed with failures", def.name)
-                        }
-                    }
-                    Err(e) => format!("Workflow '{}' failed: {e}", def.name),
-                };
-                let _ = tx.send(Action::BackgroundSuccess { message: msg });
-            }
+            send_workflow_result(&bg_tx, &def.name, result);
         });
 
         self.workflow_threads.push(handle);
         self.state.status_message = Some(format!("Starting workflow '{workflow_name}'…"));
+    }
+
+    fn spawn_ticket_workflow_in_background(
+        &mut self,
+        def: conductor_core::workflow::WorkflowDef,
+        ticket_id: String,
+        repo_id: String,
+        repo_path: String,
+    ) {
+        let config = self.config.clone();
+        let bg_tx = self.bg_tx.clone();
+        let workflow_name = def.name.clone();
+        let shutdown = Arc::clone(&self.workflow_shutdown);
+
+        let handle = std::thread::spawn(move || {
+            use conductor_core::workflow::{
+                execute_workflow_standalone, WorkflowExecConfig, WorkflowExecStandalone,
+            };
+
+            let working_dir = repo_path.clone();
+
+            let params = WorkflowExecStandalone {
+                config,
+                workflow: def.clone(),
+                worktree_id: None,
+                working_dir,
+                repo_path,
+                ticket_id: Some(ticket_id),
+                repo_id: Some(repo_id),
+                model: None,
+                exec_config: WorkflowExecConfig {
+                    shutdown: Some(shutdown),
+                    ..WorkflowExecConfig::default()
+                },
+                inputs: std::collections::HashMap::new(),
+            };
+
+            let result = execute_workflow_standalone(&params);
+
+            send_workflow_result(&bg_tx, &def.name, result);
+        });
+
+        self.workflow_threads.push(handle);
+        self.state.status_message = Some(format!("Starting workflow '{workflow_name}' on ticket…"));
+    }
+
+    fn spawn_repo_workflow_in_background(
+        &mut self,
+        def: conductor_core::workflow::WorkflowDef,
+        repo_id: String,
+        repo_path: String,
+        _repo_name: String,
+    ) {
+        let config = self.config.clone();
+        let bg_tx = self.bg_tx.clone();
+        let workflow_name = def.name.clone();
+        let shutdown = Arc::clone(&self.workflow_shutdown);
+
+        let handle = std::thread::spawn(move || {
+            use conductor_core::workflow::{
+                execute_workflow_standalone, WorkflowExecConfig, WorkflowExecStandalone,
+            };
+
+            let params = WorkflowExecStandalone {
+                config,
+                workflow: def.clone(),
+                worktree_id: None,
+                working_dir: repo_path.clone(),
+                repo_path,
+                ticket_id: None,
+                repo_id: Some(repo_id),
+                model: None,
+                exec_config: WorkflowExecConfig {
+                    shutdown: Some(shutdown),
+                    ..WorkflowExecConfig::default()
+                },
+                inputs: std::collections::HashMap::new(),
+            };
+
+            let result = execute_workflow_standalone(&params);
+
+            send_workflow_result(&bg_tx, &def.name, result);
+        });
+
+        self.workflow_threads.push(handle);
+        self.state.status_message = Some(format!("Starting workflow '{workflow_name}' on repo…"));
     }
 
     fn handle_run_pr_workflow(&mut self) {

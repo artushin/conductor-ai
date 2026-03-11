@@ -62,7 +62,7 @@ const STEP_COLUMNS: &str =
 /// Column list for `workflow_runs` SELECT queries (used by `row_to_workflow_run`).
 const RUN_COLUMNS: &str =
     "id, workflow_name, worktree_id, parent_run_id, status, dry_run, trigger, \
-     started_at, ended_at, result_summary, definition_snapshot, inputs";
+     started_at, ended_at, result_summary, definition_snapshot, inputs, ticket_id, repo_id";
 
 /// Instruction appended to every agent prompt for structured output.
 pub const CONDUCTOR_OUTPUT_INSTRUCTION: &str = r#"
@@ -112,7 +112,7 @@ pub fn parse_conductor_output(text: &str) -> Option<ConductorOutput> {
 fn resolve_schema(state: &ExecutionState<'_>, name: &str) -> Result<OutputSchema> {
     let schema_ref = schema_config::SchemaRef::from_str_value(name);
     schema_config::load_schema(
-        &state.worktree_path,
+        &state.working_dir,
         &state.repo_path,
         &schema_ref,
         Some(&state.workflow_name),
@@ -295,6 +295,8 @@ pub struct WorkflowRun {
     pub result_summary: Option<String>,
     pub definition_snapshot: Option<String>,
     pub inputs: HashMap<String, String>,
+    pub ticket_id: Option<String>,
+    pub repo_id: Option<String>,
 }
 
 /// A workflow step execution record from the database.
@@ -501,17 +503,44 @@ impl<'a> WorkflowManager<'a> {
         trigger: &str,
         definition_snapshot: Option<&str>,
     ) -> Result<WorkflowRun> {
+        self.create_workflow_run_with_targets(
+            workflow_name,
+            worktree_id,
+            None,
+            None,
+            parent_run_id,
+            dry_run,
+            trigger,
+            definition_snapshot,
+        )
+    }
+
+    /// Create a workflow run record with ticket and repo target IDs in a single INSERT.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_workflow_run_with_targets(
+        &self,
+        workflow_name: &str,
+        worktree_id: Option<&str>,
+        ticket_id: Option<&str>,
+        repo_id: Option<&str>,
+        parent_run_id: &str,
+        dry_run: bool,
+        trigger: &str,
+        definition_snapshot: Option<&str>,
+    ) -> Result<WorkflowRun> {
         let id = ulid::Ulid::new().to_string();
         let now = Utc::now().to_rfc3339();
 
         self.conn.execute(
-            "INSERT INTO workflow_runs (id, workflow_name, worktree_id, parent_run_id, status, \
-             dry_run, trigger, started_at, definition_snapshot) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO workflow_runs (id, workflow_name, worktree_id, ticket_id, repo_id, \
+             parent_run_id, status, dry_run, trigger, started_at, definition_snapshot) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 workflow_name,
                 worktree_id,
+                ticket_id,
+                repo_id,
                 parent_run_id,
                 "pending",
                 dry_run as i64,
@@ -534,6 +563,8 @@ impl<'a> WorkflowManager<'a> {
             result_summary: None,
             definition_snapshot: definition_snapshot.map(String::from),
             inputs: HashMap::new(),
+            ticket_id: ticket_id.map(String::from),
+            repo_id: repo_id.map(String::from),
         })
     }
 
@@ -1085,6 +1116,8 @@ fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRun> {
             })
         })
         .unwrap_or_default();
+    let ticket_id: Option<String> = row.get(12)?;
+    let repo_id: Option<String> = row.get(13)?;
     Ok(WorkflowRun {
         id: row.get(0)?,
         workflow_name: row.get(1)?,
@@ -1098,6 +1131,8 @@ fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRun> {
         result_summary: row.get(9)?,
         definition_snapshot: row.get(10)?,
         inputs,
+        ticket_id,
+        repo_id,
     })
 }
 
@@ -1256,9 +1291,11 @@ struct ExecutionState<'a> {
     workflow_run_id: String,
     workflow_name: String,
     worktree_id: Option<String>,
-    worktree_path: String,
+    working_dir: String,
     worktree_slug: String,
     repo_path: String,
+    ticket_id: Option<String>,
+    repo_id: Option<String>,
     model: Option<String>,
     exec_config: WorkflowExecConfig,
     inputs: HashMap<String, String>,
@@ -1320,11 +1357,13 @@ pub struct WorkflowExecInput<'a> {
     pub workflow: &'a WorkflowDef,
     /// `None` for ephemeral PR runs with no registered worktree.
     pub worktree_id: Option<&'a str>,
-    pub worktree_path: &'a str,
+    pub working_dir: &'a str,
     pub repo_path: &'a str,
     pub model: Option<&'a str>,
     pub exec_config: &'a WorkflowExecConfig,
     pub inputs: HashMap<String, String>,
+    pub ticket_id: Option<&'a str>,
+    pub repo_id: Option<&'a str>,
     /// Current nesting depth for sub-workflow calls (0 = top-level).
     pub depth: u32,
 }
@@ -1352,7 +1391,7 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
 
     let specs: Vec<AgentSpec> = all_agents.iter().map(AgentSpec::from).collect();
     let missing_agents = agent_config::find_missing_agents(
-        input.worktree_path,
+        input.working_dir,
         input.repo_path,
         &specs,
         Some(&workflow.name),
@@ -1369,7 +1408,7 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
 
     if !all_snippets.is_empty() {
         let missing_snippets = prompt_config::find_missing_snippets(
-            input.worktree_path,
+            input.working_dir,
             input.repo_path,
             &all_snippets,
             Some(&workflow.name),
@@ -1403,19 +1442,48 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
     let parent_prompt = format!("Workflow: {} — {}", workflow.name, workflow.description);
     let parent_run = agent_mgr.create_run(input.worktree_id, &parent_prompt, None, input.model)?;
 
-    // Create workflow run record with snapshot
-    let wf_run = wf_mgr.create_workflow_run(
+    // Create workflow run record with snapshot and target FKs in a single INSERT
+    let wf_run = wf_mgr.create_workflow_run_with_targets(
         &workflow.name,
         input.worktree_id,
+        input.ticket_id,
+        input.repo_id,
         &parent_run.id,
         input.exec_config.dry_run,
         &workflow.trigger.to_string(),
         Some(&snapshot_json),
     )?;
 
+    // Build inputs map, injecting implicit ticket/repo variables
+    let mut merged_inputs = input.inputs.clone();
+    if let Some(tid) = input.ticket_id {
+        let ticket = crate::tickets::TicketSyncer::new(conn).get_by_id(tid)?;
+        merged_inputs
+            .entry("ticket_id".to_string())
+            .or_insert_with(|| ticket.id.clone());
+        merged_inputs
+            .entry("ticket_title".to_string())
+            .or_insert_with(|| ticket.title.clone());
+        merged_inputs
+            .entry("ticket_url".to_string())
+            .or_insert_with(|| ticket.url.clone());
+    }
+    if let Some(rid) = input.repo_id {
+        let repo = crate::repo::RepoManager::new(conn, config).get_by_id(rid)?;
+        merged_inputs
+            .entry("repo_id".to_string())
+            .or_insert_with(|| repo.id.clone());
+        merged_inputs
+            .entry("repo_path".to_string())
+            .or_insert_with(|| repo.local_path.clone());
+        merged_inputs
+            .entry("repo_name".to_string())
+            .or_insert_with(|| repo.slug.clone());
+    }
+
     // Persist inputs so they can be restored on resume
-    if !input.inputs.is_empty() {
-        wf_mgr.set_workflow_run_inputs(&wf_run.id, &input.inputs)?;
+    if !merged_inputs.is_empty() {
+        wf_mgr.set_workflow_run_inputs(&wf_run.id, &merged_inputs)?;
     }
 
     // Mark as running
@@ -1427,12 +1495,14 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         workflow_run_id: wf_run.id.clone(),
         workflow_name: workflow.name.clone(),
         worktree_id: input.worktree_id.map(String::from),
-        worktree_path: input.worktree_path.to_string(),
+        working_dir: input.working_dir.to_string(),
         worktree_slug,
         repo_path: input.repo_path.to_string(),
+        ticket_id: input.ticket_id.map(String::from),
+        repo_id: input.repo_id.map(String::from),
         model: input.model.map(String::from),
         exec_config: input.exec_config.clone(),
-        inputs: input.inputs.clone(),
+        inputs: merged_inputs,
         agent_mgr: AgentManager::new(conn),
         wf_mgr: WorkflowManager::new(conn),
         parent_run_id: parent_run.id.clone(),
@@ -1549,8 +1619,10 @@ pub struct WorkflowExecStandalone {
     pub workflow: WorkflowDef,
     /// `None` for ephemeral PR runs with no registered worktree.
     pub worktree_id: Option<String>,
-    pub worktree_path: String,
+    pub working_dir: String,
     pub repo_path: String,
+    pub ticket_id: Option<String>,
+    pub repo_id: Option<String>,
     pub model: Option<String>,
     pub exec_config: WorkflowExecConfig,
     pub inputs: HashMap<String, String>,
@@ -1568,8 +1640,10 @@ pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<Wo
         config: &params.config,
         workflow: &params.workflow,
         worktree_id: params.worktree_id.as_deref(),
-        worktree_path: &params.worktree_path,
+        working_dir: &params.working_dir,
         repo_path: &params.repo_path,
+        ticket_id: params.ticket_id.as_deref(),
+        repo_id: params.repo_id.as_deref(),
         model: params.model.as_deref(),
         exec_config: &params.exec_config,
         inputs: params.inputs.clone(),
@@ -1688,13 +1762,13 @@ pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult
         }
     }
 
-    // Reject ephemeral PR runs early (no registered worktree — cannot resume).
-    let wt_id = wf_run.worktree_id.as_deref().ok_or_else(|| {
-        ConductorError::Workflow(format!(
+    // Fail early for ephemeral PR runs (no worktree_id, repo_id, or ticket_id).
+    if wf_run.worktree_id.is_none() && wf_run.repo_id.is_none() && wf_run.ticket_id.is_none() {
+        return Err(ConductorError::Workflow(format!(
             "Workflow run '{}' was an ephemeral PR run with no registered worktree — cannot resume.",
             wf_run.id
-        ))
-    })?;
+        )));
+    }
 
     // Deserialize definition from snapshot
     let snapshot = wf_run.definition_snapshot.as_deref().ok_or_else(|| {
@@ -1706,8 +1780,40 @@ pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult
     let workflow: WorkflowDef = serde_json::from_str(snapshot).map_err(|e| {
         ConductorError::Workflow(format!("Failed to deserialize workflow snapshot: {e}"))
     })?;
-    let worktree = wt_mgr.get_by_id(wt_id)?;
-    let repo = crate::repo::RepoManager::new(conn, config).get_by_id(&worktree.repo_id)?;
+
+    // Determine execution paths based on target type.
+    // - Worktree run: look up worktree and derive repo from it.
+    // - Repo/ticket run: look up repo directly (via repo_id or ticket.repo_id).
+    let (worktree_path, worktree_slug, repo_path) =
+        if let Some(wt_id) = wf_run.worktree_id.as_deref() {
+            let worktree = wt_mgr.get_by_id(wt_id)?;
+            let repo = crate::repo::RepoManager::new(conn, config).get_by_id(&worktree.repo_id)?;
+            (
+                worktree.path.clone(),
+                worktree.slug.clone(),
+                repo.local_path.clone(),
+            )
+        } else {
+            // Resolve repo_id from the run or via the linked ticket.
+            // (The ephemeral guard above ensures at least one FK is set.)
+            let effective_repo_id = if let Some(rid) = wf_run.repo_id.as_deref() {
+                rid.to_string()
+            } else {
+                let tid = wf_run.ticket_id.as_deref().expect("guarded above");
+                crate::tickets::TicketSyncer::new(conn)
+                    .get_by_id(tid)
+                    .map_err(|e| {
+                        ConductorError::Workflow(format!(
+                            "Cannot resolve repo for ticket '{}' during resume: {e}",
+                            tid
+                        ))
+                    })?
+                    .repo_id
+            };
+            let repo = crate::repo::RepoManager::new(conn, config).get_by_id(&effective_repo_id)?;
+            let path = repo.local_path.clone();
+            (path.clone(), String::new(), path)
+        };
 
     // Build the skip set
     let skip_completed = if input.restart {
@@ -1792,9 +1898,11 @@ pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult
         workflow_run_id: wf_run.id.clone(),
         workflow_name: workflow.name.clone(),
         worktree_id: wf_run.worktree_id.clone(),
-        worktree_path: worktree.path.clone(),
-        worktree_slug: worktree.slug.clone(),
-        repo_path: repo.local_path.clone(),
+        working_dir: worktree_path,
+        worktree_slug,
+        repo_path,
+        ticket_id: wf_run.ticket_id.clone(),
+        repo_id: wf_run.repo_id.clone(),
         model: input.model.map(String::from),
         exec_config: WorkflowExecConfig::default(),
         inputs: wf_run.inputs.clone(),
@@ -2077,7 +2185,7 @@ fn execute_call_with_schema(
 
     // Load agent definition
     let agent_def = agent_config::load_agent(
-        &state.worktree_path,
+        &state.working_dir,
         &state.repo_path,
         &AgentSpec::from(&node.agent),
         Some(&state.workflow_name),
@@ -2092,7 +2200,7 @@ fn execute_call_with_schema(
 
     // Load and concatenate prompt snippets
     let snippet_text = prompt_config::load_and_concat_snippets(
-        &state.worktree_path,
+        &state.working_dir,
         &state.repo_path,
         with_refs,
         Some(&state.workflow_name),
@@ -2153,7 +2261,7 @@ fn execute_call_with_schema(
         // Spawn in tmux
         if let Err(e) = agent_runtime::spawn_child_tmux(
             &child_run.id,
-            &state.worktree_path,
+            &state.working_dir,
             &prompt,
             step_model,
             &child_window,
@@ -2351,13 +2459,13 @@ fn execute_call_workflow(
 
     // Load the child workflow definition once (it won't change between retries)
     let child_def =
-        workflow_dsl::load_workflow_by_name(&state.worktree_path, &state.repo_path, &node.workflow)
+        workflow_dsl::load_workflow_by_name(&state.working_dir, &state.repo_path, &node.workflow)
             .map_err(|e| {
-                ConductorError::Workflow(format!(
-                    "Failed to load sub-workflow '{}': {e}",
-                    node.workflow
-                ))
-            })?;
+            ConductorError::Workflow(format!(
+                "Failed to load sub-workflow '{}': {e}",
+                node.workflow
+            ))
+        })?;
 
     // Retry loop
     let max_attempts = 1 + node.retries;
@@ -2420,8 +2528,10 @@ fn execute_call_workflow(
             config: state.config,
             workflow: &child_def,
             worktree_id: state.worktree_id.as_deref(),
-            worktree_path: &state.worktree_path,
+            working_dir: &state.working_dir,
             repo_path: &state.repo_path,
+            ticket_id: state.ticket_id.as_deref(),
+            repo_id: state.repo_id.as_deref(),
             model: state.model.as_deref(),
             exec_config: &state.exec_config,
             inputs: child_inputs,
@@ -2971,7 +3081,7 @@ fn execute_parallel(
         }
 
         let agent_def = agent_config::load_agent(
-            &state.worktree_path,
+            &state.working_dir,
             &state.repo_path,
             &AgentSpec::from(agent_ref),
             Some(&state.workflow_name),
@@ -2992,7 +3102,7 @@ fn execute_parallel(
         }
 
         let snippet_text = prompt_config::load_and_concat_snippets(
-            &state.worktree_path,
+            &state.working_dir,
             &state.repo_path,
             &effective_with,
             Some(&state.workflow_name),
@@ -3040,7 +3150,7 @@ fn execute_parallel(
 
         if let Err(e) = agent_runtime::spawn_child_tmux(
             &child_run.id,
-            &state.worktree_path,
+            &state.working_dir,
             &prompt,
             step_model,
             &window_name,
@@ -3442,7 +3552,7 @@ fn execute_gate(state: &mut ExecutionState<'_>, node: &GateNode, iteration: u32)
                 // Poll gh pr view for approvals
                 let output = Command::new("gh")
                     .args(["pr", "view", "--json", "reviews"])
-                    .current_dir(&state.worktree_path)
+                    .current_dir(&state.working_dir)
                     .output();
 
                 if let Ok(out) = output {
@@ -3490,7 +3600,7 @@ fn execute_gate(state: &mut ExecutionState<'_>, node: &GateNode, iteration: u32)
 
                 let output = Command::new("gh")
                     .args(["pr", "checks", "--json", "state"])
-                    .current_dir(&state.worktree_path)
+                    .current_dir(&state.working_dir)
                     .output();
 
                 if let Ok(out) = output {
@@ -3866,6 +3976,72 @@ mod tests {
     }
 
     #[test]
+    fn test_create_workflow_run_with_repo_id_round_trip() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr
+            .create_run(Some("w1"), "workflow", None, None)
+            .unwrap();
+
+        let mgr = WorkflowManager::new(&conn);
+        let run = mgr
+            .create_workflow_run_with_targets(
+                "test-wf",
+                Some("w1"),
+                None,
+                Some("r1"),
+                &parent.id,
+                false,
+                "manual",
+                None,
+            )
+            .unwrap();
+
+        // Verify the struct returned by create reflects the inputs.
+        assert_eq!(run.repo_id.as_deref(), Some("r1"));
+        assert_eq!(run.ticket_id, None);
+
+        // Read back from DB and assert columns are persisted correctly.
+        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched.repo_id.as_deref(), Some("r1"));
+        assert_eq!(fetched.ticket_id, None);
+    }
+
+    #[test]
+    fn test_create_workflow_run_with_ticket_id_round_trip() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr
+            .create_run(Some("w1"), "workflow", None, None)
+            .unwrap();
+
+        insert_test_ticket(&conn, "tkt-rt-1", "r1");
+
+        let mgr = WorkflowManager::new(&conn);
+        let run = mgr
+            .create_workflow_run_with_targets(
+                "test-wf",
+                None,
+                Some("tkt-rt-1"),
+                None,
+                &parent.id,
+                false,
+                "manual",
+                None,
+            )
+            .unwrap();
+
+        // Verify the struct returned by create reflects the inputs.
+        assert_eq!(run.ticket_id.as_deref(), Some("tkt-rt-1"));
+        assert_eq!(run.repo_id, None);
+
+        // Read back from DB and assert columns are persisted correctly.
+        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched.ticket_id.as_deref(), Some("tkt-rt-1"));
+        assert_eq!(fetched.repo_id, None);
+    }
+
+    #[test]
     fn test_insert_step_with_iteration() {
         let conn = setup_db();
         let agent_mgr = AgentManager::new(&conn);
@@ -4103,9 +4279,11 @@ mod tests {
             workflow_run_id: run_id.clone(),
             workflow_name: "test".to_string(),
             worktree_id: Some("w1".to_string()),
-            worktree_path: String::new(),
+            working_dir: String::new(),
             worktree_slug: String::new(),
             repo_path: String::new(),
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: WorkflowExecConfig::default(),
             inputs: HashMap::new(),
@@ -4948,9 +5126,11 @@ And here is my actual output:
             workflow_run_id: String::new(),
             workflow_name: String::new(),
             worktree_id: None,
-            worktree_path: String::new(),
+            working_dir: String::new(),
             worktree_slug: String::new(),
             repo_path: String::new(),
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: WorkflowExecConfig::default(),
             inputs: HashMap::new(),
@@ -5337,9 +5517,11 @@ And here is my actual output:
             workflow_run_id: run.id,
             workflow_name: "test".into(),
             worktree_id: Some("w1".into()),
-            worktree_path: "/tmp/test".into(),
+            working_dir: "/tmp/test".into(),
             worktree_slug: "test".into(),
             repo_path: "/tmp/repo".into(),
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: WorkflowExecConfig::default(),
             inputs: HashMap::new(),
@@ -5702,8 +5884,10 @@ And here is my actual output:
             config: &config,
             workflow: &workflow,
             worktree_id: Some("w1"),
-            worktree_path: "/tmp/ws/feat-test",
+            working_dir: "/tmp/ws/feat-test",
             repo_path: "/tmp/repo",
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: &exec_config,
             inputs: HashMap::new(),
@@ -5739,8 +5923,10 @@ And here is my actual output:
             config: &config,
             workflow: &workflow,
             worktree_id: Some("w1"),
-            worktree_path: "/tmp/ws/feat-test",
+            working_dir: "/tmp/ws/feat-test",
             repo_path: "/tmp/repo",
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: &exec_config,
             inputs: HashMap::new(),
@@ -5778,8 +5964,10 @@ And here is my actual output:
             config: &config,
             workflow: &workflow,
             worktree_id: Some("w1"),
-            worktree_path: "/tmp/ws/feat-test",
+            working_dir: "/tmp/ws/feat-test",
             repo_path: "/tmp/repo",
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: &exec_config,
             inputs: HashMap::new(),
@@ -7408,8 +7596,10 @@ And here is my actual output:
             config: &config,
             workflow: &workflow,
             worktree_id: None,
-            worktree_path: "",
+            working_dir: "",
             repo_path: "",
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: &exec_config,
             inputs: HashMap::new(),
@@ -7432,8 +7622,10 @@ And here is my actual output:
             config: &config,
             workflow: &workflow,
             worktree_id: None,
-            worktree_path: "",
+            working_dir: "",
             repo_path: "",
+            ticket_id: None,
+            repo_id: None,
             model: None,
             exec_config: &exec_config,
             inputs: HashMap::new(),
@@ -7684,5 +7876,340 @@ And here is my actual output:
         assert!(mgr.get_workflow_run(&run_global.id).unwrap().is_some());
         // w1 run must be gone.
         assert!(mgr.get_workflow_run(&run_w1.id).unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Implicit variable injection tests
+    // -----------------------------------------------------------------------
+
+    /// Insert a minimal ticket row into the test DB and return its id.
+    fn insert_test_ticket(conn: &Connection, id: &str, repo_id: &str) {
+        conn.execute(
+            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, \
+             labels, url, synced_at, raw_json) \
+             VALUES (?1, ?2, 'github', ?3, 'Test ticket title', '', 'open', '[]', \
+             'https://github.com/test/repo/issues/1', '2024-01-01T00:00:00Z', '{}')",
+            rusqlite::params![id, repo_id, id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_execute_workflow_injects_repo_variables() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        // repo `r1` with local_path `/tmp/repo` is inserted by setup_db()
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            ticket_id: None,
+            repo_id: Some("r1"),
+            model: None,
+            exec_config: &exec_config,
+            inputs: HashMap::new(),
+            depth: 0,
+        };
+        let result = execute_workflow(&input).unwrap();
+
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .get_workflow_run(&result.workflow_run_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(run.inputs.get("repo_id").map(String::as_str), Some("r1"));
+        assert_eq!(
+            run.inputs.get("repo_path").map(String::as_str),
+            Some("/tmp/repo")
+        );
+        assert_eq!(
+            run.inputs.get("repo_name").map(String::as_str),
+            Some("test-repo")
+        );
+        // Assert the repo_id column is persisted on the WorkflowRun record itself.
+        assert_eq!(run.repo_id.as_deref(), Some("r1"));
+        assert_eq!(run.ticket_id, None);
+    }
+
+    #[test]
+    fn test_execute_workflow_injects_ticket_variables() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        insert_test_ticket(&conn, "tkt-1", "r1");
+
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            ticket_id: Some("tkt-1"),
+            repo_id: None,
+            model: None,
+            exec_config: &exec_config,
+            inputs: HashMap::new(),
+            depth: 0,
+        };
+        let result = execute_workflow(&input).unwrap();
+
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .get_workflow_run(&result.workflow_run_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            run.inputs.get("ticket_id").map(String::as_str),
+            Some("tkt-1")
+        );
+        assert_eq!(
+            run.inputs.get("ticket_title").map(String::as_str),
+            Some("Test ticket title")
+        );
+        assert!(
+            run.inputs.contains_key("ticket_url"),
+            "ticket_url should be injected"
+        );
+        // Assert the ticket_id column is persisted on the WorkflowRun record itself.
+        assert_eq!(run.ticket_id.as_deref(), Some("tkt-1"));
+        assert_eq!(run.repo_id, None);
+    }
+
+    #[test]
+    fn test_execute_workflow_existing_input_not_overwritten_by_injection() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        let mut explicit_inputs = HashMap::new();
+        explicit_inputs.insert("repo_name".to_string(), "my-override".to_string());
+
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            ticket_id: None,
+            repo_id: Some("r1"),
+            model: None,
+            exec_config: &exec_config,
+            inputs: explicit_inputs,
+            depth: 0,
+        };
+        let result = execute_workflow(&input).unwrap();
+
+        let wf_mgr = WorkflowManager::new(&conn);
+        let run = wf_mgr
+            .get_workflow_run(&result.workflow_run_id)
+            .unwrap()
+            .unwrap();
+
+        // Caller-supplied repo_name must not be overwritten by the injected value.
+        assert_eq!(
+            run.inputs.get("repo_name").map(String::as_str),
+            Some("my-override")
+        );
+    }
+
+    #[test]
+    fn test_execute_workflow_unknown_ticket_id_returns_error() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "",
+            repo_path: "",
+            ticket_id: Some("nonexistent-ticket"),
+            repo_id: None,
+            model: None,
+            exec_config: &exec_config,
+            inputs: HashMap::new(),
+            depth: 0,
+        };
+        assert!(
+            execute_workflow(&input).is_err(),
+            "referencing a nonexistent ticket_id must return an error"
+        );
+    }
+
+    #[test]
+    fn test_execute_workflow_unknown_repo_id_returns_error() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "",
+            repo_path: "",
+            ticket_id: None,
+            repo_id: Some("nonexistent-repo"),
+            model: None,
+            exec_config: &exec_config,
+            inputs: HashMap::new(),
+            depth: 0,
+        };
+        assert!(
+            execute_workflow(&input).is_err(),
+            "referencing a nonexistent repo_id must return an error"
+        );
+    }
+
+    #[test]
+    fn test_resume_workflow_ephemeral_run_rejected() {
+        let conn = setup_db();
+        let config = Config::default();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr.create_run(None, "workflow", None, None).unwrap();
+        let wf_mgr = WorkflowManager::new(&conn);
+        let snapshot = serde_json::to_string(&make_empty_workflow()).unwrap();
+        let run = wf_mgr
+            .create_workflow_run(
+                "ephemeral-wf",
+                None,
+                &parent.id,
+                false,
+                "manual",
+                Some(&snapshot),
+            )
+            .unwrap();
+        wf_mgr
+            .update_workflow_status(&run.id, WorkflowRunStatus::Failed, Some("step failed"))
+            .unwrap();
+
+        let result = resume_workflow(&WorkflowResumeInput {
+            conn: &conn,
+            config: &config,
+            workflow_run_id: &run.id,
+            model: None,
+            from_step: None,
+            restart: false,
+        });
+        assert!(result.is_err(), "ephemeral run resume should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("ephemeral PR run"),
+            "error should mention ephemeral PR run, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resume_workflow_repo_target() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            ticket_id: None,
+            repo_id: Some("r1"),
+            model: None,
+            exec_config: &exec_config,
+            inputs: HashMap::new(),
+            depth: 0,
+        };
+        let result = execute_workflow(&input).unwrap();
+
+        let wf_mgr = WorkflowManager::new(&conn);
+        wf_mgr
+            .update_workflow_status(
+                &result.workflow_run_id,
+                WorkflowRunStatus::Failed,
+                Some("step failed"),
+            )
+            .unwrap();
+
+        let resume_result = resume_workflow(&WorkflowResumeInput {
+            conn: &conn,
+            config: &config,
+            workflow_run_id: &result.workflow_run_id,
+            model: None,
+            from_step: None,
+            restart: false,
+        });
+        assert!(
+            resume_result.is_ok(),
+            "resume of repo-targeted run should succeed: {:?}",
+            resume_result.err()
+        );
+    }
+
+    #[test]
+    fn test_resume_workflow_ticket_target() {
+        let conn = setup_db();
+        let config = Config::default();
+        let exec_config = WorkflowExecConfig::default();
+        let workflow = make_empty_workflow();
+
+        insert_test_ticket(&conn, "tkt-1", "r1");
+
+        let input = WorkflowExecInput {
+            conn: &conn,
+            config: &config,
+            workflow: &workflow,
+            worktree_id: None,
+            working_dir: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            ticket_id: Some("tkt-1"),
+            repo_id: None,
+            model: None,
+            exec_config: &exec_config,
+            inputs: HashMap::new(),
+            depth: 0,
+        };
+        let result = execute_workflow(&input).unwrap();
+
+        let wf_mgr = WorkflowManager::new(&conn);
+        wf_mgr
+            .update_workflow_status(
+                &result.workflow_run_id,
+                WorkflowRunStatus::Failed,
+                Some("step failed"),
+            )
+            .unwrap();
+
+        let resume_result = resume_workflow(&WorkflowResumeInput {
+            conn: &conn,
+            config: &config,
+            workflow_run_id: &result.workflow_run_id,
+            model: None,
+            from_step: None,
+            restart: false,
+        });
+        assert!(
+            resume_result.is_ok(),
+            "resume of ticket-targeted run should succeed: {:?}",
+            resume_result.err()
+        );
     }
 }
