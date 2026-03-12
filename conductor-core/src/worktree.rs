@@ -161,6 +161,9 @@ impl<'a> WorktreeManager<'a> {
         // Create git branch
         check_output(git_in(&repo.local_path).args(["branch", "--", &branch, &base]))?;
 
+        // Ensure the per-repo workspace directory exists
+        std::fs::create_dir_all(&repo.workspace_dir)?;
+
         // Create git worktree
         check_output(git_in(&repo.local_path).args([
             "worktree",
@@ -1348,7 +1351,7 @@ mod tests {
         config.general.workspace_root = tmp.path().to_path_buf();
 
         let repo_mgr = crate::repo::RepoManager::new(&conn, &config);
-        let repo = repo_mgr
+        let _repo = repo_mgr
             .add(
                 "myrepo",
                 missing_local.to_str().unwrap(),
@@ -1356,9 +1359,6 @@ mod tests {
                 Some(tmp.path().join("workspaces/myrepo").to_str().unwrap()),
             )
             .unwrap();
-
-        // Workspace dir must exist for `git worktree add`
-        std::fs::create_dir_all(&repo.workspace_dir).unwrap();
 
         let mgr = WorktreeManager::new(&conn, &config);
         let result = mgr.create("myrepo", "feat-auto-clone", None, None);
