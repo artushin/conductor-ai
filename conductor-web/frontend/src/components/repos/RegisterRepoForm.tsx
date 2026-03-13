@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../../api/client";
 
-export function CreateRepoForm({
+export function RegisterRepoForm({
   onCreated,
   open: controlledOpen,
   onOpenChange,
@@ -39,7 +39,7 @@ export function CreateRepoForm({
         onClick={() => setOpen(true)}
         className="px-3 py-1.5 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700"
       >
-        Add Repo
+        Register Repo
       </button>
     );
   }
@@ -64,7 +64,7 @@ export function CreateRepoForm({
           disabled={submitting}
           className="px-3 py-1.5 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
         >
-          {submitting ? "Adding..." : "Add"}
+          {submitting ? "Registering..." : "Register"}
         </button>
         <button
           type="button"
