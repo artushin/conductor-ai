@@ -979,6 +979,7 @@ impl<'a> WorkflowManager<'a> {
         &self,
         repo_id: &str,
         limit: usize,
+        offset: usize,
         status: Option<WorkflowRunStatus>,
     ) -> Result<Vec<WorkflowRun>> {
         if let Some(s) = status {
@@ -992,13 +993,38 @@ impl<'a> WorkflowManager<'a> {
                      WHERE workflow_runs.repo_id = ?1 \
                        AND (workflow_runs.worktree_id IS NULL OR worktrees.status = 'active') \
                        AND workflow_runs.status = ?2 \
-                     ORDER BY workflow_runs.started_at DESC LIMIT {limit}"
+                     ORDER BY workflow_runs.started_at DESC LIMIT {limit} OFFSET {offset}"
                 ),
                 params![repo_id, status_str],
                 row_to_workflow_run,
             )
         } else {
-            self.list_workflow_runs_by_repo_id(repo_id, limit)
+            self.list_workflow_runs_by_repo_id(repo_id, limit, offset)
+        }
+    }
+
+    /// Like `list_workflow_runs_filtered` but with explicit limit and offset for pagination.
+    pub fn list_workflow_runs_filtered_paginated(
+        &self,
+        worktree_id: &str,
+        status: Option<WorkflowRunStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WorkflowRun>> {
+        if let Some(s) = status {
+            let status_str = s.to_string();
+            query_collect(
+                self.conn,
+                &format!(
+                    "SELECT {RUN_COLUMNS} FROM workflow_runs \
+                     WHERE worktree_id = ?1 AND status = ?2 \
+                     ORDER BY started_at DESC LIMIT {limit} OFFSET {offset}"
+                ),
+                params![worktree_id, status_str],
+                row_to_workflow_run,
+            )
+        } else {
+            self.list_workflow_runs_paginated(worktree_id, limit, offset)
         }
     }
 
@@ -1028,6 +1054,7 @@ impl<'a> WorkflowManager<'a> {
         &self,
         repo_id: &str,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<WorkflowRun>> {
         query_collect(
             self.conn,
@@ -1037,9 +1064,29 @@ impl<'a> WorkflowManager<'a> {
                  LEFT JOIN worktrees ON worktrees.id = workflow_runs.worktree_id \
                  WHERE workflow_runs.repo_id = ?1 \
                    AND (workflow_runs.worktree_id IS NULL OR worktrees.status = 'active') \
-                 ORDER BY workflow_runs.started_at DESC LIMIT {limit}"
+                 ORDER BY workflow_runs.started_at DESC LIMIT {limit} OFFSET {offset}"
             ),
             params![repo_id],
+            row_to_workflow_run,
+        )
+    }
+
+    /// Like `list_workflow_runs` but with explicit limit and offset for pagination.
+    /// `list_workflow_runs` is kept for TUI callers that return all runs.
+    pub fn list_workflow_runs_paginated(
+        &self,
+        worktree_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WorkflowRun>> {
+        query_collect(
+            self.conn,
+            &format!(
+                "SELECT {RUN_COLUMNS} FROM workflow_runs \
+                 WHERE worktree_id = ?1 \
+                 ORDER BY started_at DESC LIMIT {limit} OFFSET {offset}"
+            ),
+            params![worktree_id],
             row_to_workflow_run,
         )
     }
@@ -5517,7 +5564,7 @@ And here is my actual output:
         )
         .unwrap();
 
-        let runs = mgr.list_workflow_runs_by_repo_id("r1", 100).unwrap();
+        let runs = mgr.list_workflow_runs_by_repo_id("r1", 100, 0).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].workflow_name, "active-run");
     }
@@ -9695,5 +9742,132 @@ And here is my actual output:
             )
             .unwrap();
         assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn test_list_workflow_runs_paginated_limit_and_offset() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let mgr = WorkflowManager::new(&conn);
+
+        // Create 5 runs for worktree w1
+        for i in 0..5 {
+            let p = agent_mgr
+                .create_run(Some("w1"), &format!("wf-paginated-{i}"), None, None)
+                .unwrap();
+            mgr.create_workflow_run(
+                &format!("paginated-flow-{i}"),
+                Some("w1"),
+                &p.id,
+                false,
+                "manual",
+                None,
+            )
+            .unwrap();
+        }
+
+        // First page: limit=2, offset=0
+        let page1 = mgr.list_workflow_runs_paginated("w1", 2, 0).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        // Second page: limit=2, offset=2
+        let page2 = mgr.list_workflow_runs_paginated("w1", 2, 2).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        // Third page: limit=2, offset=4 — only 1 remaining
+        let page3 = mgr.list_workflow_runs_paginated("w1", 2, 4).unwrap();
+        assert_eq!(page3.len(), 1);
+
+        // Pages must not overlap
+        let ids1: Vec<_> = page1.iter().map(|r| r.id.clone()).collect();
+        let ids2: Vec<_> = page2.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            ids1.iter().all(|id| !ids2.contains(id)),
+            "page1 and page2 must not share runs"
+        );
+
+        // All 5 runs returned when limit exceeds count
+        let all = mgr.list_workflow_runs_paginated("w1", 100, 0).unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_list_workflow_runs_paginated_filters_by_worktree() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('w2', 'r1', 'feat-other', 'feat/other', '/tmp/ws/other', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let agent_mgr = AgentManager::new(&conn);
+        let mgr = WorkflowManager::new(&conn);
+
+        let p1 = agent_mgr
+            .create_run(Some("w1"), "wf-w1", None, None)
+            .unwrap();
+        let p2 = agent_mgr
+            .create_run(Some("w2"), "wf-w2", None, None)
+            .unwrap();
+        mgr.create_workflow_run("run-w1", Some("w1"), &p1.id, false, "manual", None)
+            .unwrap();
+        mgr.create_workflow_run("run-w2", Some("w2"), &p2.id, false, "manual", None)
+            .unwrap();
+
+        let w1_runs = mgr.list_workflow_runs_paginated("w1", 100, 0).unwrap();
+        assert_eq!(w1_runs.len(), 1);
+        assert_eq!(w1_runs[0].workflow_name, "run-w1");
+
+        let w2_runs = mgr.list_workflow_runs_paginated("w2", 100, 0).unwrap();
+        assert_eq!(w2_runs.len(), 1);
+        assert_eq!(w2_runs[0].workflow_name, "run-w2");
+    }
+
+    #[test]
+    fn test_list_workflow_runs_by_repo_id_offset_pagination() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let mgr = WorkflowManager::new(&conn);
+
+        // Create 4 runs for repo r1 (all on active worktree w1)
+        for i in 0..4 {
+            let p = agent_mgr
+                .create_run(Some("w1"), &format!("wf-repo-{i}"), None, None)
+                .unwrap();
+            mgr.create_workflow_run_with_targets(
+                &format!("repo-flow-{i}"),
+                Some("w1"),
+                None,
+                Some("r1"),
+                &p.id,
+                false,
+                "manual",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        // First page
+        let page1 = mgr.list_workflow_runs_by_repo_id("r1", 2, 0).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        // Second page
+        let page2 = mgr.list_workflow_runs_by_repo_id("r1", 2, 2).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        // Pages must not overlap
+        let ids1: Vec<_> = page1.iter().map(|r| r.id.clone()).collect();
+        let ids2: Vec<_> = page2.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            ids1.iter().all(|id| !ids2.contains(id)),
+            "page1 and page2 must not share runs"
+        );
+
+        // Beyond end returns empty
+        let beyond = mgr.list_workflow_runs_by_repo_id("r1", 2, 10).unwrap();
+        assert!(beyond.is_empty());
     }
 }
