@@ -3,7 +3,8 @@
 //! All DB access runs inside `tokio::task::spawn_blocking` since `rusqlite::Connection`
 //! is `!Send`. The `rmcp` library handles the stdio JSON-RPC transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -442,7 +443,7 @@ fn read_resource_by_uri(db_path: &Path, uri: &str) -> anyhow::Result<String> {
             .get_workflow_run(run_id)?
             .ok_or_else(|| anyhow::anyhow!("Workflow run {run_id} not found"))?;
         let steps = wf_mgr.get_workflow_steps(run_id)?;
-        return Ok(format_run_detail(&run, &steps));
+        return Ok(format_run_detail_with_log(&conn, &run, &steps));
     }
 
     if let Some(repo_slug) = uri.strip_prefix("conductor://workflows/") {
@@ -503,6 +504,114 @@ fn format_run_detail(
             step.status,
             step.result_text.as_deref().unwrap_or("")
         ));
+    }
+    out
+}
+
+/// Resolve the worktree filesystem path for a workflow run.
+fn worktree_path_for_run(
+    conn: &rusqlite::Connection,
+    run: &conductor_core::workflow::WorkflowRun,
+) -> Option<PathBuf> {
+    let wt_id = run.worktree_id.as_deref()?;
+    let config = conductor_core::config::load_config().ok()?;
+    let wt = conductor_core::worktree::WorktreeManager::new(conn, &config)
+        .get_by_id(wt_id)
+        .ok()?;
+    Some(PathBuf::from(&wt.path))
+}
+
+/// Return the tail of the most recent Claude Code conversation log for a worktree.
+///
+/// Looks in `~/.claude/projects/<escaped>/` where `<escaped>` is the worktree
+/// path with every `/` replaced by `-`. Returns `None` on any error or if no
+/// relevant messages are found.
+fn conversation_log_tail(worktree_path: &Path) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let escaped = worktree_path.to_str()?.replace('/', "-");
+    let projects_dir = PathBuf::from(&home)
+        .join(".claude")
+        .join("projects")
+        .join(&escaped);
+    conversation_log_tail_from_dir(&projects_dir)
+}
+
+/// Inner implementation: read the most-recently-modified JSONL from `projects_dir`
+/// and return the last 20 user/assistant messages. Separated for testability.
+fn conversation_log_tail_from_dir(projects_dir: &Path) -> Option<String> {
+    // Collect all .jsonl files, pick the most recently modified.
+    let entries = std::fs::read_dir(projects_dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, path));
+            }
+        }
+    }
+    let log_path = best?.1;
+
+    // Ring-buffer the last 20 user/assistant messages, streaming line-by-line
+    // to avoid buffering the entire (potentially large) JSONL file into memory.
+    let file = std::fs::File::open(&log_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(20);
+    for line in reader.lines() {
+        let line = line.ok().unwrap_or_default();
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type != "user" && msg_type != "assistant" {
+            continue;
+        }
+        // Extract text content.
+        let text = match val.get("message").and_then(|m| m.get("content")) {
+            Some(Value::String(s)) => s.chars().take(500).collect::<String>(),
+            Some(Value::Array(blocks)) => {
+                let mut parts = String::new();
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            parts.push_str(t);
+                        }
+                    }
+                }
+                parts.chars().take(500).collect::<String>()
+            }
+            _ => continue,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if ring.len() == 20 {
+            ring.pop_front();
+        }
+        ring.push_back(format!("[{msg_type}]\n{text}\n"));
+    }
+
+    if ring.is_empty() {
+        return None;
+    }
+    Some(ring.into_iter().collect::<String>())
+}
+
+/// Like `format_run_detail` but also appends the conversation log tail when available.
+fn format_run_detail_with_log(
+    conn: &rusqlite::Connection,
+    run: &conductor_core::workflow::WorkflowRun,
+    steps: &[conductor_core::workflow::WorkflowRunStep],
+) -> String {
+    let mut out = format_run_detail(run, steps);
+    if let Some(wt_path) = worktree_path_for_run(conn, run) {
+        if let Some(log) = conversation_log_tail(&wt_path) {
+            out.push_str("\nconversation log (last 20 messages):\n");
+            out.push_str(&log);
+        }
     }
     out
 }
@@ -1013,7 +1122,7 @@ fn tool_get_run(db_path: &Path, args: &serde_json::Map<String, Value>) -> CallTo
         Ok(s) => s,
         Err(e) => return tool_err(e),
     };
-    tool_ok(format_run_detail(&run, &steps))
+    tool_ok(format_run_detail_with_log(&conn, &run, &steps))
 }
 
 fn tool_approve_gate(db_path: &Path, args: &serde_json::Map<String, Value>) -> CallToolResult {
@@ -1723,5 +1832,175 @@ mod tests {
         assert_eq!(runs_a[0].workflow_name, "wf-a");
         assert_eq!(runs_b.len(), 1, "expected 1 run for repo-b");
         assert_eq!(runs_b[0].workflow_name, "wf-b");
+    }
+
+    // -- conversation_log_tail ----------------------------------------------
+    //
+    // Tests call `conversation_log_tail_from_dir` directly so we can pass a temp
+    // directory path without mutating the HOME env var (which is not thread-safe
+    // in parallel test runs).
+
+    /// Write a minimal JSONL conversation log to the given path.
+    fn write_jsonl(path: &std::path::Path, lines: &[serde_json::Value]) {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path).expect("create jsonl");
+        for line in lines {
+            writeln!(f, "{}", line).expect("write line");
+        }
+    }
+
+    /// Create a temp dir with a single `session.jsonl` containing `messages`,
+    /// then call `conversation_log_tail_from_dir` on that dir.
+    fn tail_from_messages(messages: &[serde_json::Value]) -> Option<String> {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        write_jsonl(&dir.path().join("session.jsonl"), messages);
+        conversation_log_tail_from_dir(dir.path())
+    }
+
+    #[test]
+    fn test_conversation_log_tail_nonexistent_dir() {
+        // A non-existent directory returns None.
+        let result = conversation_log_tail_from_dir(std::path::Path::new(
+            "/tmp/no-such-conductor-test-dir-xyz",
+        ));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_conversation_log_tail_empty_log() {
+        // A JSONL file with no user/assistant messages returns None.
+        let result = tail_from_messages(&[
+            serde_json::json!({"type": "system", "message": {"content": "setup"}}),
+        ]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_conversation_log_tail_skips_non_user_assistant() {
+        // Only "user" and "assistant" type entries should appear in the tail.
+        let result = tail_from_messages(&[
+            serde_json::json!({"type": "system", "message": {"content": "sys"}}),
+            serde_json::json!({"type": "tool_result", "message": {"content": "tool"}}),
+        ]);
+        assert!(result.is_none(), "no user/assistant messages → None");
+    }
+
+    #[test]
+    fn test_conversation_log_tail_string_content() {
+        // Messages with string content are included.
+        let result = tail_from_messages(&[
+            serde_json::json!({"type": "user", "message": {"content": "Hello from user"}}),
+            serde_json::json!({"type": "assistant", "message": {"content": "Hello from assistant"}}),
+        ])
+        .expect("should return Some");
+        assert!(result.contains("Hello from user"), "got: {result}");
+        assert!(result.contains("Hello from assistant"), "got: {result}");
+        assert!(result.contains("[user]"), "got: {result}");
+        assert!(result.contains("[assistant]"), "got: {result}");
+    }
+
+    #[test]
+    fn test_conversation_log_tail_array_content_blocks() {
+        // Messages with array content blocks (type=text) are concatenated; other
+        // block types (e.g. tool_use) are ignored.
+        let result = tail_from_messages(&[serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "block one "},
+                    {"type": "tool_use", "id": "xyz"},
+                    {"type": "text", "text": "block two"}
+                ]
+            }
+        })])
+        .expect("should return Some");
+        assert!(result.contains("block one"), "got: {result}");
+        assert!(result.contains("block two"), "got: {result}");
+        assert!(
+            !result.contains("xyz"),
+            "tool_use id should not appear; got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_conversation_log_tail_ring_buffer_cap() {
+        // Only the last 20 messages should be retained.
+        let messages: Vec<_> = (0..30_u32)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"content": format!("msg-{i:03}")}
+                })
+            })
+            .collect();
+        let result = tail_from_messages(&messages).expect("should return Some");
+        // First 10 messages (000–009) should have been evicted.
+        for i in 0..10_u32 {
+            assert!(
+                !result.contains(&format!("msg-{i:03}")),
+                "msg-{i:03} should have been evicted; got: {result}"
+            );
+        }
+        // Last 20 messages (010–029) should be present.
+        for i in 10..30_u32 {
+            assert!(
+                result.contains(&format!("msg-{i:03}")),
+                "msg-{i:03} should be present; got: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conversation_log_tail_truncates_long_text() {
+        // Individual message text is capped at 500 chars.
+        let long_text = "x".repeat(1000);
+        let result = tail_from_messages(&[
+            serde_json::json!({"type": "user", "message": {"content": long_text}}),
+        ])
+        .expect("should return Some");
+        let x_count = result.chars().filter(|&c| c == 'x').count();
+        assert_eq!(x_count, 500, "expected 500 chars of text, got {x_count}");
+    }
+
+    #[test]
+    fn test_conversation_log_tail_skips_empty_text() {
+        // Messages that produce empty text (e.g. only tool_use blocks) are skipped.
+        let result = tail_from_messages(&[serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "id": "abc"}]
+            }
+        })]);
+        assert!(result.is_none(), "only tool_use content → no text → None");
+    }
+
+    #[test]
+    fn test_conversation_log_tail_picks_most_recent_file() {
+        // When multiple JSONL files exist, the most recently modified one is used.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+
+        // Write the older file first so its mtime is earlier.
+        let old_path = dir.path().join("old.jsonl");
+        write_jsonl(
+            &old_path,
+            &[serde_json::json!({"type": "user", "message": {"content": "from old file"}})],
+        );
+        // Sleep briefly to ensure mtime differs between files.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let new_path = dir.path().join("new.jsonl");
+        write_jsonl(
+            &new_path,
+            &[serde_json::json!({"type": "user", "message": {"content": "from new file"}})],
+        );
+
+        let result = conversation_log_tail_from_dir(dir.path()).expect("should return Some");
+        assert!(
+            result.contains("from new file"),
+            "should use newest file; got: {result}"
+        );
+        assert!(
+            !result.contains("from old file"),
+            "should not use old file; got: {result}"
+        );
     }
 }
