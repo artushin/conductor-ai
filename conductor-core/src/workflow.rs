@@ -508,6 +508,14 @@ pub struct StepResult {
 // Manager (CRUD)
 // ---------------------------------------------------------------------------
 
+/// Counts of active workflow runs (pending / running / waiting) for a single repo.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveWorkflowCounts {
+    pub pending: u32,
+    pub running: u32,
+    pub waiting: u32,
+}
+
 /// Manages workflow definitions, execution, and persistence.
 pub struct WorkflowManager<'a> {
     conn: &'a Connection,
@@ -516,6 +524,36 @@ pub struct WorkflowManager<'a> {
 impl<'a> WorkflowManager<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
+    }
+
+    /// Returns counts of active workflow runs (pending / running / waiting) per repo_id.
+    /// Repos with no active runs are absent from the map. Rows where repo_id IS NULL are skipped.
+    pub fn active_run_counts_by_repo(&self) -> Result<HashMap<String, ActiveWorkflowCounts>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT repo_id, status, COUNT(*) AS cnt \
+             FROM workflow_runs \
+             WHERE status IN ('pending', 'running', 'waiting') \
+               AND repo_id IS NOT NULL \
+             GROUP BY repo_id, status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let repo_id: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            let cnt: u32 = row.get(2)?;
+            Ok((repo_id, status, cnt))
+        })?;
+        let mut map: HashMap<String, ActiveWorkflowCounts> = HashMap::new();
+        for row in rows {
+            let (repo_id, status, cnt) = row?;
+            let entry = map.entry(repo_id).or_default();
+            match status.as_str() {
+                "pending" => entry.pending += cnt,
+                "running" => entry.running += cnt,
+                "waiting" => entry.waiting += cnt,
+                _ => {}
+            }
+        }
+        Ok(map)
     }
 
     pub fn create_workflow_run(
@@ -4711,6 +4749,106 @@ mod tests {
         let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
         assert_eq!(fetched.repo_id.as_deref(), Some("r1"));
         assert_eq!(fetched.ticket_id, None);
+    }
+
+    #[test]
+    fn test_active_run_counts_by_repo_empty() {
+        let conn = setup_db();
+        let mgr = WorkflowManager::new(&conn);
+        let counts = mgr.active_run_counts_by_repo().unwrap();
+        assert!(
+            counts.is_empty(),
+            "expected no counts with no workflow runs"
+        );
+    }
+
+    #[test]
+    fn test_active_run_counts_by_repo_with_runs() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr
+            .create_run(Some("w1"), "workflow", None, None)
+            .unwrap();
+        let mgr = WorkflowManager::new(&conn);
+
+        // Create one pending and one running run for repo r1.
+        let run1 = mgr
+            .create_workflow_run_with_targets(
+                "wf-a",
+                Some("w1"),
+                None,
+                Some("r1"),
+                &parent.id,
+                false,
+                "manual",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // Advance run1 to running.
+        conn.execute(
+            "UPDATE workflow_runs SET status = 'running' WHERE id = ?1",
+            [&run1.id],
+        )
+        .unwrap();
+        let _run2 = mgr
+            .create_workflow_run_with_targets(
+                "wf-b",
+                Some("w1"),
+                None,
+                Some("r1"),
+                &parent.id,
+                false,
+                "manual",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // run2 stays at pending (default).
+
+        let counts = mgr.active_run_counts_by_repo().unwrap();
+        let c = counts.get("r1").expect("r1 should be in map");
+        assert_eq!(c.running, 1, "expected 1 running");
+        assert_eq!(c.pending, 1, "expected 1 pending");
+        assert_eq!(c.waiting, 0, "expected 0 waiting");
+    }
+
+    #[test]
+    fn test_active_run_counts_by_repo_excludes_completed() {
+        let conn = setup_db();
+        let agent_mgr = AgentManager::new(&conn);
+        let parent = agent_mgr
+            .create_run(Some("w1"), "workflow", None, None)
+            .unwrap();
+        let mgr = WorkflowManager::new(&conn);
+
+        let run = mgr
+            .create_workflow_run_with_targets(
+                "wf-done",
+                Some("w1"),
+                None,
+                Some("r1"),
+                &parent.id,
+                false,
+                "manual",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE workflow_runs SET status = 'completed' WHERE id = ?1",
+            [&run.id],
+        )
+        .unwrap();
+
+        let counts = mgr.active_run_counts_by_repo().unwrap();
+        assert!(
+            !counts.contains_key("r1"),
+            "completed runs must not appear in active counts"
+        );
     }
 
     #[test]

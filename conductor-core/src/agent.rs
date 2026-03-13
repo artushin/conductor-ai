@@ -698,6 +698,13 @@ pub struct CostPhase {
     pub duration_ms: i64,
 }
 
+/// Counts of active agent runs (running / waiting_for_feedback) for a single repo.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveAgentCounts {
+    pub running: u32,
+    pub waiting: u32,
+}
+
 pub struct AgentManager<'a> {
     conn: &'a Connection,
 }
@@ -1682,6 +1689,35 @@ impl<'a> AgentManager<'a> {
         );
 
         optional_row(result)
+    }
+
+    /// Returns counts of active agent runs (running / waiting_for_feedback) per repo_id.
+    /// Repos with no active runs are absent from the map.
+    pub fn active_run_counts_by_repo(&self) -> Result<HashMap<String, ActiveAgentCounts>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT w.repo_id, a.status, COUNT(*) AS cnt \
+             FROM agent_runs a \
+             JOIN worktrees w ON w.id = a.worktree_id \
+             WHERE a.status IN ('running', 'waiting_for_feedback') \
+             GROUP BY w.repo_id, a.status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let repo_id: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            let cnt: u32 = row.get(2)?;
+            Ok((repo_id, status, cnt))
+        })?;
+        let mut map: HashMap<String, ActiveAgentCounts> = HashMap::new();
+        for row in rows {
+            let (repo_id, status, cnt) = row?;
+            let entry = map.entry(repo_id).or_default();
+            match status.as_str() {
+                "running" => entry.running += cnt,
+                "waiting_for_feedback" => entry.waiting += cnt,
+                _ => {}
+            }
+        }
+        Ok(map)
     }
 
     /// Reap orphaned agent runs whose tmux windows have disappeared.
