@@ -115,6 +115,14 @@ pub enum Action {
 
     // Theme picker
     ShowThemePicker,
+    /// Background result: theme directory scan completed; open the picker modal.
+    ThemesLoaded {
+        themes: Vec<(String, String)>,
+        /// Pre-loaded `Theme` objects corresponding 1-to-1 with `themes`.
+        /// Loaded off-thread so keypress preview is a pure in-memory lookup.
+        loaded_themes: Vec<crate::theme::Theme>,
+        warnings: Vec<String>,
+    },
     /// Temporarily apply the theme at this index (live preview while browsing).
     ThemePreview(usize),
     /// Background result: config write after theme selection completed.

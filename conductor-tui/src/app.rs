@@ -541,6 +541,13 @@ impl App {
 
             // Theme picker
             Action::ShowThemePicker => self.handle_show_theme_picker(),
+            Action::ThemesLoaded {
+                themes,
+                loaded_themes,
+                warnings,
+            } => {
+                self.handle_themes_loaded(themes, loaded_themes, warnings);
+            }
             Action::ThemePreview(idx) => self.handle_theme_preview(idx),
             Action::ThemeSaveComplete { result } => {
                 self.state.modal = match result {
@@ -3350,57 +3357,108 @@ impl App {
     // ── Theme picker ───────────────────────────────────────────────────
 
     fn handle_show_theme_picker(&mut self) {
-        use crate::theme::KNOWN_THEMES;
-        // Find the index in KNOWN_THEMES that matches the current config theme name.
+        let Some(bg_tx) = self.bg_tx.clone() else {
+            self.state.modal = Modal::Error {
+                message: "Cannot open theme picker: background sender not ready.".into(),
+            };
+            return;
+        };
+        // Show a non-blocking progress modal while scanning ~/.conductor/themes/
+        // off the TUI main thread, as required by the threading rule in CLAUDE.md.
+        self.state.modal = Modal::Progress {
+            message: "Loading themes…".into(),
+        };
+        std::thread::spawn(move || {
+            let (all, mut warnings) = crate::theme::all_themes();
+            // Pre-load all Theme objects so keypress preview is an in-memory
+            // lookup with no file I/O on the TUI main thread.
+            // Themes that fail to re-parse are excluded from both lists so the
+            // picker never shows an entry with silently-incorrect preview colors.
+            let mut themes: Vec<(String, String)> = Vec::new();
+            let mut loaded_themes: Vec<crate::theme::Theme> = Vec::new();
+            for (name, label) in all {
+                match crate::theme::Theme::from_name(&name) {
+                    Ok(t) => {
+                        themes.push((name, label));
+                        loaded_themes.push(t);
+                    }
+                    Err(e) => warnings.push(e),
+                }
+            }
+            let _ = bg_tx.send(Action::ThemesLoaded {
+                themes,
+                loaded_themes,
+                warnings,
+            });
+        });
+    }
+
+    fn handle_themes_loaded(
+        &mut self,
+        themes: Vec<(String, String)>,
+        loaded_themes: Vec<crate::theme::Theme>,
+        warnings: Vec<String>,
+    ) {
         let current_name = self
             .config
             .general
             .theme
             .clone()
             .unwrap_or_else(|| "conductor".to_string());
-        let selected = KNOWN_THEMES
+        let selected = themes
             .iter()
-            .position(|(name, _)| *name == current_name.as_str())
+            .position(|(name, _)| name == current_name.as_str())
             .unwrap_or(0);
         self.state.modal = Modal::ThemePicker {
+            themes,
+            loaded_themes,
             selected,
             original_theme: self.state.theme,
             original_name: current_name,
         };
+        // Surface any broken theme files as a status warning (non-fatal).
+        if !warnings.is_empty() {
+            self.state.status_message = Some(format!(
+                "Warning: {} theme file(s) failed to parse — check your ~/.conductor/themes/ directory",
+                warnings.len()
+            ));
+        }
     }
 
     fn handle_theme_preview(&mut self, idx: usize) {
-        use crate::theme::KNOWN_THEMES;
-        if let Some((name, _)) = KNOWN_THEMES.get(idx) {
-            self.state.theme = crate::theme::Theme::from_name(name).unwrap_or_default();
-        }
-        // Also advance the cursor in the modal so the highlight tracks correctly.
+        // Use the pre-loaded Theme objects stored in the modal — no file I/O on
+        // the TUI main thread.
         if let Modal::ThemePicker {
-            ref mut selected, ..
+            ref loaded_themes,
+            ref mut selected,
+            ..
         } = self.state.modal
         {
+            if let Some(theme) = loaded_themes.get(idx) {
+                self.state.theme = *theme;
+            }
             *selected = idx;
         }
     }
 
     fn handle_theme_picker_confirm(&mut self, selected: usize) {
-        use crate::theme::KNOWN_THEMES;
-        let Some((name, _)) = KNOWN_THEMES.get(selected) else {
+        let name_opt = if let Modal::ThemePicker { ref themes, .. } = self.state.modal {
+            themes.get(selected).map(|(n, _)| n.clone())
+        } else {
+            None
+        };
+        let Some(name) = name_opt else {
             self.state.modal = Modal::None;
             return;
         };
-        let name = name.to_string();
         let Some(bg_tx) = self.bg_tx.clone() else {
             self.state.modal = Modal::Error {
                 message: "Cannot save theme: background sender not ready.".into(),
             };
             return;
         };
-        // Update in-memory config immediately (non-blocking). Also clear
-        // theme_path so the named theme wins on next startup (theme_path takes
-        // precedence over theme when both are set).
+        // Update in-memory config immediately (non-blocking).
         self.config.general.theme = Some(name.clone());
-        self.config.general.theme_path = None;
         // Write the updated config to disk off the TUI main thread to avoid
         // blocking the render loop.
         let config = self.config.clone();
