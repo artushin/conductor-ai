@@ -304,6 +304,21 @@ impl<'a> WorktreeManager<'a> {
         Ok(worktrees)
     }
 
+    /// Walk up from `cwd` and return the worktree whose `path` is a prefix of (or equals) `cwd`.
+    ///
+    /// When multiple worktrees match (nested paths), the one with the longest path wins,
+    /// ensuring the most-specific worktree is returned.
+    ///
+    /// Returns `None` when no registered worktree matches.
+    pub fn find_by_cwd(&self, cwd: &Path) -> Result<Option<Worktree>> {
+        let worktrees = self.list(None, false)?;
+        let found = worktrees
+            .into_iter()
+            .filter(|wt| cwd.starts_with(Path::new(&wt.path)))
+            .max_by_key(|wt| wt.path.len());
+        Ok(found)
+    }
+
     pub fn delete(&self, repo_slug: &str, name: &str) -> Result<Worktree> {
         let repo_mgr = RepoManager::new(self.conn, self.config);
         let repo = repo_mgr.get_by_slug(repo_slug)?;
@@ -1627,5 +1642,84 @@ mod tests {
             result.is_err(),
             "expected error when gh pr view is unavailable"
         );
+    }
+
+    #[test]
+    fn test_find_by_cwd_no_match() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        let result = mgr.find_by_cwd(Path::new("/tmp/other/path")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_by_cwd_exact_match() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        let result = mgr.find_by_cwd(Path::new("/tmp/ws/feat-a")).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "wt1");
+    }
+
+    #[test]
+    fn test_find_by_cwd_subdirectory_match() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        let result = mgr
+            .find_by_cwd(Path::new("/tmp/ws/feat-a/src/lib"))
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "wt1");
+    }
+
+    #[test]
+    fn test_find_by_cwd_longest_prefix_wins() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+        // wt1 is a prefix of wt2's path — wt2 should win when cwd is inside wt2
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt1', 'r1', 'feat-a', 'feat/a', '/tmp/ws/feat-a', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('wt2', 'r1', 'feat-b', 'feat/b', '/tmp/ws/feat-a/nested', 'active', '2024-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        // cwd is inside the nested worktree — should return wt2, not wt1
+        let result = mgr
+            .find_by_cwd(Path::new("/tmp/ws/feat-a/nested/src"))
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "wt2");
     }
 }
