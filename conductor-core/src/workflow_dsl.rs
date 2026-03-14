@@ -68,6 +68,24 @@ impl WorkflowDef {
         refs.dedup();
         refs
     }
+
+    /// Collect all output schema references across body and always blocks, sorted and deduplicated.
+    pub fn collect_all_schema_refs(&self) -> Vec<String> {
+        let mut refs = collect_schema_refs(&self.body);
+        refs.extend(collect_schema_refs(&self.always));
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+
+    /// Collect all bot names referenced across body and always blocks, sorted and deduplicated.
+    pub fn collect_all_bot_names(&self) -> Vec<String> {
+        let mut names = collect_bot_names(&self.body);
+        names.extend(collect_bot_names(&self.always));
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// A structured parse warning produced when a `.wf` file fails to load.
@@ -1539,6 +1557,71 @@ pub fn collect_workflow_refs(nodes: &[WorkflowNode]) -> Vec<String> {
         }
     }
     refs
+}
+
+/// Collect all output schema references (`output =` values) from a node tree.
+pub fn collect_schema_refs(nodes: &[WorkflowNode]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for node in nodes {
+        match node {
+            WorkflowNode::Call(n) => {
+                if let Some(ref s) = n.output {
+                    refs.push(s.clone());
+                }
+            }
+            WorkflowNode::Do(n) => {
+                if let Some(ref s) = n.output {
+                    refs.push(s.clone());
+                }
+                refs.extend(collect_schema_refs(&n.body));
+            }
+            WorkflowNode::Parallel(n) => {
+                if let Some(ref s) = n.output {
+                    refs.push(s.clone());
+                }
+                refs.extend(n.call_outputs.values().cloned());
+            }
+            WorkflowNode::If(n) => refs.extend(collect_schema_refs(&n.body)),
+            WorkflowNode::Unless(n) => refs.extend(collect_schema_refs(&n.body)),
+            WorkflowNode::While(n) => refs.extend(collect_schema_refs(&n.body)),
+            WorkflowNode::DoWhile(n) => refs.extend(collect_schema_refs(&n.body)),
+            WorkflowNode::Always(n) => refs.extend(collect_schema_refs(&n.body)),
+            WorkflowNode::CallWorkflow(_) | WorkflowNode::Gate(_) => {}
+        }
+    }
+    refs
+}
+
+/// Collect all bot names (`bot_name =` values) from a node tree.
+pub fn collect_bot_names(nodes: &[WorkflowNode]) -> Vec<String> {
+    let mut names = Vec::new();
+    for node in nodes {
+        match node {
+            WorkflowNode::Call(n) => {
+                if let Some(ref b) = n.bot_name {
+                    names.push(b.clone());
+                }
+            }
+            WorkflowNode::CallWorkflow(n) => {
+                if let Some(ref b) = n.bot_name {
+                    names.push(b.clone());
+                }
+            }
+            WorkflowNode::Gate(n) => {
+                if let Some(ref b) = n.bot_name {
+                    names.push(b.clone());
+                }
+            }
+            WorkflowNode::If(n) => names.extend(collect_bot_names(&n.body)),
+            WorkflowNode::Unless(n) => names.extend(collect_bot_names(&n.body)),
+            WorkflowNode::While(n) => names.extend(collect_bot_names(&n.body)),
+            WorkflowNode::DoWhile(n) => names.extend(collect_bot_names(&n.body)),
+            WorkflowNode::Do(n) => names.extend(collect_bot_names(&n.body)),
+            WorkflowNode::Parallel(_) => {}
+            WorkflowNode::Always(n) => names.extend(collect_bot_names(&n.body)),
+        }
+    }
+    names
 }
 
 /// Maximum allowed workflow nesting depth.
@@ -4184,5 +4267,156 @@ workflow w {
         assert_eq!(def.inputs[4].name, "with_default");
         assert!(!def.inputs[4].required);
         assert_eq!(def.inputs[4].default.as_deref(), Some("x"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // collect_schema_refs / collect_bot_names
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_schema_refs_empty() {
+        assert!(collect_schema_refs(&[]).is_empty());
+    }
+
+    /// Minimal workflow header that satisfies the parser's required fields.
+    const WF_HEADER: &str = r#"meta { targets = ["worktree"] }"#;
+
+    fn make_wf(body: &str) -> String {
+        format!("workflow w {{\n  {WF_HEADER}\n{body}\n}}")
+    }
+
+    #[test]
+    fn test_collect_schema_refs_call_node() {
+        let src = make_wf(
+            r#"  call plan { output = "review-findings" }
+  call build"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let refs = collect_schema_refs(&def.body);
+        assert_eq!(refs, vec!["review-findings"]);
+    }
+
+    #[test]
+    fn test_collect_schema_refs_nested_if() {
+        let src = make_wf(
+            r#"  call plan { output = "plan-output" }
+  if plan.ready {
+    call implement { output = "impl-result" }
+  }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let refs = collect_schema_refs(&def.body);
+        assert!(refs.contains(&"plan-output".to_string()));
+        assert!(refs.contains(&"impl-result".to_string()));
+    }
+
+    #[test]
+    fn test_collect_schema_refs_parallel_node() {
+        let src = make_wf(
+            r#"  parallel {
+    output = "shared-schema"
+    call reviewer_a
+    call reviewer_b
+  }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let refs = collect_schema_refs(&def.body);
+        assert!(refs.contains(&"shared-schema".to_string()));
+    }
+
+    #[test]
+    fn test_collect_all_schema_refs_includes_always_block() {
+        let src = make_wf(
+            r#"  call plan { output = "plan-schema" }
+  always {
+    call notify { output = "notify-schema" }
+  }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let refs = def.collect_all_schema_refs();
+        assert!(
+            refs.contains(&"plan-schema".to_string()),
+            "body schema missing"
+        );
+        assert!(
+            refs.contains(&"notify-schema".to_string()),
+            "always schema missing"
+        );
+    }
+
+    #[test]
+    fn test_collect_all_schema_refs_deduplicates() {
+        let src = make_wf(
+            r#"  call step_a { output = "shared" }
+  call step_b { output = "shared" }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let refs = def.collect_all_schema_refs();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "shared");
+    }
+
+    #[test]
+    fn test_collect_bot_names_empty() {
+        assert!(collect_bot_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_collect_bot_names_call_node() {
+        let src = make_wf(
+            r#"  call plan { as = "conductor-ai" }
+  call build"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let names = collect_bot_names(&def.body);
+        assert_eq!(names, vec!["conductor-ai"]);
+    }
+
+    #[test]
+    fn test_collect_bot_names_nested_blocks() {
+        let src = make_wf(
+            r#"  if step.marker {
+    call act { as = "my-bot" }
+  }
+  while step.marker {
+    max_iterations = 3
+    on_max_iter = fail
+    call retry { as = "my-bot" }
+  }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let names = collect_bot_names(&def.body);
+        // both calls have the same bot name — raw list has two entries
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|n| n == "my-bot"));
+    }
+
+    #[test]
+    fn test_collect_all_bot_names_includes_always_block() {
+        let src = make_wf(
+            r#"  call plan { as = "main-bot" }
+  always {
+    call cleanup { as = "always-bot" }
+  }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let names = def.collect_all_bot_names();
+        assert!(names.contains(&"main-bot".to_string()), "body bot missing");
+        assert!(
+            names.contains(&"always-bot".to_string()),
+            "always bot missing"
+        );
+    }
+
+    #[test]
+    fn test_collect_all_bot_names_deduplicates() {
+        let src = make_wf(
+            r#"  call step_a { as = "shared-bot" }
+  call step_b { as = "shared-bot" }"#,
+        );
+        let def = parse_workflow_str(&src, "w.wf").unwrap();
+        let names = def.collect_all_bot_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], "shared-bot");
     }
 }

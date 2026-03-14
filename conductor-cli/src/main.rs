@@ -17,6 +17,7 @@ use conductor_core::issue_source::{GitHubConfig, IssueSourceManager, JiraConfig}
 use conductor_core::jira_acli;
 use conductor_core::orchestrator::{self, OrchestratorConfig};
 use conductor_core::repo::{derive_local_path, derive_slug_from_url, RepoManager};
+use conductor_core::schema_config;
 use conductor_core::tickets::{build_agent_prompt, TicketInput, TicketSyncer};
 use conductor_core::workflow::{
     collect_agent_names, detect_workflow_cycles, validate_workflow_semantics, WorkflowExecConfig,
@@ -1654,6 +1655,53 @@ fn main() -> Result<()> {
                             println!("    - {snippet}");
                         }
                         has_errors = true;
+                    }
+                }
+
+                // Collect and validate output schemas.
+                let all_schemas = workflow.collect_all_schema_refs();
+                let schema_issues =
+                    schema_config::check_schemas(&wt_path, &repo_path, &all_schemas, Some(&name));
+                if !all_schemas.is_empty() {
+                    println!("  Schemas referenced: {}", all_schemas.len());
+                    if schema_issues.is_empty() {
+                        println!("  All schemas found and valid.");
+                    } else {
+                        for issue in &schema_issues {
+                            match issue {
+                                schema_config::SchemaIssue::Missing(s) => {
+                                    println!("\n  MISSING schema: {s}");
+                                }
+                                schema_config::SchemaIssue::Invalid { name: s, error } => {
+                                    println!("\n  INVALID schema: {s}\n    {error}");
+                                }
+                            }
+                        }
+                        has_errors = true;
+                    }
+                }
+
+                // Check bot names against config.
+                let all_bots = workflow.collect_all_bot_names();
+                let unknown_bots: Vec<_> = all_bots
+                    .iter()
+                    .filter(|b| !config.github.apps.contains_key(b.as_str()))
+                    .cloned()
+                    .collect();
+                if !all_bots.is_empty() {
+                    println!("  Bot names referenced: {}", all_bots.len());
+                    if unknown_bots.is_empty() {
+                        println!("  All bot names found in config.");
+                    } else {
+                        println!(
+                            "\n  WARNING: unknown bot names ({}/{}):",
+                            unknown_bots.len(),
+                            all_bots.len()
+                        );
+                        for b in &unknown_bots {
+                            println!("    ~ {b} (not in [github.apps])");
+                        }
+                        // does NOT set has_errors = true — bot config is per-environment
                     }
                 }
 
