@@ -1308,6 +1308,7 @@ impl App {
                 } else {
                     self.state.workflow_def_index = self.state.workflow_def_index.saturating_sub(1);
                     self.state.workflow_def_step_index = 0;
+                    self.state.workflow_def_expanded_calls.clear();
                 }
             }
             WorkflowsFocus::Runs => {
@@ -1330,6 +1331,10 @@ impl App {
                                 &d.body,
                                 0,
                                 &self.state.theme,
+                                &self.state.data.workflow_defs,
+                                &self.state.workflow_def_expanded_calls,
+                                "",
+                                &std::collections::HashSet::new(),
                             )
                             .len()
                         })
@@ -1341,6 +1346,7 @@ impl App {
                         self.state.data.workflow_defs.len(),
                     );
                     self.state.workflow_def_step_index = 0;
+                    self.state.workflow_def_expanded_calls.clear();
                 }
             }
             WorkflowsFocus::Runs => {
@@ -1353,6 +1359,33 @@ impl App {
     fn workflow_column_select(&mut self) {
         match self.state.workflows_focus {
             WorkflowsFocus::Defs => {
+                if self.state.workflow_def_focus == WorkflowDefFocus::Steps {
+                    // Enter on a step row: toggle expansion if it's a CallWorkflow node.
+                    if let Some(def) = self
+                        .state
+                        .data
+                        .workflow_defs
+                        .get(self.state.workflow_def_index)
+                    {
+                        let path = crate::ui::workflows::get_def_step_node_at(
+                            &def.body,
+                            &self.state.data.workflow_defs,
+                            &self.state.workflow_def_expanded_calls,
+                            "",
+                            &std::collections::HashSet::new(),
+                            self.state.workflow_def_step_index,
+                            &mut 0,
+                        );
+                        if let Some(p) = path {
+                            if self.state.workflow_def_expanded_calls.contains(&p) {
+                                self.state.workflow_def_expanded_calls.remove(&p);
+                            } else {
+                                self.state.workflow_def_expanded_calls.insert(p);
+                            }
+                        }
+                    }
+                    return;
+                }
                 if let Some(def) = self.selected_workflow_def() {
                     self.state.selected_workflow_def = Some(def);
                     self.state.workflow_def_detail_scroll = 0;
