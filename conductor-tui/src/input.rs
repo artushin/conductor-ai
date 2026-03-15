@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action::Action;
-use crate::state::{AppState, Modal, View, WorktreeDetailFocus};
+use crate::state::{AppState, ColumnFocus, Modal, View, WorktreeDetailFocus};
 
 /// Map a key event to an action based on the current app state.
 /// Priority: Modal > Filter > Normal keybindings.
@@ -263,16 +263,34 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         match key.code {
             KeyCode::Char('d') => return Action::HalfPageDown,
             KeyCode::Char('u') => return Action::HalfPageUp,
+            KeyCode::Char('h') => return Action::FocusContentColumn,
+            KeyCode::Char('l') => return Action::FocusWorkflowColumn,
             _ => {}
         }
     }
 
-    // View-specific keybindings (ticket list — Dashboard Tickets pane and Tickets view)
-    let in_ticket_list = (state.view == View::Dashboard
-        && state.dashboard_focus == crate::state::DashboardFocus::Tickets)
-        || state.view == View::Tickets
-        || (state.view == View::RepoDetail
-            && state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets);
+    // Workflow column keybindings (when workflow column has focus) — must precede view-specific
+    // bindings so that workflow column keys win when the column is active.
+    if state.column_focus == ColumnFocus::Workflow {
+        match key.code {
+            KeyCode::Char('H') => return Action::ToggleCompletedRuns,
+            KeyCode::Char('r') | KeyCode::Char('w') => return Action::RunWorkflow,
+            KeyCode::Char('v') if state.workflows_focus == crate::state::WorkflowsFocus::Defs => {
+                return Action::ViewWorkflowDef;
+            }
+            KeyCode::Char('e') if state.workflows_focus == crate::state::WorkflowsFocus::Defs => {
+                return Action::EditWorkflowDef;
+            }
+            KeyCode::Char(' ') if state.workflows_focus == crate::state::WorkflowsFocus::Runs => {
+                return Action::ToggleWorkflowRunCollapse;
+            }
+            _ => {}
+        }
+    }
+
+    // View-specific keybindings (ticket list — RepoDetail Tickets pane)
+    let in_ticket_list = state.view == View::RepoDetail
+        && state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets;
     if in_ticket_list {
         match key.code {
             KeyCode::Char('o') => return Action::OpenTicketUrl,
@@ -283,23 +301,14 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         }
     }
 
-    // View-specific keybindings (Dashboard Repos pane)
-    if state.view == View::Dashboard && state.dashboard_focus == crate::state::DashboardFocus::Repos
-    {
+    // View-specific keybindings (Dashboard)
+    if state.view == View::Dashboard {
         match key.code {
             KeyCode::Char('o') => return Action::OpenRepoUrl,
             KeyCode::Char('y') => return Action::CopyRepoUrl,
             KeyCode::Char('w') => return Action::PickWorkflow,
             _ => {}
         }
-    }
-
-    // View-specific keybindings (Dashboard Worktrees pane)
-    if state.view == View::Dashboard
-        && state.dashboard_focus == crate::state::DashboardFocus::Worktrees
-        && key.code == KeyCode::Char('w')
-    {
-        return Action::PickWorkflow;
     }
 
     // View-specific keybindings (WorktreeDetail agent controls)
@@ -324,17 +333,34 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
             KeyCode::Char('w') => return Action::PickWorkflow,
             KeyCode::Char('y') => return Action::WorktreeDetailCopy,
             KeyCode::Char('o') => return Action::WorktreeDetailOpen,
-            KeyCode::Char('j') if focus == WorktreeDetailFocus::InfoPanel => {
+            KeyCode::Char('j')
+                if focus == WorktreeDetailFocus::InfoPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::MoveDown
             }
-            KeyCode::Char('k') if focus == WorktreeDetailFocus::InfoPanel => return Action::MoveUp,
-            KeyCode::Char('j') if focus == WorktreeDetailFocus::LogPanel => {
+            KeyCode::Char('k')
+                if focus == WorktreeDetailFocus::InfoPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
+                return Action::MoveUp
+            }
+            KeyCode::Char('j')
+                if focus == WorktreeDetailFocus::LogPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::AgentActivityDown
             }
-            KeyCode::Char('k') if focus == WorktreeDetailFocus::LogPanel => {
+            KeyCode::Char('k')
+                if focus == WorktreeDetailFocus::LogPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::AgentActivityUp
             }
-            KeyCode::Enter if focus == WorktreeDetailFocus::LogPanel => {
+            KeyCode::Enter
+                if focus == WorktreeDetailFocus::LogPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::ExpandAgentEvent
             }
             KeyCode::Enter
@@ -348,23 +374,6 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                     && state.worktree_detail_selected_row == crate::state::info_row::TICKET =>
             {
                 return Action::LinkTicket
-            }
-            _ => {}
-        }
-    }
-
-    // View-specific keybindings (Workflows)
-    if state.view == View::Workflows {
-        match key.code {
-            KeyCode::Char('r') | KeyCode::Char('w') => return Action::RunWorkflow,
-            KeyCode::Char('v') if state.workflows_focus == crate::state::WorkflowsFocus::Defs => {
-                return Action::ViewWorkflowDef;
-            }
-            KeyCode::Char('e') if state.workflows_focus == crate::state::WorkflowsFocus::Defs => {
-                return Action::EditWorkflowDef;
-            }
-            KeyCode::Char(' ') if state.workflows_focus == crate::state::WorkflowsFocus::Runs => {
-                return Action::ToggleWorkflowRunCollapse;
             }
             _ => {}
         }
@@ -451,8 +460,12 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         // Toggle closed tickets visibility (all ticket views)
         KeyCode::Char('A') => Action::ToggleClosedTickets,
 
-        // Toggle global status bar expansion (useful when 4+ items are active)
-        KeyCode::Char('!') => Action::ToggleStatusBar,
+        // Toggle workflow column visibility
+        KeyCode::Char('\\') => Action::ToggleWorkflowColumn,
+
+        // Navigate between columns
+        KeyCode::Char('[') => Action::FocusContentColumn,
+        KeyCode::Char(']') => Action::FocusWorkflowColumn,
 
         // Open the in-TUI theme picker
         KeyCode::Char('T') => Action::ShowThemePicker,
@@ -464,11 +477,6 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         KeyCode::Char('s') => Action::SyncTickets,
         KeyCode::Char('S') => Action::ManageIssueSources,
         KeyCode::Char('o') => Action::OpenTicketUrl,
-
-        // Direct view navigation
-        KeyCode::Char('1') => Action::GoToDashboard,
-        KeyCode::Char('2') => Action::GoToTickets,
-        KeyCode::Char('3') => Action::GoToWorkflows,
 
         _ => Action::None,
     }
@@ -682,6 +690,32 @@ mod tests {
     }
 
     #[test]
+    fn worktree_detail_jk_routes_to_move_when_workflow_column_focused() {
+        // When workflow column has focus, j/k should not be captured by WorktreeDetail
+        // and should fall through to MoveDown/MoveUp for workflow column navigation.
+        let mut state = worktree_detail_state_with_focus(WorktreeDetailFocus::LogPanel);
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        assert!(matches!(
+            map_key(key(KeyCode::Char('j')), &state),
+            Action::MoveDown
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('k')), &state),
+            Action::MoveUp
+        ));
+    }
+
+    #[test]
+    fn worktree_detail_enter_does_not_expand_when_workflow_column_focused() {
+        let mut state = worktree_detail_state_with_focus(WorktreeDetailFocus::LogPanel);
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        assert!(!matches!(
+            map_key(key(KeyCode::Enter), &state),
+            Action::ExpandAgentEvent
+        ));
+    }
+
+    #[test]
     fn worktree_detail_enter_does_not_expand_when_info_panel_focused() {
         let state = worktree_detail_state_with_focus(WorktreeDetailFocus::InfoPanel);
         assert!(!matches!(
@@ -833,9 +867,9 @@ mod tests {
     }
 
     #[test]
-    fn r_maps_to_run_workflow_in_workflows_view() {
+    fn r_maps_to_run_workflow_in_workflow_column_focus() {
         let mut state = AppState::new();
-        state.view = View::Workflows;
+        state.column_focus = crate::state::ColumnFocus::Workflow;
         assert!(matches!(
             map_key(key(KeyCode::Char('r')), &state),
             Action::RunWorkflow
@@ -852,9 +886,9 @@ mod tests {
     }
 
     #[test]
-    fn w_maps_to_run_workflow_in_workflows_view() {
+    fn w_maps_to_run_workflow_in_workflow_column_focus() {
         let mut state = AppState::new();
-        state.view = View::Workflows;
+        state.column_focus = crate::state::ColumnFocus::Workflow;
         assert!(matches!(
             map_key(key(KeyCode::Char('w')), &state),
             Action::RunWorkflow
@@ -862,32 +896,9 @@ mod tests {
     }
 
     #[test]
-    fn w_maps_to_pick_workflow_in_dashboard_tickets() {
+    fn w_maps_to_pick_workflow_in_dashboard() {
         let mut state = AppState::new();
         state.view = View::Dashboard;
-        state.dashboard_focus = crate::state::DashboardFocus::Tickets;
-        assert!(matches!(
-            map_key(key(KeyCode::Char('w')), &state),
-            Action::PickWorkflow
-        ));
-    }
-
-    #[test]
-    fn w_maps_to_pick_workflow_in_dashboard_repos() {
-        let mut state = AppState::new();
-        state.view = View::Dashboard;
-        state.dashboard_focus = crate::state::DashboardFocus::Repos;
-        assert!(matches!(
-            map_key(key(KeyCode::Char('w')), &state),
-            Action::PickWorkflow
-        ));
-    }
-
-    #[test]
-    fn w_maps_to_pick_workflow_in_dashboard_worktrees() {
-        let mut state = AppState::new();
-        state.view = View::Dashboard;
-        state.dashboard_focus = crate::state::DashboardFocus::Worktrees;
         assert!(matches!(
             map_key(key(KeyCode::Char('w')), &state),
             Action::PickWorkflow
@@ -1045,5 +1056,66 @@ mod tests {
         assert!(matches!(map_key(key(KeyCode::Down), &state), Action::None));
         assert!(matches!(map_key(key(KeyCode::Left), &state), Action::None));
         assert!(matches!(map_key(key(KeyCode::Right), &state), Action::None));
+    }
+
+    // --- Workflow column focus keybindings ---
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_l_maps_to_focus_workflow_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(ctrl(KeyCode::Char('l')), &state),
+            Action::FocusWorkflowColumn
+        ));
+    }
+
+    #[test]
+    fn ctrl_h_maps_to_focus_content_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(ctrl(KeyCode::Char('h')), &state),
+            Action::FocusContentColumn
+        ));
+    }
+
+    #[test]
+    fn backslash_maps_to_toggle_workflow_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(key(KeyCode::Char('\\')), &state),
+            Action::ToggleWorkflowColumn
+        ));
+    }
+
+    #[test]
+    fn backslash_toggle_works_in_workflow_column_focus() {
+        let mut state = AppState::new();
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        assert!(matches!(
+            map_key(key(KeyCode::Char('\\')), &state),
+            Action::ToggleWorkflowColumn
+        ));
+    }
+
+    #[test]
+    fn left_bracket_maps_to_focus_content_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(key(KeyCode::Char('[')), &state),
+            Action::FocusContentColumn
+        ));
+    }
+
+    #[test]
+    fn right_bracket_maps_to_focus_workflow_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(key(KeyCode::Char(']')), &state),
+            Action::FocusWorkflowColumn
+        ));
     }
 }

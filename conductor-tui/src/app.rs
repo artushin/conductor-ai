@@ -22,7 +22,7 @@ use crate::background;
 use crate::event::{BackgroundSender, EventLoop};
 use crate::input;
 use crate::state::{
-    info_row, repo_info_row, AppState, ConfirmAction, DashboardFocus, FormAction, FormField,
+    info_row, repo_info_row, AppState, ConfirmAction, DashboardRow, FormAction, FormField,
     InputAction, Modal, PostCreateChoice, RepoDetailFocus, View, WorkflowRunDetailFocus,
     WorkflowsFocus, WorktreeDetailFocus,
 };
@@ -368,23 +368,19 @@ impl App {
             }
             Action::Select => self.select(),
 
-            // View navigation
-            Action::GoToDashboard => {
-                self.state.view = View::Dashboard;
+            Action::FocusContentColumn => {
+                self.state.column_focus = crate::state::ColumnFocus::Content;
             }
-            Action::GoToTickets => {
-                self.state.view = View::Tickets;
-                self.state.ticket_index = 0;
+            Action::FocusWorkflowColumn => {
+                if self.state.workflow_column_visible {
+                    self.state.column_focus = crate::state::ColumnFocus::Workflow;
+                }
             }
-            Action::GoToWorkflows => {
-                // Navigate to the global workflows view.
-                // If a worktree is already selected (e.g. from WorktreeDetail), keep it
-                // for scoped defs/runs; otherwise show all runs across all worktrees.
-                self.state.view = View::Workflows;
-                self.state.workflows_focus = crate::state::WorkflowsFocus::Runs;
-                self.state.workflow_def_index = 0;
-                self.state.workflow_run_index = 0;
-                self.reload_workflow_data();
+            Action::ToggleWorkflowColumn => {
+                self.state.workflow_column_visible = !self.state.workflow_column_visible;
+                if !self.state.workflow_column_visible {
+                    self.state.column_focus = crate::state::ColumnFocus::Content;
+                }
             }
 
             // Filter
@@ -573,9 +569,10 @@ impl App {
                 self.state.detail_ticket_index = 0;
             }
 
-            // Global status bar toggle (expand/collapse detail line for 4+ active items)
-            Action::ToggleStatusBar => {
-                self.state.status_bar_expanded = !self.state.status_bar_expanded;
+            // Workflow completed/cancelled visibility toggle
+            Action::ToggleCompletedRuns => {
+                self.state.show_completed_workflow_runs = !self.state.show_completed_workflow_runs;
+                self.clamp_workflow_indices();
             }
 
             // WorktreeDetail panel actions
@@ -730,7 +727,7 @@ impl App {
                     self.state.status_message = Some(msg);
                 }
                 self.clamp_workflow_indices();
-                return matches!(self.state.view, View::Workflows | View::WorkflowRunDetail);
+                return true; // Always redraw since workflow column is persistent
             }
 
             Action::ToggleWorkflowRunCollapse => {
@@ -846,15 +843,8 @@ impl App {
                 self.reload_agent_events();
                 self.state.rebuild_filtered_tickets();
                 self.clamp_indices();
-                // Redraw when viewing worktree detail / workflows, or on the
-                // dashboard (which now has a live workflow panel).
-                return matches!(
-                    self.state.view,
-                    View::Dashboard
-                        | View::WorktreeDetail
-                        | View::Workflows
-                        | View::WorkflowRunDetail
-                );
+                // Always redraw since workflow column is persistent across all views.
+                return true;
             }
             Action::TicketSyncComplete { repo_slug, count } => {
                 self.state.status_message = Some(format!("Synced {count} tickets for {repo_slug}"));
@@ -1162,14 +1152,9 @@ impl App {
     }
 
     fn clamp_indices(&mut self) {
-        let repos_len = self.state.data.repos.len();
-        if repos_len > 0 && self.state.repo_index >= repos_len {
-            self.state.repo_index = repos_len - 1;
-        }
-
-        let wt_len = self.state.data.worktrees.len();
-        if wt_len > 0 && self.state.worktree_index >= wt_len {
-            self.state.worktree_index = wt_len - 1;
+        let dashboard_len = self.state.dashboard_rows().len();
+        if dashboard_len > 0 && self.state.dashboard_index >= dashboard_len {
+            self.state.dashboard_index = dashboard_len - 1;
         }
 
         let t_len = self.state.filtered_tickets.len();
@@ -1203,65 +1188,70 @@ impl App {
                 }
                 self.state.selected_worktree_id = None;
             }
-            View::Tickets => {
-                self.state.view = View::Dashboard;
-            }
-            View::Workflows => {
-                // Go back to worktree detail if we came from there
-                if self.state.selected_worktree_id.is_some() {
-                    self.state.view = View::WorktreeDetail;
-                    *self.state.agent_list_state.borrow_mut() = ListState::default();
-                    self.reload_agent_events();
-                } else {
-                    self.state.view = View::Dashboard;
-                }
-            }
             View::WorkflowRunDetail => {
-                self.state.view = View::Workflows;
+                self.state.view = self.state.previous_view.take().unwrap_or(View::Dashboard);
+                if let Some(prev_wt_id) = self.state.previous_selected_worktree_id.take() {
+                    self.state.selected_worktree_id = prev_wt_id;
+                }
                 self.state.selected_workflow_run_id = None;
+                self.state.column_focus = crate::state::ColumnFocus::Workflow;
+                self.state.workflows_focus = WorkflowsFocus::Runs;
+                // Re-poll immediately so the workflow column reflects the restored view's
+                // context (repo- or worktree-scoped) instead of showing stale global data
+                // that was loaded while in WorkflowRunDetail.
+                self.poll_workflow_data_async();
+            }
+            View::WorkflowDefDetail => {
+                self.state.view = self.state.previous_view.take().unwrap_or(View::Dashboard);
+                self.state.selected_workflow_def = None;
+                self.state.workflow_def_detail_scroll = 0;
+                self.state.column_focus = crate::state::ColumnFocus::Workflow;
+                self.state.workflows_focus = WorkflowsFocus::Defs;
             }
         }
     }
 
     fn next_panel(&mut self) {
-        match self.state.view {
-            View::Dashboard => {
-                self.state.dashboard_focus = self.state.dashboard_focus.next();
-            }
-            View::RepoDetail => {
-                self.state.repo_detail_focus = self.state.repo_detail_focus.next();
-            }
-            View::Workflows => {
+        use crate::state::ColumnFocus;
+        match self.state.column_focus {
+            ColumnFocus::Workflow => {
                 self.state.workflows_focus = self.state.workflows_focus.toggle();
             }
-            View::WorkflowRunDetail => {
-                self.toggle_workflow_run_detail_focus();
-            }
-            View::WorktreeDetail => {
-                self.state.worktree_detail_focus = self.state.worktree_detail_focus.toggle();
-            }
-            _ => {}
+            ColumnFocus::Content => match self.state.view {
+                View::Dashboard => {} // single panel — Tab is a no-op
+                View::RepoDetail => {
+                    self.state.repo_detail_focus = self.state.repo_detail_focus.next();
+                }
+                View::WorkflowRunDetail => {
+                    self.toggle_workflow_run_detail_focus();
+                }
+                View::WorktreeDetail => {
+                    self.state.worktree_detail_focus = self.state.worktree_detail_focus.toggle();
+                }
+                View::WorkflowDefDetail => {} // single panel — Tab is a no-op
+            },
         }
     }
 
     fn prev_panel(&mut self) {
-        match self.state.view {
-            View::Dashboard => {
-                self.state.dashboard_focus = self.state.dashboard_focus.prev();
-            }
-            View::RepoDetail => {
-                self.state.repo_detail_focus = self.state.repo_detail_focus.prev();
-            }
-            View::Workflows => {
+        use crate::state::ColumnFocus;
+        match self.state.column_focus {
+            ColumnFocus::Workflow => {
                 self.state.workflows_focus = self.state.workflows_focus.toggle();
             }
-            View::WorkflowRunDetail => {
-                self.toggle_workflow_run_detail_focus();
-            }
-            View::WorktreeDetail => {
-                self.state.worktree_detail_focus = self.state.worktree_detail_focus.toggle();
-            }
-            _ => {}
+            ColumnFocus::Content => match self.state.view {
+                View::Dashboard => {} // single panel — Tab is a no-op
+                View::RepoDetail => {
+                    self.state.repo_detail_focus = self.state.repo_detail_focus.prev();
+                }
+                View::WorkflowRunDetail => {
+                    self.toggle_workflow_run_detail_focus();
+                }
+                View::WorktreeDetail => {
+                    self.state.worktree_detail_focus = self.state.worktree_detail_focus.toggle();
+                }
+                View::WorkflowDefDetail => {} // single panel — Tab is a no-op
+            },
         }
     }
 
@@ -1270,6 +1260,76 @@ impl App {
     fn toggle_workflow_run_detail_focus(&mut self) {
         if self.state.selected_step_has_agent() {
             self.state.workflow_run_detail_focus = self.state.workflow_run_detail_focus.toggle();
+        }
+    }
+
+    fn workflow_column_move_up(&mut self) {
+        match self.state.workflows_focus {
+            WorkflowsFocus::Defs => {
+                self.state.workflow_def_index = self.state.workflow_def_index.saturating_sub(1);
+            }
+            WorkflowsFocus::Runs => {
+                self.state.workflow_run_index = self.state.workflow_run_index.saturating_sub(1);
+            }
+        }
+    }
+
+    fn workflow_column_move_down(&mut self) {
+        match self.state.workflows_focus {
+            WorkflowsFocus::Defs => {
+                clamp_increment(
+                    &mut self.state.workflow_def_index,
+                    self.state.data.workflow_defs.len(),
+                );
+            }
+            WorkflowsFocus::Runs => {
+                let visible_len = self.state.visible_workflow_run_rows().len();
+                clamp_increment(&mut self.state.workflow_run_index, visible_len);
+            }
+        }
+    }
+
+    fn workflow_column_select(&mut self) {
+        match self.state.workflows_focus {
+            WorkflowsFocus::Defs => {
+                if let Some(def) = self.selected_workflow_def() {
+                    self.state.selected_workflow_def = Some(def);
+                    self.state.workflow_def_detail_scroll = 0;
+                    self.state.previous_view = Some(self.state.view);
+                    self.state.view = View::WorkflowDefDetail;
+                }
+            }
+            WorkflowsFocus::Runs => {
+                let visible = self.state.visible_workflow_run_rows();
+                if let Some(row) = visible.get(self.state.workflow_run_index) {
+                    let Some(target_id) = row.run_id().map(|s| s.to_string()) else {
+                        return; // header row — Enter is a no-op
+                    };
+                    if let Some(run) = self
+                        .state
+                        .data
+                        .workflow_runs
+                        .iter()
+                        .find(|r| r.id == target_id)
+                    {
+                        let run_id = run.id.clone();
+                        let worktree_id = run.worktree_id.clone();
+                        self.state.previous_selected_worktree_id =
+                            Some(self.state.selected_worktree_id.clone());
+                        if self.state.selected_worktree_id.is_none() {
+                            self.state.selected_worktree_id = worktree_id;
+                        }
+                        self.state.selected_workflow_run_id = Some(run_id);
+                        self.state.previous_view = Some(self.state.view);
+                        self.state.view = View::WorkflowRunDetail;
+                        self.state.workflow_step_index = 0;
+                        self.state.workflow_run_detail_focus = WorkflowRunDetailFocus::Steps;
+                        self.state.step_agent_event_index = 0;
+                        self.state.column_focus = crate::state::ColumnFocus::Content;
+                        self.reload_workflow_steps();
+                    }
+                }
+            }
         }
     }
 
@@ -1339,18 +1399,15 @@ impl App {
             }
             _ => {}
         }
+        // When workflow column has focus, navigate workflow panes.
+        if self.state.column_focus == crate::state::ColumnFocus::Workflow {
+            self.workflow_column_move_up();
+            return;
+        }
         match self.state.view {
-            View::Dashboard => match self.state.dashboard_focus {
-                DashboardFocus::Repos => {
-                    self.state.repo_index = self.state.repo_index.saturating_sub(1);
-                }
-                DashboardFocus::Worktrees => {
-                    self.state.worktree_index = self.state.worktree_index.saturating_sub(1);
-                }
-                DashboardFocus::Tickets => {
-                    self.state.ticket_index = self.state.ticket_index.saturating_sub(1);
-                }
-            },
+            View::Dashboard => {
+                self.state.dashboard_index = self.state.dashboard_index.saturating_sub(1);
+            }
             View::RepoDetail => match self.state.repo_detail_focus {
                 RepoDetailFocus::Info => {
                     self.state.repo_detail_info_row =
@@ -1365,17 +1422,6 @@ impl App {
                 }
                 RepoDetailFocus::Prs => {
                     self.state.detail_pr_index = self.state.detail_pr_index.saturating_sub(1);
-                }
-            },
-            View::Tickets => {
-                self.state.ticket_index = self.state.ticket_index.saturating_sub(1);
-            }
-            View::Workflows => match self.state.workflows_focus {
-                WorkflowsFocus::Defs => {
-                    self.state.workflow_def_index = self.state.workflow_def_index.saturating_sub(1);
-                }
-                WorkflowsFocus::Runs => {
-                    self.state.workflow_run_index = self.state.workflow_run_index.saturating_sub(1);
                 }
             },
             View::WorkflowRunDetail => match self.state.workflow_run_detail_focus {
@@ -1397,6 +1443,10 @@ impl App {
             {
                 self.state.worktree_detail_selected_row =
                     self.state.worktree_detail_selected_row.saturating_sub(1);
+            }
+            View::WorkflowDefDetail => {
+                self.state.workflow_def_detail_scroll =
+                    self.state.workflow_def_detail_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -1469,24 +1519,16 @@ impl App {
             }
             _ => {}
         }
+        // When workflow column has focus, navigate workflow panes.
+        if self.state.column_focus == crate::state::ColumnFocus::Workflow {
+            self.workflow_column_move_down();
+            return;
+        }
         match self.state.view {
-            View::Dashboard => match self.state.dashboard_focus {
-                DashboardFocus::Repos => {
-                    clamp_increment(&mut self.state.repo_index, self.state.data.repos.len());
-                }
-                DashboardFocus::Worktrees => {
-                    clamp_increment(
-                        &mut self.state.worktree_index,
-                        self.state.data.worktrees.len(),
-                    );
-                }
-                DashboardFocus::Tickets => {
-                    clamp_increment(
-                        &mut self.state.ticket_index,
-                        self.state.filtered_tickets.len(),
-                    );
-                }
-            },
+            View::Dashboard => {
+                let len = self.state.dashboard_rows().len();
+                clamp_increment(&mut self.state.dashboard_index, len);
+            }
             View::RepoDetail => match self.state.repo_detail_focus {
                 RepoDetailFocus::Info => {
                     clamp_increment(&mut self.state.repo_detail_info_row, repo_info_row::COUNT);
@@ -1505,24 +1547,6 @@ impl App {
                 }
                 RepoDetailFocus::Prs => {
                     clamp_increment(&mut self.state.detail_pr_index, self.state.detail_prs.len());
-                }
-            },
-            View::Tickets => {
-                clamp_increment(
-                    &mut self.state.ticket_index,
-                    self.state.filtered_tickets.len(),
-                );
-            }
-            View::Workflows => match self.state.workflows_focus {
-                WorkflowsFocus::Defs => {
-                    clamp_increment(
-                        &mut self.state.workflow_def_index,
-                        self.state.data.workflow_defs.len(),
-                    );
-                }
-                WorkflowsFocus::Runs => {
-                    let visible_len = self.state.visible_workflow_run_rows().len();
-                    clamp_increment(&mut self.state.workflow_run_index, visible_len);
                 }
             },
             View::WorkflowRunDetail => match self.state.workflow_run_detail_focus {
@@ -1552,70 +1576,74 @@ impl App {
                     info_row::COUNT,
                 );
             }
+            View::WorkflowDefDetail => {
+                self.state.workflow_def_detail_scroll =
+                    self.state.workflow_def_detail_scroll.saturating_add(1);
+            }
             _ => {}
         }
     }
 
     fn select(&mut self) {
+        // When workflow column has focus, handle workflow selection.
+        if self.state.column_focus == crate::state::ColumnFocus::Workflow {
+            self.workflow_column_select();
+            return;
+        }
         match self.state.view {
-            View::Dashboard => match self.state.dashboard_focus {
-                DashboardFocus::Repos => {
-                    if let Some(repo) = self.state.selected_repo() {
-                        let repo_id = repo.id.clone();
-                        let remote_url = repo.remote_url.clone();
-                        self.state.selected_repo_id = Some(repo_id.clone());
-                        self.state.detail_worktrees = self
-                            .state
-                            .data
-                            .worktrees
-                            .iter()
-                            .filter(|wt| wt.repo_id == repo_id)
-                            .cloned()
-                            .collect();
-                        self.state.detail_tickets = self
-                            .state
-                            .data
-                            .tickets
-                            .iter()
-                            .filter(|t| t.repo_id == repo_id)
-                            .cloned()
-                            .collect();
-                        self.state.detail_wt_index = 0;
-                        self.state.detail_ticket_index = 0;
-                        // Clear stale PR data and kick off a fresh fetch.
-                        self.state.detail_prs = Vec::new();
-                        self.state.detail_pr_index = 0;
-                        self.state.pr_last_fetched_at = None;
-                        if let Some(ref tx) = self.bg_tx {
-                            background::spawn_pr_fetch_once(
-                                tx.clone(),
-                                remote_url,
-                                repo_id.clone(),
-                            );
+            View::Dashboard => {
+                let rows = self.state.dashboard_rows();
+                match rows.get(self.state.dashboard_index) {
+                    Some(&DashboardRow::Repo(repo_idx)) => {
+                        if let Some(repo) = self.state.data.repos.get(repo_idx).cloned() {
+                            let repo_id = repo.id.clone();
+                            let remote_url = repo.remote_url.clone();
+                            self.state.selected_repo_id = Some(repo_id.clone());
+                            self.state.detail_worktrees = self
+                                .state
+                                .data
+                                .worktrees
+                                .iter()
+                                .filter(|wt| wt.repo_id == repo_id)
+                                .cloned()
+                                .collect();
+                            self.state.detail_tickets = self
+                                .state
+                                .data
+                                .tickets
+                                .iter()
+                                .filter(|t| t.repo_id == repo_id)
+                                .cloned()
+                                .collect();
+                            self.state.detail_wt_index = 0;
+                            self.state.detail_ticket_index = 0;
+                            self.state.detail_prs = Vec::new();
+                            self.state.detail_pr_index = 0;
+                            self.state.pr_last_fetched_at = None;
+                            if let Some(ref tx) = self.bg_tx {
+                                background::spawn_pr_fetch_once(
+                                    tx.clone(),
+                                    remote_url,
+                                    repo_id.clone(),
+                                );
+                            }
+                            self.state.rebuild_filtered_tickets();
+                            self.state.repo_detail_focus = RepoDetailFocus::Worktrees;
+                            self.state.view = View::RepoDetail;
                         }
-                        self.state.rebuild_filtered_tickets();
-                        self.state.repo_detail_focus = RepoDetailFocus::Worktrees;
-                        self.state.view = View::RepoDetail;
                     }
-                }
-                DashboardFocus::Worktrees => {
-                    if let Some(wt) = self.state.selected_worktree() {
-                        let wt_id = wt.id.clone();
-                        self.state.selected_worktree_id = Some(wt_id);
-                        self.state.selected_repo_id = None;
-                        self.state.view = View::WorktreeDetail;
-                        *self.state.agent_list_state.borrow_mut() = ListState::default();
-                        self.reload_agent_events();
+                    Some(&DashboardRow::Worktree(wt_idx)) => {
+                        if let Some(wt) = self.state.data.worktrees.get(wt_idx).cloned() {
+                            self.state.selected_worktree_id = Some(wt.id.clone());
+                            self.state.selected_repo_id = None;
+                            self.state.view = View::WorktreeDetail;
+                            *self.state.agent_list_state.borrow_mut() = ListState::default();
+                            self.reload_agent_events();
+                        }
                     }
+                    None => {}
                 }
-                DashboardFocus::Tickets => {
-                    if let Some(ticket) = self.state.filtered_tickets.get(self.state.ticket_index) {
-                        self.state.modal = Modal::TicketInfo {
-                            ticket: Box::new(ticket.clone()),
-                        };
-                    }
-                }
-            },
+            }
             View::RepoDetail => match self.state.repo_detail_focus {
                 RepoDetailFocus::Info => {
                     // Delegate to info open handler
@@ -1645,53 +1673,6 @@ impl App {
                     // No-op: PR selection deferred to a future ticket.
                 }
             },
-            View::Tickets => {
-                if let Some(ticket) = self.state.filtered_tickets.get(self.state.ticket_index) {
-                    self.state.modal = Modal::TicketInfo {
-                        ticket: Box::new(ticket.clone()),
-                    };
-                }
-            }
-            View::Workflows => {
-                match self.state.workflows_focus {
-                    WorkflowsFocus::Defs => {
-                        // Run selected workflow definition
-                        self.handle_run_workflow();
-                    }
-                    WorkflowsFocus::Runs => {
-                        // Enter workflow run detail (works for both parent and child rows).
-                        // Header rows: Enter is a no-op (Space toggles collapse instead).
-                        let visible = self.state.visible_workflow_run_rows();
-                        if let Some(row) = visible.get(self.state.workflow_run_index) {
-                            let Some(target_id) = row.run_id().map(|s| s.to_string()) else {
-                                return; // header row — Enter is a no-op
-                            };
-                            if let Some(run) = self
-                                .state
-                                .data
-                                .workflow_runs
-                                .iter()
-                                .find(|r| r.id == target_id)
-                            {
-                                let run_id = run.id.clone();
-                                let worktree_id = run.worktree_id.clone();
-                                // In global mode, set the worktree context from the run
-                                // (ephemeral PR runs have no worktree_id — skip)
-                                if self.state.selected_worktree_id.is_none() {
-                                    self.state.selected_worktree_id = worktree_id;
-                                }
-                                self.state.selected_workflow_run_id = Some(run_id);
-                                self.state.view = View::WorkflowRunDetail;
-                                self.state.workflow_step_index = 0;
-                                self.state.workflow_run_detail_focus =
-                                    WorkflowRunDetailFocus::Steps;
-                                self.state.step_agent_event_index = 0;
-                                self.reload_workflow_steps();
-                            }
-                        }
-                    }
-                }
-            }
             View::WorkflowRunDetail => {
                 // Build modal title+body from cached data, then assign modal after borrows end
                 let modal = if let Some(step) = self
@@ -1777,6 +1758,7 @@ impl App {
                 }
             }
             View::WorktreeDetail => {}
+            View::WorkflowDefDetail => {}
         }
     }
 
@@ -1795,12 +1777,8 @@ impl App {
                 .and_then(|tid| self.state.data.ticket_map.get(tid))
                 .map(|t| t.url.clone());
         }
-        // Ticket list views: Dashboard Tickets pane, standalone Tickets view, RepoDetail Tickets pane
+        // Ticket list views: RepoDetail Tickets pane
         let ticket = match self.state.view {
-            View::Dashboard if self.state.dashboard_focus == DashboardFocus::Tickets => {
-                self.state.filtered_tickets.get(self.state.ticket_index)
-            }
-            View::Tickets => self.state.filtered_tickets.get(self.state.ticket_index),
             View::RepoDetail if self.state.repo_detail_focus == RepoDetailFocus::Tickets => self
                 .state
                 .filtered_detail_tickets
@@ -2553,20 +2531,10 @@ impl App {
     fn handle_create(&mut self) {
         // Try to detect ticket context based on current view and focus
         let ticket_context = match self.state.view {
-            View::Dashboard if self.state.dashboard_focus == DashboardFocus::Tickets => self
-                .state
-                .filtered_tickets
-                .get(self.state.ticket_index)
-                .cloned(),
             View::RepoDetail if self.state.repo_detail_focus == RepoDetailFocus::Tickets => self
                 .state
                 .filtered_detail_tickets
                 .get(self.state.detail_ticket_index)
-                .cloned(),
-            View::Tickets => self
-                .state
-                .filtered_tickets
-                .get(self.state.ticket_index)
                 .cloned(),
             _ => None,
         };
@@ -2594,15 +2562,6 @@ impl App {
         // Fallback: repo-only path (no ticket context)
         match self.state.view {
             View::Dashboard | View::RepoDetail => {
-                // Creating a worktree from the Worktrees tab is ambiguous — no repo is selected
-                if self.state.view == View::Dashboard
-                    && self.state.dashboard_focus == DashboardFocus::Worktrees
-                {
-                    self.state.status_message =
-                        Some("Switch to the Repos tab to create a worktree".to_string());
-                    return;
-                }
-
                 let repo_slug = self
                     .state
                     .selected_repo_id
@@ -2621,10 +2580,8 @@ impl App {
                             ticket_id: None,
                         },
                     };
-                } else if self.state.view == View::Dashboard
-                    && self.state.dashboard_focus == DashboardFocus::Repos
-                {
-                    // No repo selected on repos panel — open register repo form instead
+                } else if self.state.view == View::Dashboard && self.state.data.repos.is_empty() {
+                    // No repos registered yet — open register repo form instead
                     self.handle_register_repo();
                 } else {
                     self.state.status_message = Some("Select a repo first".to_string());
@@ -3573,16 +3530,10 @@ impl App {
 
         match self.state.view {
             View::Dashboard => {
-                use crate::state::DashboardFocus;
-                match self.state.dashboard_focus {
-                    DashboardFocus::Worktrees => {
-                        let Some(wt) = self
-                            .state
-                            .data
-                            .worktrees
-                            .get(self.state.worktree_index)
-                            .cloned()
-                        else {
+                let rows = self.state.dashboard_rows();
+                match rows.get(self.state.dashboard_index) {
+                    Some(&DashboardRow::Worktree(wt_idx)) => {
+                        let Some(wt) = self.state.data.worktrees.get(wt_idx).cloned() else {
                             return;
                         };
                         let repo_slug = self
@@ -3610,9 +3561,8 @@ impl App {
                             },
                         };
                     }
-                    DashboardFocus::Repos => {
-                        let Some(repo) = self.state.data.repos.get(self.state.repo_index).cloned()
-                        else {
+                    Some(&DashboardRow::Repo(repo_idx)) => {
+                        let Some(repo) = self.state.data.repos.get(repo_idx).cloned() else {
                             return;
                         };
                         let (effective, source) = if let Some(ref m) = repo.model {
@@ -3637,7 +3587,7 @@ impl App {
                             },
                         };
                     }
-                    DashboardFocus::Tickets => {}
+                    None => (),
                 }
             }
             View::WorktreeDetail => {
@@ -4921,6 +4871,12 @@ impl App {
         }
 
         let wt_id = self.state.selected_worktree_id.clone();
+        // In RepoDetail with no worktree selected, scope to the selected repo.
+        let repo_id = if wt_id.is_none() && self.state.view == View::RepoDetail {
+            self.state.selected_repo_id.clone()
+        } else {
+            None
+        };
         let (worktree_path, repo_path) = if let Some(ref id) = wt_id {
             match self.resolve_worktree_paths(id) {
                 Some((wt_path, rp)) => (Some(wt_path), Some(rp)),
@@ -4942,6 +4898,7 @@ impl App {
             wt_id,
             worktree_path,
             repo_path,
+            repo_id,
             selected_run_id,
             selected_step_child_run_id,
             in_flight,
@@ -4963,14 +4920,26 @@ impl App {
                     self.state.status_message = Some(msg);
                 }
             }
+        } else if self.state.view == View::RepoDetail {
+            // Repo-scoped: defs cleared here, background poller will repopulate
+            self.state.data.workflow_defs.clear();
+            self.state.data.workflow_def_slugs.clear();
         } else {
             // Global mode: defs are cross-worktree, cleared here and populated by background poller
             self.state.data.workflow_defs.clear();
             self.state.data.workflow_def_slugs.clear();
         }
-        self.state.data.workflow_runs = wf_mgr
-            .list_workflow_runs_for_scope(self.state.selected_worktree_id.as_deref(), 50)
-            .unwrap_or_default();
+        self.state.data.workflow_runs =
+            if let Some(ref wt_id) = self.state.selected_worktree_id.clone() {
+                wf_mgr.list_workflow_runs(wt_id).unwrap_or_default()
+            } else if self.state.view == View::RepoDetail {
+                let repo_id = self.state.selected_repo_id.as_deref().unwrap_or("");
+                wf_mgr
+                    .list_workflow_runs_for_repo(repo_id, 50)
+                    .unwrap_or_default()
+            } else {
+                wf_mgr.list_all_workflow_runs(50).unwrap_or_default()
+            };
 
         // Load steps for the currently selected run
         self.state.init_collapse_state();
@@ -5102,34 +5071,38 @@ impl App {
                     return;
                 }
             }
-        } else if self.state.view == View::Dashboard
-            && self.state.dashboard_focus == crate::state::DashboardFocus::Repos
-        {
-            // Dashboard Repos pane: target is the highlighted repo (cursor position)
-            let repo = match self.state.selected_repo() {
-                Some(r) => r.clone(),
-                None => {
-                    self.state.status_message = Some("No repo selected".to_string());
-                    return;
+        } else if self.state.view == View::Dashboard {
+            let rows = self.state.dashboard_rows();
+            match rows.get(self.state.dashboard_index) {
+                Some(&DashboardRow::Repo(repo_idx)) => {
+                    let repo = match self.state.data.repos.get(repo_idx) {
+                        Some(r) => r.clone(),
+                        None => {
+                            self.state.status_message = Some("No repo selected".to_string());
+                            return;
+                        }
+                    };
+                    self.repo_picker_target(&repo)
                 }
-            };
-            self.repo_picker_target(&repo)
-        } else if self.state.view == View::Dashboard
-            && self.state.dashboard_focus == crate::state::DashboardFocus::Worktrees
-        {
-            // Dashboard Worktrees pane: target is the highlighted worktree (cursor position)
-            let wt = match self.state.selected_worktree() {
-                Some(w) => w.clone(),
-                None => {
-                    self.state.status_message = Some("No worktree selected".to_string());
-                    return;
+                Some(&DashboardRow::Worktree(wt_idx)) => {
+                    let wt = match self.state.data.worktrees.get(wt_idx) {
+                        Some(w) => w.clone(),
+                        None => {
+                            self.state.status_message = Some("No worktree selected".to_string());
+                            return;
+                        }
+                    };
+                    match self.worktree_picker_target(&wt) {
+                        Some(t) => t,
+                        None => {
+                            self.state.status_message =
+                                Some("Repo not found for this worktree".to_string());
+                            return;
+                        }
+                    }
                 }
-            };
-            match self.worktree_picker_target(&wt) {
-                Some(t) => t,
                 None => {
-                    self.state.status_message =
-                        Some("Repo not found for this worktree".to_string());
+                    self.state.status_message = Some("No item selected".to_string());
                     return;
                 }
             }
@@ -5196,14 +5169,8 @@ impl App {
                 repo_path,
             }
         } else {
-            // Ticket list contexts: target is the selected ticket itself
+            // Ticket list contexts: target is the selected ticket itself (RepoDetail only)
             let ticket = match self.state.view {
-                View::Dashboard
-                    if self.state.dashboard_focus == crate::state::DashboardFocus::Tickets =>
-                {
-                    self.state.filtered_tickets.get(self.state.ticket_index)
-                }
-                View::Tickets => self.state.filtered_tickets.get(self.state.ticket_index),
                 View::RepoDetail
                     if self.state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets =>
                 {
@@ -6312,5 +6279,136 @@ mod tests {
         let mut idx = 0;
         wrap_decrement(&mut idx, 0);
         assert_eq!(idx, 0);
+    }
+
+    fn make_test_app() -> App {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conductor_core::db::migrations::run(&conn).unwrap();
+        App::new(
+            conn,
+            conductor_core::config::Config::default(),
+            crate::theme::Theme::default(),
+        )
+    }
+
+    fn make_test_run(id: &str) -> conductor_core::workflow::WorkflowRun {
+        conductor_core::workflow::WorkflowRun {
+            id: id.into(),
+            workflow_name: "test".into(),
+            worktree_id: Some("w1".into()),
+            parent_run_id: String::new(),
+            status: conductor_core::workflow::WorkflowRunStatus::Running,
+            dry_run: false,
+            trigger: "manual".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: None,
+            result_summary: None,
+            definition_snapshot: None,
+            inputs: std::collections::HashMap::new(),
+            ticket_id: None,
+            repo_id: None,
+            parent_workflow_run_id: None,
+            target_label: None,
+            default_bot_name: None,
+        }
+    }
+
+    #[test]
+    fn test_toggle_workflow_column_off_moves_focus_to_content() {
+        let mut app = make_test_app();
+        app.state.workflow_column_visible = true;
+        app.state.column_focus = crate::state::ColumnFocus::Workflow;
+        app.handle_action(Action::ToggleWorkflowColumn);
+        assert!(!app.state.workflow_column_visible);
+        assert_eq!(app.state.column_focus, crate::state::ColumnFocus::Content);
+    }
+
+    #[test]
+    fn test_toggle_workflow_column_on_preserves_focus() {
+        let mut app = make_test_app();
+        app.state.workflow_column_visible = false;
+        app.state.column_focus = crate::state::ColumnFocus::Content;
+        app.handle_action(Action::ToggleWorkflowColumn);
+        assert!(app.state.workflow_column_visible);
+        assert_eq!(app.state.column_focus, crate::state::ColumnFocus::Content);
+    }
+
+    #[test]
+    fn test_workflow_column_select_run_enters_detail_view() {
+        let mut app = make_test_app();
+        app.state.selected_worktree_id = Some("w1".into());
+        app.state.data.workflow_runs = vec![make_test_run("run1")];
+        app.state.column_focus = crate::state::ColumnFocus::Workflow;
+        app.state.workflows_focus = WorkflowsFocus::Runs;
+        app.state.workflow_run_index = 0;
+        app.handle_action(Action::Select);
+        assert_eq!(app.state.view, View::WorkflowRunDetail);
+        assert_eq!(app.state.column_focus, crate::state::ColumnFocus::Content);
+        assert_eq!(app.state.selected_workflow_run_id.as_deref(), Some("run1"));
+    }
+
+    #[test]
+    fn test_workflow_column_select_header_row_is_noop() {
+        // Global mode (selected_worktree_id = None): first visible row is a group header.
+        // Pressing Enter on a header should be a no-op.
+        let mut app = make_test_app();
+        let mut run = make_test_run("run1");
+        run.worktree_id = None;
+        app.state.data.workflow_runs = vec![run];
+        app.state.column_focus = crate::state::ColumnFocus::Workflow;
+        app.state.workflows_focus = WorkflowsFocus::Runs;
+        app.state.workflow_run_index = 0; // points at repo/target header in global mode
+        app.handle_action(Action::Select);
+        assert_eq!(app.state.view, View::Dashboard);
+        assert!(app.state.selected_workflow_run_id.is_none());
+    }
+
+    #[test]
+    fn test_back_from_workflow_run_detail_restores_workflow_column_focus() {
+        let mut app = make_test_app();
+        app.state.view = View::WorkflowRunDetail;
+        app.state.column_focus = crate::state::ColumnFocus::Content;
+        app.state.selected_workflow_run_id = Some("run1".into());
+        app.handle_action(Action::Back);
+        assert_eq!(app.state.view, View::Dashboard);
+        assert_eq!(app.state.column_focus, crate::state::ColumnFocus::Workflow);
+        assert_eq!(app.state.workflows_focus, WorkflowsFocus::Runs);
+        assert!(app.state.selected_workflow_run_id.is_none());
+    }
+
+    #[test]
+    fn test_back_from_workflow_run_detail_restores_previous_view() {
+        let mut app = make_test_app();
+        app.state.view = View::WorkflowRunDetail;
+        app.state.previous_view = Some(View::RepoDetail);
+        app.state.column_focus = crate::state::ColumnFocus::Content;
+        app.handle_action(Action::Back);
+        assert_eq!(app.state.view, View::RepoDetail);
+        assert_eq!(app.state.column_focus, crate::state::ColumnFocus::Workflow);
+        assert!(app.state.selected_workflow_run_id.is_none());
+        assert!(app.state.previous_view.is_none());
+    }
+
+    #[test]
+    fn test_focus_workflow_column_ignored_when_hidden() {
+        let mut state = crate::state::AppState::new();
+        state.workflow_column_visible = false;
+        state.column_focus = crate::state::ColumnFocus::Content;
+        // FocusWorkflowColumn should be a no-op when column is hidden
+        if state.workflow_column_visible {
+            state.column_focus = crate::state::ColumnFocus::Workflow;
+        }
+        assert_eq!(state.column_focus, crate::state::ColumnFocus::Content);
+    }
+
+    #[test]
+    fn test_focus_workflow_column_allowed_when_visible() {
+        let mut state = crate::state::AppState::new();
+        state.workflow_column_visible = true;
+        state.column_focus = crate::state::ColumnFocus::Content;
+        if state.workflow_column_visible {
+            state.column_focus = crate::state::ColumnFocus::Workflow;
+        }
+        assert_eq!(state.column_focus, crate::state::ColumnFocus::Workflow);
     }
 }

@@ -68,10 +68,9 @@ pub enum Action {
     MoveDown,
     Select,
 
-    // Views
-    GoToDashboard,
-    GoToTickets,
-    GoToWorkflows,
+    FocusContentColumn,
+    FocusWorkflowColumn,
+    ToggleWorkflowColumn,
     // CRUD triggers
     RegisterRepo,
     Create,
@@ -138,8 +137,8 @@ pub enum Action {
     // Toggle visibility of closed tickets in all ticket views
     ToggleClosedTickets,
 
-    // Toggle the global status bar expanded/collapsed (for 4+ active items)
-    ToggleStatusBar,
+    // Toggle visibility of completed/cancelled workflow runs in the workflow column
+    ToggleCompletedRuns,
 
     // Agent triggers (tmux-based)
     LaunchAgent,

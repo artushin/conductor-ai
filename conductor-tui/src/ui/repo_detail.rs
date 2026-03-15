@@ -7,7 +7,7 @@ use ratatui::Frame;
 use conductor_core::github::GithubPr;
 
 use super::helpers::{shorten_paths, visual_idx_with_headers};
-use crate::state::{AppState, RepoDetailFocus};
+use crate::state::{AppState, ColumnFocus, RepoDetailFocus};
 
 fn pr_group_key(pr: &GithubPr) -> &'static str {
     if pr.is_draft {
@@ -22,6 +22,10 @@ fn pr_group_key(pr: &GithubPr) -> &'static str {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    super::workflow_column::render_with_workflow_column(frame, area, state, render_content);
+}
+
+fn render_content(frame: &mut Frame, area: Rect, state: &AppState) {
     let repo = state
         .selected_repo_id
         .as_ref()
@@ -37,17 +41,41 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     };
 
+    // Worktrees pane: sized to content, capped at 1/3 of available height.
+    let wt_height = (state.detail_worktrees.len() as u16 + 2)
+        .max(3)
+        .min(area.height / 3);
+
+    // PRs pane: count visual rows (group headers + items), capped at 1/4 of height.
+    let pr_visual_rows = {
+        let mut count = 0u16;
+        let mut prev_group = "";
+        for pr in &state.detail_prs {
+            let g = pr_group_key(pr);
+            if g != prev_group {
+                count += 1;
+                prev_group = g;
+            }
+            count += 1;
+        }
+        count
+    };
+    let pr_height = (pr_visual_rows + 2).max(3).min(area.height / 4);
+
+    // Layout: Info | Worktrees | PRs | Tickets
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(9),
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Length(wt_height),
+            Constraint::Length(pr_height),
+            Constraint::Min(0),
         ])
         .split(area);
 
     // Repo info header
-    let info_focused = state.repo_detail_focus == RepoDetailFocus::Info;
+    let info_focused = state.column_focus == ColumnFocus::Content
+        && state.repo_detail_focus == RepoDetailFocus::Info;
     let info_border_color = if info_focused {
         state.theme.border_focused
     } else {
@@ -144,7 +172,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(info, layout[0]);
 
     // Scoped worktrees
-    let wt_focused = state.repo_detail_focus == RepoDetailFocus::Worktrees;
+    let wt_focused = state.column_focus == ColumnFocus::Content
+        && state.repo_detail_focus == RepoDetailFocus::Worktrees;
     let wt_border = if wt_focused {
         Style::default().fg(state.theme.border_focused)
     } else {
@@ -176,14 +205,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     }
     frame.render_stateful_widget(wt_list, layout[1], &mut wt_state);
 
-    // Bottom row: horizontal 50/50 split — Tickets (left) | PRs (right)
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(layout[2]);
-
     // Scoped tickets
-    let ticket_focused = state.repo_detail_focus == RepoDetailFocus::Tickets;
+    let ticket_focused = state.column_focus == ColumnFocus::Content
+        && state.repo_detail_focus == RepoDetailFocus::Tickets;
     let ticket_border = if ticket_focused {
         Style::default().fg(state.theme.border_focused)
     } else {
@@ -208,7 +232,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 .get(&t.id)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            spans.extend(super::common::ticket_label_spans_compact(labels));
+            spans.extend(super::common::ticket_label_spans_compact(
+                labels,
+                &state.theme,
+            ));
             spans.extend(super::common::ticket_agent_total_spans(
                 state, &t.id, "  ", false,
             ));
@@ -252,10 +279,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     if ticket_focused && !state.filtered_detail_tickets.is_empty() {
         ticket_state.select(Some(state.detail_ticket_index));
     }
-    frame.render_stateful_widget(ticket_list, bottom[0], &mut ticket_state);
+    frame.render_stateful_widget(ticket_list, layout[3], &mut ticket_state);
 
     // PRs pane
-    let pr_focused = state.repo_detail_focus == RepoDetailFocus::Prs;
+    let pr_focused = state.column_focus == ColumnFocus::Content
+        && state.repo_detail_focus == RepoDetailFocus::Prs;
     let pr_border = if pr_focused {
         Style::default().fg(state.theme.border_focused)
     } else {
@@ -355,5 +383,5 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         );
         pr_list_state.select(Some(visual_idx));
     }
-    frame.render_stateful_widget(pr_list, bottom[1], &mut pr_list_state);
+    frame.render_stateful_widget(pr_list, layout[2], &mut pr_list_state);
 }
