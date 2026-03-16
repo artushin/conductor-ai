@@ -116,6 +116,9 @@ enum AgentCommands {
         /// Named GitHub App bot identity to use (matches [github.apps.<name>] in config).
         #[arg(long)]
         bot_name: Option<String>,
+        /// Additional --plugin-dir arguments to pass to the Claude session
+        #[arg(long)]
+        plugin_dir: Vec<String>,
     },
     /// Orchestrate child agents: spawn a child run for each plan step
     Orchestrate {
@@ -342,6 +345,14 @@ enum RepoCommands {
         /// Set to true to allow, false to disallow
         #[arg(long, default_value = "true")]
         allow: bool,
+    },
+    /// Set plugin directories for a repo (passed as --plugin-dir to agent sessions)
+    SetPluginDirs {
+        /// Repo slug
+        slug: String,
+        /// Plugin directory paths (absolute)
+        #[arg(required = true)]
+        dirs: Vec<String>,
     },
 }
 
@@ -625,6 +636,20 @@ fn main() -> Result<()> {
                     println!("Disabled agent issue creation for {slug}");
                 }
             }
+            RepoCommands::SetPluginDirs { slug, dirs } => {
+                let mgr = RepoManager::new(&conn, &config);
+                // Validate directories
+                for dir in &dirs {
+                    let path = std::path::PathBuf::from(dir);
+                    if !path.is_dir() {
+                        eprintln!("WARNING: Directory does not exist: {dir}");
+                    } else if !path.join(".claude-plugin").join("plugin.json").is_file() {
+                        eprintln!("WARNING: No plugin.json found at {dir}");
+                    }
+                }
+                mgr.set_plugin_dirs(&slug, &dirs)?;
+                println!("Set plugin_dirs for '{slug}': {dirs:?}");
+            }
             RepoCommands::Sources { command } => {
                 let repo_mgr = RepoManager::new(&conn, &config);
                 let source_mgr = IssueSourceManager::new(&conn);
@@ -751,7 +776,7 @@ fn main() -> Result<()> {
                                         model,
                                     )?;
                                     run_agent(
-                                        &conn, &run.id, &wt.path, &prompt, None, model, None,
+                                        &conn, &run.id, &wt.path, &prompt, None, model, None, &[],
                                     )?;
                                 }
                                 Err(e) => {
@@ -834,6 +859,7 @@ fn main() -> Result<()> {
                     resume,
                     model,
                     bot_name,
+                    plugin_dir,
                 } => {
                     let resolved_prompt = match (prompt, prompt_file) {
                         (Some(p), _) => p,
@@ -851,6 +877,7 @@ fn main() -> Result<()> {
                         resume.as_deref(),
                         model.as_deref(),
                         bot_name.as_deref(),
+                        &plugin_dir,
                     )?;
                 }
                 AgentCommands::Orchestrate {
@@ -1932,6 +1959,7 @@ fn generate_plan(worktree_path: &str, prompt: &str) -> Option<Vec<PlanStep>> {
 ///
 /// Uses `--output-format json` (single JSON result) since the tmux terminal IS the display.
 /// Claude's interactive output goes directly to the terminal; we only parse the final JSON result.
+#[allow(clippy::too_many_arguments)]
 fn run_agent(
     conn: &rusqlite::Connection,
     run_id: &str,
@@ -1940,6 +1968,7 @@ fn run_agent(
     resume_session_id: Option<&str>,
     model: Option<&str>,
     bot_name: Option<&str>,
+    plugin_dirs: &[String],
 ) -> Result<()> {
     let mgr = AgentManager::new(conn);
 
@@ -2103,6 +2132,18 @@ fn run_agent(
 
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
+        }
+
+        // Add plugin directories (GAP-004)
+        for dir in plugin_dirs {
+            cmd.arg("--plugin-dir").arg(dir);
+        }
+
+        // Also check environment variable (DECISION-006)
+        if let Ok(env_dirs) = std::env::var("CONDUCTOR_PLUGIN_DIRS") {
+            for dir in env_dirs.split(':').filter(|d| !d.is_empty()) {
+                cmd.arg("--plugin-dir").arg(dir);
+            }
         }
 
         // ── open log file (create on turn 0, append on feedback resume turns) ─

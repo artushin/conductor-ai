@@ -2349,6 +2349,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             model: None,
             allow_agent_issue_creation: false,
+            plugin_dirs: Vec::new(),
         };
         state.data.repos.push(repo);
         state.data.rebuild_maps();
@@ -2762,6 +2763,7 @@ mod tests {
             created_at: String::new(),
             model: None,
             allow_agent_issue_creation: false,
+            plugin_dirs: Vec::new(),
         }];
         state.data.workflow_runs = vec![make_wf_run_with_label(
             "pr1",

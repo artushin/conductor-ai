@@ -20,6 +20,9 @@ pub struct Repo {
     pub model: Option<String>,
     /// Whether agents are allowed to create issues in the issue tracker for this repo.
     pub allow_agent_issue_creation: bool,
+    /// Plugin directories to pass to Claude sessions for this repo (DECISION-004).
+    #[serde(default)]
+    pub plugin_dirs: Vec<String>,
 }
 
 pub struct RepoManager<'a> {
@@ -72,6 +75,7 @@ impl<'a> RepoManager<'a> {
             created_at: now,
             model: None,
             allow_agent_issue_creation: false,
+            plugin_dirs: Vec::new(),
         };
 
         self.conn.execute(
@@ -96,7 +100,8 @@ impl<'a> RepoManager<'a> {
             self.conn,
             "SELECT id, slug, local_path, remote_url, default_branch, workspace_dir, created_at, \
              COALESCE(model, NULL) as model, \
-             COALESCE(allow_agent_issue_creation, 0) as allow_agent_issue_creation \
+             COALESCE(allow_agent_issue_creation, 0) as allow_agent_issue_creation, \
+             COALESCE(plugin_dirs, '[]') as plugin_dirs \
              FROM repos ORDER BY slug",
             [],
             |row| {
@@ -110,6 +115,10 @@ impl<'a> RepoManager<'a> {
                     created_at: row.get(6)?,
                     model: row.get(7)?,
                     allow_agent_issue_creation: row.get::<_, i64>(8).map(|v| v != 0)?,
+                    plugin_dirs: serde_json::from_str(
+                        &row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string()),
+                    )
+                    .unwrap_or_default(),
                 })
             },
         )
@@ -121,7 +130,8 @@ impl<'a> RepoManager<'a> {
                 "SELECT id, slug, local_path, remote_url, default_branch, workspace_dir, \
                  created_at, \
                  COALESCE(model, NULL) as model, \
-                 COALESCE(allow_agent_issue_creation, 0) as allow_agent_issue_creation \
+                 COALESCE(allow_agent_issue_creation, 0) as allow_agent_issue_creation, \
+                 COALESCE(plugin_dirs, '[]') as plugin_dirs \
                  FROM repos WHERE id = ?1",
                 params![id],
                 |row| {
@@ -135,6 +145,10 @@ impl<'a> RepoManager<'a> {
                         created_at: row.get(6)?,
                         model: row.get(7)?,
                         allow_agent_issue_creation: row.get::<_, i64>(8).map(|v| v != 0)?,
+                        plugin_dirs: serde_json::from_str(
+                            &row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string()),
+                        )
+                        .unwrap_or_default(),
                     })
                 },
             )
@@ -152,7 +166,8 @@ impl<'a> RepoManager<'a> {
                 "SELECT id, slug, local_path, remote_url, default_branch, workspace_dir, \
                  created_at, \
                  COALESCE(model, NULL) as model, \
-                 COALESCE(allow_agent_issue_creation, 0) as allow_agent_issue_creation \
+                 COALESCE(allow_agent_issue_creation, 0) as allow_agent_issue_creation, \
+                 COALESCE(plugin_dirs, '[]') as plugin_dirs \
                  FROM repos WHERE slug = ?1",
                 params![slug],
                 |row| {
@@ -166,6 +181,10 @@ impl<'a> RepoManager<'a> {
                         created_at: row.get(6)?,
                         model: row.get(7)?,
                         allow_agent_issue_creation: row.get::<_, i64>(8).map(|v| v != 0)?,
+                        plugin_dirs: serde_json::from_str(
+                            &row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string()),
+                        )
+                        .unwrap_or_default(),
                     })
                 },
             )
@@ -206,6 +225,22 @@ impl<'a> RepoManager<'a> {
         Ok(())
     }
 
+    /// Set plugin directories for a repo (DECISION-004).
+    pub fn set_plugin_dirs(&self, slug: &str, dirs: &[String]) -> Result<()> {
+        let dirs_json = serde_json::to_string(dirs)
+            .map_err(|e| ConductorError::Config(format!("serialize plugin_dirs: {e}")))?;
+        let affected = self.conn.execute(
+            "UPDATE repos SET plugin_dirs = ?1 WHERE slug = ?2",
+            params![dirs_json, slug],
+        )?;
+        if affected == 0 {
+            return Err(ConductorError::RepoNotFound {
+                slug: slug.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn unregister(&self, slug: &str) -> Result<()> {
         let affected = self
             .conn
@@ -229,6 +264,36 @@ impl<'a> RepoManager<'a> {
         }
         Ok(())
     }
+}
+
+/// Get plugin directories for a repo by ID, with env var fallback (DECISION-004, DECISION-006).
+///
+/// Returns an empty vec if the repo has no configured plugin_dirs.
+/// Also appends directories from `CONDUCTOR_PLUGIN_DIRS` env var if set.
+pub fn get_plugin_dirs_for_repo(
+    conn: &Connection,
+    repo_id: Option<&str>,
+) -> crate::error::Result<Vec<String>> {
+    let mut dirs = Vec::new();
+
+    if let Some(rid) = repo_id {
+        let config = Config::default();
+        let mgr = RepoManager::new(conn, &config);
+        if let Ok(repo) = mgr.get_by_id(rid) {
+            dirs.extend(repo.plugin_dirs);
+        }
+    }
+
+    // Also check environment variable (DECISION-006)
+    if let Ok(env_dirs) = std::env::var("CONDUCTOR_PLUGIN_DIRS") {
+        for dir in env_dirs.split(':').filter(|d| !d.is_empty()) {
+            if !dirs.iter().any(|d2| d2 == dir) {
+                dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    Ok(dirs)
 }
 
 /// Derive a repo slug from a remote URL (e.g. "https://github.com/org/repo.git" → "repo").

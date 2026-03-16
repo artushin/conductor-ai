@@ -183,6 +183,46 @@ fn find_agent_path(bases: &[&str], subdir: &Path, filename: &str) -> Option<Path
     })
 }
 
+/// Recursively search for an agent file in a directory tree.
+/// Returns the first match found (depth-first, deterministic order).
+fn find_agent_recursive(dir: &Path, filename: &str) -> Option<PathBuf> {
+    // First check direct children (fastest path)
+    let direct = dir.join(filename);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    // Then recurse into subdirectories
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut subdirs: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subdirs.sort(); // Deterministic order
+        for subdir in subdirs {
+            if let Some(found) = find_agent_recursive(&subdir, filename) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Recursively collect all .md agent files from a directory tree.
+fn collect_agents_recursive(dir: &Path, agents: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
+                agents.push(path);
+            } else if path.is_dir() {
+                collect_agents_recursive(&path, agents);
+            }
+        }
+    }
+}
+
 /// Resolve an agent by short name using the search order.
 fn load_agent_by_name(
     worktree_path: &str,
@@ -212,6 +252,26 @@ fn load_agent_by_name(
     // 3. Claude Code agents fallback (worktree, then repo)
     if let Some(path) = find_agent_path(&bases, Path::new(".claude/agents"), &filename) {
         return parse_agent_file(&path);
+    }
+
+    // 3b. Claude Code agents — recursive subdirectory search (DECISION-002)
+    for base in &bases {
+        let claude_agents_dir = PathBuf::from(base).join(".claude").join("agents");
+        if claude_agents_dir.is_dir() {
+            if let Some(path) = find_agent_recursive(&claude_agents_dir, &filename) {
+                return parse_agent_file(&path);
+            }
+        }
+    }
+
+    // 3c. Conductor agents — recursive search (DECISION-002)
+    for base in &bases {
+        let conductor_agents_dir = PathBuf::from(base).join(".conductor").join("agents");
+        if conductor_agents_dir.is_dir() {
+            if let Some(path) = find_agent_recursive(&conductor_agents_dir, &filename) {
+                return parse_agent_file(&path);
+            }
+        }
     }
 
     Err(ConductorError::AgentConfig(format!(
@@ -285,21 +345,6 @@ pub fn find_missing_agents(
         .collect()
 }
 
-/// Collect sorted `.md` entries from a directory, returning an empty vec if the
-/// directory does not exist.
-fn collect_md_entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .map_err(|e| ConductorError::AgentConfig(format!("Failed to read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    Ok(entries)
-}
-
 /// Load all agent definitions, scanning in priority order (first definition of a
 /// name wins, consistent with [`load_agent`] resolution):
 ///
@@ -321,8 +366,11 @@ pub fn load_all_agents(worktree_path: &str, repo_path: &str) -> Result<Vec<Agent
     let mut defs = Vec::new();
 
     for dir in search_dirs {
-        for entry in collect_md_entries(dir)? {
-            let def = parse_agent_file(&entry.path())?;
+        // Collect both flat and recursive entries (DECISION-002)
+        let mut agent_paths = Vec::new();
+        collect_agents_recursive(dir, &mut agent_paths);
+        for path in agent_paths {
+            let def = parse_agent_file(&path)?;
             if seen_names.insert(def.name.clone()) {
                 defs.push(def);
             }

@@ -182,6 +182,7 @@ pub fn spawn_child_tmux(
     model: Option<&str>,
     window_name: &str,
     bot_name: Option<&str>,
+    plugin_dirs: &[String],
 ) -> std::result::Result<(), String> {
     let mut args = vec![
         "agent".to_string(),
@@ -202,6 +203,12 @@ pub fn spawn_child_tmux(
     if let Some(b) = bot_name {
         args.push("--bot-name".to_string());
         args.push(b.to_string());
+    }
+
+    // Add plugin directories (GAP-004)
+    for dir in plugin_dirs {
+        args.push("--plugin-dir".to_string());
+        args.push(dir.clone());
     }
 
     spawn_tmux_window(&args, window_name)

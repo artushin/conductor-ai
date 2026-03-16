@@ -617,6 +617,17 @@ pub fn run(conn: &Connection) -> Result<()> {
         bump_version(conn, 35)?;
     }
 
+    // Migration 036: add plugin_dirs column to repos (DECISION-004).
+    let has_plugin_dirs: bool = conn
+        .prepare("SELECT plugin_dirs FROM repos LIMIT 0")
+        .is_ok();
+    if !has_plugin_dirs {
+        conn.execute_batch(include_str!("migrations/036_repo_plugin_dirs.sql"))?;
+    }
+    if version < 36 {
+        bump_version(conn, 36)?;
+    }
+
     Ok(())
 }
 

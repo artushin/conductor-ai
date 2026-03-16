@@ -1970,6 +1970,8 @@ struct ExecutionState<'a> {
     resume_ctx: Option<ResumeContext>,
     /// Default named GitHub App bot identity inherited from a parent `call workflow { as = "..." }`.
     default_bot_name: Option<String>,
+    /// Plugin directories to pass to child agent sessions (DECISION-004).
+    plugin_dirs: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2199,6 +2201,8 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         block_with: Vec::new(),
         resume_ctx: None,
         default_bot_name: input.default_bot_name.clone(),
+        plugin_dirs: crate::repo::get_plugin_dirs_for_repo(conn, input.repo_id)
+            .unwrap_or_default(),
     };
 
     run_workflow_engine(&mut state, workflow)
@@ -2624,6 +2628,8 @@ pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult
         block_with: Vec::new(),
         resume_ctx,
         default_bot_name: wf_run.default_bot_name.clone(),
+        plugin_dirs: crate::repo::get_plugin_dirs_for_repo(conn, wf_run.repo_id.as_deref())
+            .unwrap_or_default(),
     };
 
     run_workflow_engine(&mut state, &workflow)
@@ -2974,6 +2980,7 @@ fn execute_call_with_schema(
             step_model,
             &child_window,
             effective_bot_name,
+            &state.plugin_dirs,
         ) {
             tracing::warn!("Failed to spawn child: {e}");
             let _ = state
@@ -3872,6 +3879,7 @@ fn execute_parallel(
             step_model,
             &window_name,
             state.default_bot_name.as_deref(),
+            &state.plugin_dirs,
         ) {
             tracing::warn!("Failed to spawn parallel agent '{agent_label}': {e}");
             let _ = state
@@ -5237,6 +5245,7 @@ mod tests {
             block_with: Vec::new(),
             resume_ctx: None,
             default_bot_name: None,
+            plugin_dirs: Vec::new(),
         };
         (state, run_id)
     }
@@ -6304,6 +6313,7 @@ And here is my actual output:
             block_with: Vec::new(),
             resume_ctx: None,
             default_bot_name: None,
+            plugin_dirs: Vec::new(),
         }
     }
 
@@ -6717,6 +6727,7 @@ And here is my actual output:
             block_with: Vec::new(),
             resume_ctx: None,
             default_bot_name: None,
+            plugin_dirs: Vec::new(),
         }
     }
 
