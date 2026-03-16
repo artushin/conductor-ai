@@ -8,7 +8,7 @@ use crate::agent_config::AgentSpec;
 use crate::error::{ConductorError, Result};
 use crate::workflow_dsl::{
     ApprovalMode, CallNode, CallWorkflowNode, DoNode, DoWhileNode, GateNode, GateType, IfNode,
-    OnTimeout, ParallelNode, UnlessNode, WhileNode,
+    OnTimeout, ParallelNode, ScriptNode, UnlessNode, WhileNode,
 };
 
 use super::engine::{
@@ -18,7 +18,7 @@ use super::engine::{
 };
 use super::helpers::{find_max_completed_while_iteration, sanitize_tmux_name};
 use super::output::{interpret_agent_output, parse_conductor_output};
-use super::prompt_builder::{build_agent_prompt, build_variable_map};
+use super::prompt_builder::{build_agent_prompt, build_variable_map, substitute_variables};
 use super::status::{WorkflowRunStatus, WorkflowStepStatus};
 use super::types::ContextEntry;
 
@@ -264,6 +264,7 @@ fn execute_call_with_schema(
                         Some(completed_run.id),
                         iteration,
                         structured_json,
+                        None,
                     );
 
                     return Ok(());
@@ -464,6 +465,7 @@ pub(super) fn execute_call_workflow(
                     Some(result.workflow_run_id.clone()),
                     iteration,
                     None,
+                    None,
                 );
 
                 for (key, value) in child_steps {
@@ -629,6 +631,7 @@ pub(super) fn execute_call_workflow(
                         context,
                         Some(result.workflow_run_id.clone()),
                         iteration,
+                        None,
                         None,
                     );
 
@@ -1322,6 +1325,7 @@ pub(super) fn execute_parallel(
         context: String::new(),
         child_run_id: None,
         structured_output: None,
+        output_file: None,
     };
     state
         .step_results
@@ -1723,6 +1727,833 @@ pub(super) fn handle_gate_timeout(
                 None,
             )?;
             Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Script step executor
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes read from a script's stdout file into memory.
+/// Output beyond this limit is truncated with a notice appended.
+const MAX_STDOUT_BYTES: usize = 100 * 1024; // 100 KB
+
+/// Read at most [`MAX_STDOUT_BYTES`] from `path`, returning a UTF-8 string.
+/// If the file is larger than the limit the content is truncated and a notice
+/// is appended so callers can see that truncation occurred.
+fn read_stdout_bounded(path: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(MAX_STDOUT_BYTES + 1);
+    f.by_ref()
+        .take((MAX_STDOUT_BYTES + 1) as u64)
+        .read_to_end(&mut buf)?;
+    let truncated = buf.len() > MAX_STDOUT_BYTES;
+    if truncated {
+        buf.truncate(MAX_STDOUT_BYTES);
+    }
+    let mut s = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        s.push_str("\n...[output truncated at 100 KB]");
+    }
+    Ok(s)
+}
+
+/// Outcome of polling a spawned script child process.
+enum ScriptPollResult {
+    /// Process exited with success (exit code 0).
+    Succeeded,
+    /// Process exited with failure (non-zero exit code or wait error).
+    Failed(String),
+    /// Script exceeded its timeout; the process has been killed.
+    TimedOut,
+    /// Workflow shutdown signal received; the process has been killed.
+    Cancelled,
+}
+
+/// Poll a child process until it exits, times out, or the shutdown signal fires.
+///
+/// Checks the shutdown flag and elapsed time every 200 ms using `try_wait`.
+fn poll_script_child(
+    child: &mut std::process::Child,
+    timeout_secs: Option<u64>,
+    shutdown: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> ScriptPollResult {
+    let poll_interval = Duration::from_millis(200);
+    let start = std::time::Instant::now();
+
+    loop {
+        // Check shutdown signal
+        if let Some(flag) = shutdown {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ScriptPollResult::Cancelled;
+            }
+        }
+
+        // Check per-step timeout
+        if let Some(timeout) = timeout_secs {
+            if start.elapsed().as_secs() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ScriptPollResult::TimedOut;
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return ScriptPollResult::Succeeded;
+                } else {
+                    return ScriptPollResult::Failed(format!(
+                        "script exited with non-zero status: {status}"
+                    ));
+                }
+            }
+            Ok(None) => thread::sleep(poll_interval),
+            Err(e) => {
+                return ScriptPollResult::Failed(format!("wait error: {e}"));
+            }
+        }
+    }
+}
+
+/// Resolve a script path using the standard search order:
+/// 1. Absolute paths are used as-is.
+/// 2. Relative paths are tried against `working_dir`, then `repo_path`,
+///    then `~/.claude/skills/`.
+fn resolve_script_path(
+    run: &str,
+    working_dir: &str,
+    repo_path: &str,
+) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(run);
+    if p.is_absolute() {
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+        return None;
+    }
+
+    // Worktree dir
+    let candidate = std::path::Path::new(working_dir).join(run);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+
+    // Repo dir
+    let candidate = std::path::Path::new(repo_path).join(run);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+
+    // ~/.claude/skills/
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = std::path::Path::new(&home)
+            .join(".claude")
+            .join("skills")
+            .join(run);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+pub(super) fn execute_script(
+    state: &mut ExecutionState<'_>,
+    node: &ScriptNode,
+    iteration: u32,
+) -> Result<()> {
+    let pos = state.position;
+    state.position += 1;
+
+    // Check skip on resume
+    if should_skip(state, &node.name, iteration) {
+        tracing::info!(
+            "Skipping completed script step '{}' (iteration {})",
+            node.name,
+            iteration
+        );
+        restore_step(state, &node.name, iteration);
+        return Ok(());
+    }
+
+    let step_key = node.name.clone();
+    let step_label = node.name.as_str();
+
+    // Build variable map for substitution
+    let vars = build_variable_map(state);
+
+    // Resolve script path (substitute variables in run path first)
+    let run_path_raw = substitute_variables(&node.run, &vars);
+    let resolved_path = resolve_script_path(&run_path_raw, &state.working_dir, &state.repo_path)
+        .ok_or_else(|| {
+            ConductorError::Workflow(format!(
+                "Script step '{}': script '{}' not found in worktree, repo, or ~/.claude/skills/",
+                step_label, run_path_raw
+            ))
+        })?;
+
+    // Resolve env var values
+    let resolved_env: std::collections::HashMap<String, String> = node
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), substitute_variables(v, &vars)))
+        .collect();
+
+    // Retry loop
+    let max_attempts = 1 + node.retries;
+    let mut last_error = String::new();
+
+    for attempt in 0..max_attempts {
+        let step_id = state.wf_mgr.insert_step(
+            &state.workflow_run_id,
+            step_label,
+            "script",
+            false,
+            pos,
+            iteration as i64,
+        )?;
+
+        state.wf_mgr.update_step_status(
+            &step_id,
+            WorkflowStepStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            Some(attempt as i64),
+        )?;
+
+        // Create a temp file for the script's stdout
+        let output_path = format!("{}/script-{}.out", state.working_dir, step_id);
+        let output_file = std::fs::File::create(&output_path).map_err(|e| {
+            ConductorError::Workflow(format!(
+                "Script step '{}': failed to create output file: {e}",
+                step_label
+            ))
+        })?;
+
+        tracing::info!(
+            "Script step '{}' (attempt {}/{}): running '{}'",
+            step_label,
+            attempt + 1,
+            max_attempts,
+            resolved_path.display(),
+        );
+
+        let spawn_result = Command::new(&resolved_path)
+            .envs(&resolved_env)
+            .stdout(output_file)
+            .stderr(std::process::Stdio::inherit())
+            .current_dir(&state.working_dir)
+            .spawn();
+
+        let mut child = match spawn_result {
+            Ok(c) => c,
+            Err(e) => {
+                let err = format!(
+                    "Script step '{}': failed to spawn '{}': {e}",
+                    step_label,
+                    resolved_path.display()
+                );
+                tracing::warn!("{err}");
+                state.wf_mgr.update_step_status(
+                    &step_id,
+                    WorkflowStepStatus::Failed,
+                    None,
+                    Some(&err),
+                    None,
+                    None,
+                    Some(attempt as i64),
+                )?;
+                last_error = err;
+                continue;
+            }
+        };
+
+        match poll_script_child(
+            &mut child,
+            node.timeout,
+            state.exec_config.shutdown.as_ref(),
+        ) {
+            ScriptPollResult::Succeeded => {
+                let stdout = read_stdout_bounded(&output_path).map_err(|e| {
+                    ConductorError::Workflow(format!(
+                        "Script step '{}': failed to read stdout file '{}': {e}",
+                        step_label, output_path
+                    ))
+                })?;
+                let parsed = parse_conductor_output(&stdout);
+                let (markers, context) = match parsed {
+                    Some(out) => (out.markers, out.context),
+                    None => {
+                        // Fallback: use truncated stdout as context
+                        let truncated: String = stdout.chars().take(2000).collect();
+                        (Vec::new(), truncated)
+                    }
+                };
+
+                let markers_json = serde_json::to_string(&markers).unwrap_or_default();
+
+                tracing::info!(
+                    "Script step '{}' completed: markers={:?}",
+                    step_label,
+                    markers,
+                );
+
+                state.wf_mgr.update_step_status(
+                    &step_id,
+                    WorkflowStepStatus::Completed,
+                    None,
+                    Some(&stdout),
+                    Some(&context),
+                    Some(&markers_json),
+                    Some(attempt as i64),
+                )?;
+                state.wf_mgr.set_step_output_file(&step_id, &output_path)?;
+
+                record_step_success(
+                    state,
+                    step_key.clone(),
+                    step_label,
+                    Some(stdout),
+                    None,
+                    None,
+                    None,
+                    markers,
+                    context,
+                    None,
+                    iteration,
+                    None,
+                    Some(output_path),
+                );
+
+                return Ok(());
+            }
+
+            ScriptPollResult::Failed(err) => {
+                // Try to capture stdout so the failure message includes script output
+                let stdout_snippet = read_stdout_bounded(&output_path)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        let snippet: String = s.chars().take(2000).collect();
+                        format!("\n--- script stdout ---\n{snippet}")
+                    })
+                    .unwrap_or_default();
+                let full_err = format!("{err}{stdout_snippet}");
+                tracing::warn!(
+                    "Script step '{}' failed (attempt {}/{}): {err}",
+                    step_label,
+                    attempt + 1,
+                    max_attempts,
+                );
+                state.wf_mgr.update_step_status(
+                    &step_id,
+                    WorkflowStepStatus::Failed,
+                    None,
+                    Some(&full_err),
+                    None,
+                    None,
+                    Some(attempt as i64),
+                )?;
+                last_error = full_err;
+                // continue to next attempt
+            }
+
+            ScriptPollResult::TimedOut => {
+                let msg = format!(
+                    "script step '{}' timed out after {}s",
+                    step_label,
+                    node.timeout.unwrap_or(0)
+                );
+                tracing::warn!("{msg}");
+                state.wf_mgr.update_step_status(
+                    &step_id,
+                    WorkflowStepStatus::TimedOut,
+                    None,
+                    Some(&msg),
+                    None,
+                    None,
+                    Some(attempt as i64),
+                )?;
+                state.all_succeeded = false;
+                if state.exec_config.fail_fast {
+                    return Err(ConductorError::Workflow(msg));
+                }
+                return Ok(());
+            }
+
+            ScriptPollResult::Cancelled => {
+                let msg = format!("script step '{step_label}' cancelled: workflow shutdown");
+                state.wf_mgr.update_step_status(
+                    &step_id,
+                    WorkflowStepStatus::Failed,
+                    None,
+                    Some(&msg),
+                    None,
+                    None,
+                    Some(attempt as i64),
+                )?;
+                return Err(ConductorError::Workflow(msg));
+            }
+        }
+    }
+
+    // All retries exhausted — run on_fail agent if specified
+    if let Some(ref on_fail_agent) = node.on_fail {
+        run_on_fail_agent(
+            state,
+            step_label,
+            on_fail_agent,
+            &last_error,
+            node.retries,
+            iteration,
+        );
+    }
+
+    record_step_failure(state, step_key, step_label, last_error, max_attempts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Shared test helper: build an ExecutionState backed by a real in-memory DB.
+    // -----------------------------------------------------------------------
+
+    /// Build an `ExecutionState` wired to a real in-memory SQLite connection.
+    ///
+    /// The caller owns the `Connection`; the state borrows it.  `working_dir`
+    /// and `repo_path` are both set to `dir`.
+    fn make_test_state<'a>(
+        conn: &'a rusqlite::Connection,
+        config: &'a crate::config::Config,
+        dir: &str,
+        exec_config: crate::workflow::types::WorkflowExecConfig,
+    ) -> ExecutionState<'a> {
+        let agent_mgr = crate::agent::AgentManager::new(conn);
+        let parent = agent_mgr
+            .create_run(Some("w1"), "test", None, None)
+            .unwrap();
+        let wf_mgr = crate::workflow::manager::WorkflowManager::new(conn);
+        let run = wf_mgr
+            .create_workflow_run("test-wf", Some("w1"), &parent.id, false, "manual", None)
+            .unwrap();
+        ExecutionState {
+            conn,
+            config,
+            workflow_run_id: run.id,
+            workflow_name: "test-wf".into(),
+            worktree_id: None,
+            working_dir: dir.to_string(),
+            worktree_slug: String::new(),
+            repo_path: dir.to_string(),
+            ticket_id: None,
+            repo_id: None,
+            model: None,
+            exec_config,
+            inputs: std::collections::HashMap::new(),
+            agent_mgr: crate::agent::AgentManager::new(conn),
+            wf_mgr: crate::workflow::manager::WorkflowManager::new(conn),
+            parent_run_id: String::new(),
+            depth: 0,
+            target_label: None,
+            step_results: std::collections::HashMap::new(),
+            contexts: Vec::new(),
+            position: 0,
+            all_succeeded: true,
+            total_cost: 0.0,
+            total_turns: 0,
+            total_duration_ms: 0,
+            last_gate_feedback: None,
+            last_structured_output: None,
+            last_output_file: None,
+            block_output: None,
+            block_with: Vec::new(),
+            resume_ctx: None,
+            default_bot_name: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_script_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_script_path_absolute_exists() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let result = resolve_script_path(&path, "/nonexistent", "/nonexistent");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn test_resolve_script_path_absolute_missing() {
+        let result = resolve_script_path("/nonexistent/path/script.sh", "/wd", "/repo");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_script_path_relative_in_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi").unwrap();
+        let working_dir = dir.path().to_str().unwrap();
+        let result = resolve_script_path("run.sh", working_dir, "/nonexistent");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), script);
+    }
+
+    #[test]
+    fn test_resolve_script_path_relative_in_repo_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("ci.sh");
+        std::fs::write(&script, "#!/bin/sh\necho ci").unwrap();
+        let repo_path = dir.path().to_str().unwrap();
+        let result = resolve_script_path("ci.sh", "/nonexistent", repo_path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), script);
+    }
+
+    #[test]
+    fn test_resolve_script_path_not_found() {
+        let result = resolve_script_path("totally-missing.sh", "/nonexistent", "/nonexistent");
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // read_stdout_bounded tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_stdout_bounded_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        let s = read_stdout_bounded(path.to_str().unwrap()).unwrap();
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn test_read_stdout_bounded_large_file_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // Write 200 KB of data (over the 100 KB limit)
+        let data = "A".repeat(200 * 1024);
+        std::fs::write(&path, &data).unwrap();
+        let s = read_stdout_bounded(path.to_str().unwrap()).unwrap();
+        assert!(s.len() < data.len(), "output should be truncated");
+        assert!(
+            s.contains("[output truncated at 100 KB]"),
+            "truncation notice should be present"
+        );
+    }
+
+    #[test]
+    fn test_read_stdout_bounded_missing_file() {
+        let result = read_stdout_bounded("/nonexistent/path/file.txt");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_script integration tests
+    // -----------------------------------------------------------------------
+
+    /// Write a shell script to `path`, make it executable, and return the absolute path string.
+    fn write_script(path: &std::path::Path, body: &str) -> String {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_execute_script_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_script(
+            &dir.path().join("hello.sh"),
+            "#!/bin/sh\necho '<<<CONDUCTOR_OUTPUT>>>\n{\"markers\": [\"done\"], \"context\": \"ran ok\"}\n<<<END_CONDUCTOR_OUTPUT>>>'",
+        );
+
+        let conn = crate::test_helpers::setup_db();
+        let config = Box::leak(Box::new(crate::config::Config::default()));
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mut state = make_test_state(
+            &conn,
+            config,
+            &dir_str,
+            crate::workflow::types::WorkflowExecConfig::default(),
+        );
+
+        let node = crate::workflow_dsl::ScriptNode {
+            name: "hello".into(),
+            run: script_path,
+            env: std::collections::HashMap::new(),
+            timeout: Some(10),
+            retries: 0,
+            on_fail: None,
+        };
+
+        let result = execute_script(&mut state, &node, 0);
+        assert!(result.is_ok(), "execute_script should succeed: {result:?}");
+        assert!(state.all_succeeded);
+        let step_res = state.step_results.get("hello").unwrap();
+        assert!(step_res.markers.contains(&"done".to_string()));
+        assert_eq!(step_res.context, "ran ok");
+        assert!(
+            state.last_output_file.is_some(),
+            "last_output_file should be set"
+        );
+    }
+
+    #[test]
+    fn test_execute_script_failure_captures_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_script(
+            &dir.path().join("fail.sh"),
+            "#!/bin/sh\necho 'something before failure'\nexit 1",
+        );
+
+        let conn = crate::test_helpers::setup_db();
+        let config = Box::leak(Box::new(crate::config::Config::default()));
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mut state = make_test_state(
+            &conn,
+            config,
+            &dir_str,
+            crate::workflow::types::WorkflowExecConfig {
+                fail_fast: false,
+                ..Default::default()
+            },
+        );
+
+        let node = crate::workflow_dsl::ScriptNode {
+            name: "fail".into(),
+            run: script_path,
+            env: std::collections::HashMap::new(),
+            timeout: Some(10),
+            retries: 0,
+            on_fail: None,
+        };
+
+        // Should return Ok (not an Err) because fail_fast is false; all_succeeded flips false
+        let result = execute_script(&mut state, &node, 0);
+        assert!(result.is_ok());
+        assert!(!state.all_succeeded);
+        let step_res = state.step_results.get("fail").unwrap();
+        // The result_text should contain the stdout snippet
+        let result_text = step_res.result_text.as_deref().unwrap_or("");
+        assert!(
+            result_text.contains("something before failure"),
+            "stdout should be captured in failure result, got: {result_text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // poll_script_child unit tests — timeout and cancellation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_poll_script_child_timeout() {
+        // Spawn a long-running process; timeout=0 fires immediately.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let result = poll_script_child(&mut child, Some(0), None);
+        assert!(
+            matches!(result, ScriptPollResult::TimedOut),
+            "expected TimedOut, got other variant"
+        );
+    }
+
+    #[test]
+    fn test_poll_script_child_cancelled() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let flag = Arc::new(AtomicBool::new(true)); // already cancelled
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let result = poll_script_child(&mut child, None, Some(&flag));
+        assert!(
+            matches!(result, ScriptPollResult::Cancelled),
+            "expected Cancelled, got other variant"
+        );
+        // Verify flag didn't reset
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_script — timeout path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_script_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_script(&dir.path().join("slow.sh"), "#!/bin/sh\nsleep 60");
+
+        let conn = crate::test_helpers::setup_db();
+        let config = Box::leak(Box::new(crate::config::Config::default()));
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mut state = make_test_state(
+            &conn,
+            config,
+            &dir_str,
+            crate::workflow::types::WorkflowExecConfig {
+                fail_fast: false,
+                ..Default::default()
+            },
+        );
+
+        let node = crate::workflow_dsl::ScriptNode {
+            name: "slow".into(),
+            run: script_path,
+            env: std::collections::HashMap::new(),
+            timeout: Some(0), // expires immediately
+            retries: 0,
+            on_fail: None,
+        };
+
+        let result = execute_script(&mut state, &node, 0);
+        // fail_fast=false → returns Ok, but all_succeeded is false
+        assert!(
+            result.is_ok(),
+            "expected Ok on timeout with fail_fast=false: {result:?}"
+        );
+        assert!(
+            !state.all_succeeded,
+            "all_succeeded should be false after timeout"
+        );
+
+        // DB step should be marked TimedOut
+        let steps = state
+            .wf_mgr
+            .get_workflow_steps(&state.workflow_run_id)
+            .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].status,
+            super::super::status::WorkflowStepStatus::TimedOut
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_script — cancellation path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_script_cancelled() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_script(&dir.path().join("cancel.sh"), "#!/bin/sh\nsleep 60");
+
+        let shutdown = Arc::new(AtomicBool::new(true)); // pre-cancelled
+        let conn = crate::test_helpers::setup_db();
+        let config = Box::leak(Box::new(crate::config::Config::default()));
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mut state = make_test_state(
+            &conn,
+            config,
+            &dir_str,
+            crate::workflow::types::WorkflowExecConfig {
+                shutdown: Some(Arc::clone(&shutdown)),
+                ..Default::default()
+            },
+        );
+
+        let node = crate::workflow_dsl::ScriptNode {
+            name: "cancel".into(),
+            run: script_path,
+            env: std::collections::HashMap::new(),
+            timeout: None,
+            retries: 0,
+            on_fail: None,
+        };
+
+        let result = execute_script(&mut state, &node, 0);
+        assert!(result.is_err(), "expected Err on cancellation");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cancel") || err_msg.contains("cancelled"),
+            "error message should mention cancellation: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("cancel"), // step name included
+            "error message should include step name 'cancel': {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_script — retry path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_script_retries_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_script(&dir.path().join("flaky.sh"), "#!/bin/sh\nexit 1");
+
+        let conn = crate::test_helpers::setup_db();
+        let config = Box::leak(Box::new(crate::config::Config::default()));
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mut state = make_test_state(
+            &conn,
+            config,
+            &dir_str,
+            crate::workflow::types::WorkflowExecConfig {
+                fail_fast: false, // don't short-circuit on first failure
+                ..Default::default()
+            },
+        );
+        let run_id = state.workflow_run_id.clone();
+
+        let node = crate::workflow_dsl::ScriptNode {
+            name: "flaky".into(),
+            run: script_path,
+            env: std::collections::HashMap::new(),
+            timeout: Some(10),
+            retries: 2, // 3 attempts total
+            on_fail: None,
+        };
+
+        let result = execute_script(&mut state, &node, 0);
+        assert!(
+            result.is_ok(),
+            "fail_fast=false: expected Ok after retries: {result:?}"
+        );
+        assert!(
+            !state.all_succeeded,
+            "all_succeeded should be false after exhausting retries"
+        );
+
+        // Three step records should exist (one per attempt)
+        let steps = state.wf_mgr.get_workflow_steps(&run_id).unwrap();
+        assert_eq!(
+            steps.len(),
+            3,
+            "expected 3 step DB records (one per attempt), got {}",
+            steps.len()
+        );
+        for step in &steps {
+            assert_eq!(
+                step.status,
+                super::super::status::WorkflowStepStatus::Failed,
+                "each attempt should be marked Failed"
+            );
         }
     }
 }
