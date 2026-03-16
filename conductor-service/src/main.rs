@@ -182,6 +182,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&sock)?;
     tracing::info!("Conductor daemon listening on {:?}", sock);
 
+    // PE checkpoint watcher (polling every 5 seconds)
+    let pe_watcher = tokio::spawn(async {
+        let path = pe_checkpoint_path();
+        let mut last_modified = None;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            if path.exists() {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    let modified = metadata.modified().ok();
+                    if modified != last_modified {
+                        last_modified = modified;
+                        tracing::info!("PE checkpoint updated: {:?}", path);
+                        // Parse checkpoint and log state changes
+                        // For v1, just log the update — future versions will create conductor gates
+                        if let Ok(contents) = std::fs::read_to_string(&path) {
+                            if let Ok(checkpoint) =
+                                serde_json::from_str::<serde_json::Value>(&contents)
+                            {
+                                if let Some(state) = checkpoint.get("state") {
+                                    tracing::info!("PE state: {}", state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // Main event loop
     loop {
         tokio::select! {
@@ -218,6 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Stop the PE watcher
+    pe_watcher.abort();
 
     // Cleanup
     release_pid_lock();

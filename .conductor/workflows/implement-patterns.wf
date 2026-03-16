@@ -1,0 +1,36 @@
+workflow implement-patterns {
+  meta {
+    description = "Implement patterns into a target repo via PE"
+    trigger     = "manual"
+  }
+
+  inputs {
+    target_repo  required
+    target_path  required
+    pe_path      default = "/usr/local/bsg/pattern-extractor"
+    profile      default = "agentic-sdlc-full"
+  }
+
+  # Step 1: Onboard target
+  call pe-onboard {
+    output = "onboard-result"
+  }
+
+  gate human_review {
+    prompt  = "Review onboard results: binding.json, degradation levels. Approve to proceed."
+    timeout = "72h"
+    on_timeout = fail
+  }
+
+  # Step 2: Run implementation cycle
+  call pe-implement {
+    output  = "implement-result"
+    retries = 1
+  }
+
+  gate human_review {
+    prompt  = "Review implementation results and applied milestones."
+    timeout = "72h"
+    on_timeout = fail
+  }
+}

@@ -1,0 +1,51 @@
+workflow bsg-pattern-sync {
+  meta {
+    description = "Detect and remediate pattern drift across BSG repos"
+    trigger     = "manual"
+  }
+
+  inputs {
+    pe_path default = "/usr/local/bsg/pattern-extractor"
+  }
+
+  # Assess each target repo
+  # NOTE: parallel assessment would require separate pe-assess-{target} agents
+  # For v1, run sequentially
+
+  call pe-assess {
+    output = "assess-agent-arch"
+  }
+
+  call pe-assess {
+    output = "assess-fsm-engine"
+  }
+
+  call pe-assess {
+    output = "assess-vantage"
+  }
+
+  # Check for drift — if any assessment shows fidelity < 80
+  if assess-agent-arch.fidelity_below_80 {
+    gate human_review {
+      prompt  = "Pattern drift detected in agent-architecture. Review assessment."
+      timeout = "72h"
+      on_timeout = fail
+    }
+  }
+
+  if assess-fsm-engine.fidelity_below_80 {
+    gate human_review {
+      prompt  = "Pattern drift detected in fsm-engine. Review assessment."
+      timeout = "72h"
+      on_timeout = fail
+    }
+  }
+
+  if assess-vantage.fidelity_below_80 {
+    gate human_review {
+      prompt  = "Pattern drift detected in vantage. Review assessment."
+      timeout = "72h"
+      on_timeout = fail
+    }
+  }
+}

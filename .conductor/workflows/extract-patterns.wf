@@ -1,0 +1,47 @@
+workflow extract-patterns {
+  meta {
+    description = "Run EDLC pattern extraction pipeline against a source repo"
+    trigger     = "manual"
+  }
+
+  inputs {
+    source_repo required
+    source_path required
+    pe_path     default = "/usr/local/bsg/pattern-extractor"
+  }
+
+  # Step 1: Discover patterns in source
+  call pe-discover {
+    output  = "discover-result"
+    retries = 1
+  }
+
+  gate human_review {
+    prompt  = "Review Pattern Discovery Report. Approve to proceed with operational capture."
+    timeout = "72h"
+    on_timeout = fail
+  }
+
+  # Step 2: Capture operational structures
+  call pe-operate {
+    output  = "operate-result"
+    retries = 1
+  }
+
+  # Step 3: Extract patterns
+  call pe-extract {
+    output  = "extract-result"
+    retries = 1
+  }
+
+  # Step 4: Assess fidelity
+  call pe-assess {
+    output = "assess-result"
+  }
+
+  gate human_review {
+    prompt  = "Review extraction results and fidelity assessment. Approve to complete."
+    timeout = "72h"
+    on_timeout = fail
+  }
+}
