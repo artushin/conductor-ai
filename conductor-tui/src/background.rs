@@ -19,8 +19,8 @@ use crate::event::BackgroundSender;
 
 /// Detect workflow runs that have freshly transitioned to a terminal status.
 ///
-/// Returns a `Vec` of `(workflow_name, target_label, succeeded)` tuples for
-/// each run that moved from a non-terminal (or unknown) state into
+/// Returns a `Vec` of `(run_id, workflow_name, target_label, succeeded)` tuples
+/// for each run that moved from a non-terminal (or unknown) state into
 /// `Completed`/`Failed` since the last call.
 ///
 /// `seen` is updated in-place: stale entries (runs no longer present in
@@ -33,7 +33,7 @@ pub(crate) fn detect_new_terminal_transitions<'a>(
     runs: impl Iterator<Item = &'a conductor_core::workflow::WorkflowRun>,
     seen: &mut std::collections::HashMap<String, conductor_core::workflow::WorkflowRunStatus>,
     initialized: &mut bool,
-) -> Vec<(String, Option<String>, bool)> {
+) -> Vec<(String, String, Option<String>, bool)> {
     use conductor_core::workflow::WorkflowRunStatus;
 
     let runs: Vec<_> = runs.collect();
@@ -49,6 +49,7 @@ pub(crate) fn detect_new_terminal_transitions<'a>(
             let status_changed = prev_status.map(|s| s != &run.status).unwrap_or(true);
             if now_terminal && status_changed {
                 transitions.push((
+                    run.id.clone(),
                     run.workflow_name.clone(),
                     run.target_label.clone(),
                     matches!(run.status, WorkflowRunStatus::Completed),
@@ -69,30 +70,76 @@ pub(crate) fn detect_new_terminal_transitions<'a>(
 
 /// Spawn the DB poller thread. Polls every `interval` and sends DataRefreshed events.
 pub fn spawn_db_poller(tx: BackgroundSender, interval: Duration) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     thread::spawn(move || {
         let mut seen: HashMap<String, conductor_core::workflow::WorkflowRunStatus> = HashMap::new();
         // On the first poll `seen` is empty, so every pre-existing terminal run would
         // look like a fresh transition. Skip notifications until the map is seeded.
         let mut initialized = false;
+        // Track IDs that have already been notified this session so we skip redundant
+        // INSERT OR IGNORE attempts on every subsequent tick.
+        let mut notified_feedback_ids: HashSet<String> = HashSet::new();
+        let mut notified_gate_ids: HashSet<String> = HashSet::new();
         loop {
             thread::sleep(interval);
-            if let Some((action, config)) = poll_data() {
+            if let Some((action, config, conn)) = poll_data() {
                 if let Action::DataRefreshed(ref payload) = action {
+                    // Reuse the connection returned by poll_data() — no need to open a
+                    // second connection just for notification claims.
+                    let claim_conn = if config.notifications.enabled {
+                        Some(conn)
+                    } else {
+                        None
+                    };
+
                     let all_runs = payload
                         .latest_workflow_runs_by_worktree
                         .values()
                         .chain(payload.active_non_worktree_workflow_runs.iter());
                     let transitions =
                         detect_new_terminal_transitions(all_runs, &mut seen, &mut initialized);
-                    for (workflow_name, target_label, succeeded) in transitions {
-                        crate::notify::fire_workflow_notification(
-                            &config.notifications,
-                            &workflow_name,
-                            target_label.as_deref(),
-                            succeeded,
-                        );
+                    for (run_id, workflow_name, target_label, succeeded) in transitions {
+                        if let Some(ref conn) = claim_conn {
+                            crate::notify::fire_workflow_notification(
+                                conn,
+                                &config.notifications,
+                                &run_id,
+                                &workflow_name,
+                                target_label.as_deref(),
+                                succeeded,
+                            );
+                        }
+                    }
+
+                    // Fire feedback-requested notifications, skipping IDs already notified
+                    // this session to avoid a redundant INSERT OR IGNORE on every tick.
+                    if let Some(ref conn) = claim_conn {
+                        for req in &payload.pending_feedback_requests {
+                            if notified_feedback_ids.insert(req.id.clone()) {
+                                crate::notify::fire_feedback_notification(
+                                    conn,
+                                    &config.notifications,
+                                    &req.id,
+                                    &req.prompt,
+                                );
+                            }
+                        }
+                    }
+
+                    // Fire gate-waiting notifications, skipping already-notified step IDs.
+                    if let Some(ref conn) = claim_conn {
+                        for (step, workflow_name) in &payload.waiting_gate_steps {
+                            if notified_gate_ids.insert(step.id.clone()) {
+                                crate::notify::fire_gate_notification(
+                                    conn,
+                                    &config.notifications,
+                                    &step.id,
+                                    &step.step_name,
+                                    workflow_name,
+                                );
+                            }
+                        }
                     }
                 }
                 if !tx.send(action) {
@@ -103,8 +150,10 @@ pub fn spawn_db_poller(tx: BackgroundSender, interval: Duration) {
     });
 }
 
-/// Poll all data from the database. Returns a DataRefreshed action and the loaded config if successful.
-pub fn poll_data() -> Option<(Action, conductor_core::config::Config)> {
+/// Poll all data from the database. Returns a DataRefreshed action, the loaded config, and the
+/// open DB connection so the caller can reuse it (e.g. for notification claims) without opening
+/// a second connection on the same tick.
+pub fn poll_data() -> Option<(Action, conductor_core::config::Config, rusqlite::Connection)> {
     let db = db_path();
     let conn = open_database(&db).ok()?;
     let config = load_config().unwrap_or_else(|e| {
@@ -195,6 +244,26 @@ pub fn poll_data() -> Option<(Action, conductor_core::config::Config)> {
         .get_step_summaries_for_runs(&active_run_id_refs)
         .unwrap_or_default();
 
+    // Only run notification-specific queries when notifications are enabled.
+    let pending_feedback_requests = if config.notifications.enabled {
+        agent_mgr
+            .list_all_pending_feedback_requests()
+            .unwrap_or_else(|e| {
+                tracing::warn!("list_all_pending_feedback_requests failed: {e}");
+                vec![]
+            })
+    } else {
+        vec![]
+    };
+    let waiting_gate_steps = if config.notifications.enabled {
+        wf_mgr.list_all_waiting_gate_steps().unwrap_or_else(|e| {
+            tracing::warn!("list_all_waiting_gate_steps failed: {e}");
+            vec![]
+        })
+    } else {
+        vec![]
+    };
+
     let action = Action::DataRefreshed(Box::new(DataRefreshedPayload {
         repos,
         worktrees,
@@ -205,8 +274,10 @@ pub fn poll_data() -> Option<(Action, conductor_core::config::Config)> {
         latest_workflow_runs_by_worktree,
         workflow_step_summaries,
         active_non_worktree_workflow_runs,
+        pending_feedback_requests,
+        waiting_gate_steps,
     }));
-    Some((action, config))
+    Some((action, config, conn))
 }
 
 /// Spawn the ticket sync timer. Syncs all repos every `interval`.
@@ -710,8 +781,9 @@ mod tests {
         let tick2 = [make_run("r1", "deploy", WorkflowRunStatus::Completed)];
         let t2 = detect_new_terminal_transitions(tick2.iter(), &mut seen, &mut initialized);
         assert_eq!(t2.len(), 1);
-        assert_eq!(t2[0].0, "deploy");
-        assert!(t2[0].2, "should be succeeded=true for Completed");
+        assert_eq!(t2[0].0, "r1", "run_id should be r1");
+        assert_eq!(t2[0].1, "deploy");
+        assert!(t2[0].3, "should be succeeded=true for Completed");
     }
 
     /// A run that transitions from Running → Failed must report succeeded=false.
@@ -726,7 +798,7 @@ mod tests {
         let tick2 = [make_run("r1", "build", WorkflowRunStatus::Failed)];
         let t2 = detect_new_terminal_transitions(tick2.iter(), &mut seen, &mut initialized);
         assert_eq!(t2.len(), 1);
-        assert!(!t2[0].2, "should be succeeded=false for Failed");
+        assert!(!t2[0].3, "should be succeeded=false for Failed");
     }
 
     /// A run that was already terminal on tick 1 must NOT fire again on tick 2
@@ -788,8 +860,9 @@ mod tests {
             1,
             "Failed→Completed must fire exactly one notification"
         );
-        assert_eq!(t2[0].0, "ci");
-        assert!(t2[0].2, "should be succeeded=true for Completed");
+        assert_eq!(t2[0].0, "r1", "run_id should be r1");
+        assert_eq!(t2[0].1, "ci", "workflow_name should be ci");
+        assert!(t2[0].3, "should be succeeded=true for Completed");
     }
 
     /// A brand-new run that appears already-terminal on the second tick (e.g.
@@ -810,6 +883,7 @@ mod tests {
         ];
         let t2 = detect_new_terminal_transitions(tick2.iter(), &mut seen, &mut initialized);
         assert_eq!(t2.len(), 1);
-        assert_eq!(t2[0].0, "fast-job");
+        assert_eq!(t2[0].0, "r2", "run_id should be r2");
+        assert_eq!(t2[0].1, "fast-job");
     }
 }

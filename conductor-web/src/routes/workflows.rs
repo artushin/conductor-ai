@@ -16,7 +16,30 @@ use conductor_core::worktree::WorktreeManager;
 
 use crate::error::ApiError;
 use crate::events::ConductorEvent;
+use crate::notify::fire_workflow_notification;
 use crate::state::AppState;
+
+/// Open a throwaway DB connection and fire a workflow completion notification.
+/// Logs a warning and returns if the DB cannot be opened.
+fn notify_workflow(
+    notifications: &conductor_core::config::NotificationConfig,
+    run_id: &str,
+    workflow_name: &str,
+    label: Option<&str>,
+    succeeded: bool,
+) {
+    match conductor_core::db::open_database(&conductor_core::config::db_path()) {
+        Ok(conn) => fire_workflow_notification(
+            &conn,
+            notifications,
+            run_id,
+            workflow_name,
+            label,
+            succeeded,
+        ),
+        Err(e) => tracing::warn!("notification skipped — DB open failed: {e}"),
+    }
+}
 
 // ── Response types ────────────────────────────────────────────────────
 
@@ -211,9 +234,11 @@ pub async fn run_workflow(
 
                 let wf_name = workflow_name.clone();
                 let label = wt_target_label.clone();
+                let notify_run_id = res.workflow_run_id.clone();
                 tokio::task::spawn_blocking(move || {
-                    crate::notify::fire_workflow_notification(
+                    notify_workflow(
                         &notifications,
+                        &notify_run_id,
                         &wf_name,
                         Some(&label),
                         succeeded,
@@ -233,12 +258,10 @@ pub async fn run_workflow(
                 let wf_name = workflow_name.clone();
                 let label = wt_target_label.clone();
                 tokio::task::spawn_blocking(move || {
-                    crate::notify::fire_workflow_notification(
-                        &notifications,
-                        &wf_name,
-                        Some(&label),
-                        false,
-                    );
+                    // No run_id was returned on error; use a fresh ULID so the
+                    // dedup claim always passes (no pre-existing log entry).
+                    let error_run_id = ulid::Ulid::new().to_string();
+                    notify_workflow(&notifications, &error_run_id, &wf_name, Some(&label), false);
                 });
             }
         }
@@ -419,8 +442,9 @@ pub async fn resume_workflow_endpoint(
                 let succeeded = res.all_succeeded;
                 let status = if succeeded { "completed" } else { "failed" };
 
-                crate::notify::fire_workflow_notification(
+                notify_workflow(
                     &notifications,
+                    &res.workflow_run_id,
                     &workflow_name,
                     target_label.as_deref(),
                     succeeded,
@@ -436,8 +460,9 @@ pub async fn resume_workflow_endpoint(
             }
             Err(e) => {
                 tracing::error!("Workflow resume failed: {e}");
-                crate::notify::fire_workflow_notification(
+                notify_workflow(
                     &notifications,
+                    &params.workflow_run_id,
                     &workflow_name,
                     target_label.as_deref(),
                     false,
