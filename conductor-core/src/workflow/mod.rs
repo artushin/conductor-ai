@@ -16,7 +16,7 @@ pub(crate) mod types;
 
 // Re-export DSL types so consumers go through `workflow::` instead of `workflow_dsl::` directly.
 pub use crate::workflow_dsl::{
-    collect_agent_names, collect_workflow_refs, detect_workflow_cycles,
+    collect_agent_names, collect_workflow_refs, detect_workflow_cycles, validate_script_steps,
     validate_workflow_semantics, AgentRef, AlwaysNode, CallNode, CallWorkflowNode, DoNode,
     DoWhileNode, GateNode, GateType, IfNode, InputDecl, ParallelNode, UnlessNode, ValidationError,
     ValidationReport, WhileNode, WorkflowDef, WorkflowNode, WorkflowTrigger, WorkflowWarning,
