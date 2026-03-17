@@ -30,14 +30,17 @@ impl<'a> WorkflowManager<'a> {
     /// Returns counts of active workflow runs (pending / running / waiting) per repo_id.
     /// Repos with no active runs are absent from the map. Rows where repo_id IS NULL are skipped.
     pub fn active_run_counts_by_repo(&self) -> Result<HashMap<String, ActiveWorkflowCounts>> {
-        let mut stmt = self.conn.prepare_cached(
+        let placeholders = sql_placeholders(WorkflowRunStatus::ACTIVE.len());
+        let sql = format!(
             "SELECT repo_id, status, COUNT(*) AS cnt \
              FROM workflow_runs \
-             WHERE status IN ('pending', 'running', 'waiting') \
+             WHERE status IN ({placeholders}) \
                AND repo_id IS NOT NULL \
-             GROUP BY repo_id, status",
-        )?;
-        let rows = stmt.query_map([], |row| {
+             GROUP BY repo_id, status"
+        );
+        let active_strings = WorkflowRunStatus::active_strings();
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(active_strings.iter()), |row| {
             let repo_id: String = row.get(0)?;
             let status: String = row.get(1)?;
             let cnt: u32 = row.get(2)?;
@@ -565,13 +568,19 @@ impl<'a> WorkflowManager<'a> {
     /// Return the first active (pending/running/waiting) top-level workflow run for a worktree,
     /// or `None` if none exist.
     pub fn get_active_run_for_worktree(&self, worktree_id: &str) -> Result<Option<WorkflowRun>> {
+        let placeholders = sql_placeholders_from(WorkflowRunStatus::ACTIVE.len(), 2);
+        let active_strings = WorkflowRunStatus::active_strings();
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM workflow_runs \
+             WHERE worktree_id = ?1 AND status IN ({placeholders}) \
+             LIMIT 1"
+        );
+        let mut all_params: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Text(worktree_id.to_owned())];
+        all_params.extend(active_strings.into_iter().map(rusqlite::types::Value::Text));
         let result = self.conn.query_row(
-            &format!(
-                "SELECT {RUN_COLUMNS} FROM workflow_runs \
-                 WHERE worktree_id = ?1 AND status IN ('pending', 'running', 'waiting') \
-                 LIMIT 1"
-            ),
-            params![worktree_id],
+            &sql,
+            rusqlite::params_from_iter(all_params.iter()),
             row_to_workflow_run,
         );
         match result {
@@ -691,14 +700,8 @@ impl<'a> WorkflowManager<'a> {
         &self,
         statuses: &[WorkflowRunStatus],
     ) -> Result<Vec<WorkflowRun>> {
-        let default_statuses;
         let effective: &[WorkflowRunStatus] = if statuses.is_empty() {
-            default_statuses = [
-                WorkflowRunStatus::Running,
-                WorkflowRunStatus::Waiting,
-                WorkflowRunStatus::Pending,
-            ];
-            &default_statuses
+            &WorkflowRunStatus::ACTIVE
         } else {
             statuses
         };
@@ -1178,22 +1181,41 @@ impl<'a> WorkflowManager<'a> {
             ),
             None => ("", ""),
         };
+        let active_strings = WorkflowRunStatus::active_strings();
+        let active_placeholders = match repo_id {
+            Some(_) => sql_placeholders_from(WorkflowRunStatus::ACTIVE.len(), 2),
+            None => sql_placeholders(WorkflowRunStatus::ACTIVE.len()),
+        };
         let sql = format!(
             "SELECT {cols}, r.workflow_name, r.target_label \
              FROM workflow_run_steps s \
              JOIN workflow_runs r ON r.id = s.workflow_run_id{ej} \
              WHERE s.gate_type IS NOT NULL AND s.status = 'waiting' \
-             AND r.status IN ('pending', 'running', 'waiting'){ew} \
+             AND r.status IN ({ai}){ew} \
              ORDER BY s.started_at",
             cols = &*STEP_COLUMNS_WITH_PREFIX,
             ej = extra_join,
+            ai = active_placeholders,
             ew = extra_where,
         );
         match repo_id {
             Some(id) => {
-                crate::db::query_collect(self.conn, &sql, [id], waiting_gate_step_row_mapper)
+                let mut all_params: Vec<rusqlite::types::Value> =
+                    vec![rusqlite::types::Value::Text(id.to_owned())];
+                all_params.extend(active_strings.into_iter().map(rusqlite::types::Value::Text));
+                crate::db::query_collect(
+                    self.conn,
+                    &sql,
+                    rusqlite::params_from_iter(all_params.iter()),
+                    waiting_gate_step_row_mapper,
+                )
             }
-            None => crate::db::query_collect(self.conn, &sql, [], waiting_gate_step_row_mapper),
+            None => crate::db::query_collect(
+                self.conn,
+                &sql,
+                rusqlite::params_from_iter(active_strings.iter()),
+                waiting_gate_step_row_mapper,
+            ),
         }
     }
 
@@ -1408,10 +1430,15 @@ impl<'a> WorkflowManager<'a> {
 /// Returns a comma-separated list of numbered SQLite positional placeholders:
 /// `?1, ?2, …, ?n`.  Returns an empty string when `n == 0`.
 fn sql_placeholders(n: usize) -> String {
+    sql_placeholders_from(n, 1)
+}
+
+/// `?start, ?{start+1}, …, ?{start+n-1}`.  Returns an empty string when `n == 0`.
+fn sql_placeholders_from(n: usize, start: usize) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(n.saturating_mul(4));
-    for i in 1..=n {
-        if i > 1 {
+    for i in start..start + n {
+        if i > start {
             s.push_str(", ");
         }
         write!(s, "?{i}").unwrap();
@@ -1879,6 +1906,13 @@ mod tests {
         assert_eq!(sql_placeholders(0), "");
         assert_eq!(sql_placeholders(1), "?1");
         assert_eq!(sql_placeholders(3), "?1, ?2, ?3");
+    }
+
+    #[test]
+    fn test_sql_placeholders_from_non_one_start() {
+        assert_eq!(sql_placeholders_from(0, 5), "");
+        assert_eq!(sql_placeholders_from(1, 2), "?2");
+        assert_eq!(sql_placeholders_from(3, 4), "?4, ?5, ?6");
     }
 
     #[test]
