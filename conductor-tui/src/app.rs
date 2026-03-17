@@ -14,7 +14,9 @@ use conductor_core::github;
 use conductor_core::issue_source::IssueSourceManager;
 use conductor_core::repo::{derive_local_path, derive_slug_from_url, RepoManager};
 use conductor_core::tickets::{build_agent_prompt, TicketSyncer};
-use conductor_core::workflow::{parse_workflow_str, MetadataEntry, WorkflowWarning};
+use conductor_core::workflow::{
+    parse_workflow_str, MetadataEntry, WorkflowWarning, ENGINE_INJECTED_KEYS,
+};
 use conductor_core::worktree::WorktreeManager;
 
 use crate::action::{Action, GithubDiscoverPayload};
@@ -57,6 +59,39 @@ fn wrap_decrement(index: &mut usize, len: usize) {
         *index -= 1;
     } else {
         *index = len.saturating_sub(1);
+    }
+}
+
+/// Find the nearest non-readonly field by traversing `fields` from `start`.
+///
+/// `forward` selects the traversal direction.  Returns `None` when every
+/// field is readonly or the slice is empty, meaning no movement is possible.
+fn advance_form_field(fields: &[FormField], start: usize, forward: bool) -> Option<usize> {
+    let len = fields.len();
+    if len == 0 {
+        return None;
+    }
+    let step = |idx: usize| -> usize {
+        if forward {
+            (idx + 1) % len
+        } else if idx == 0 {
+            len - 1
+        } else {
+            idx - 1
+        }
+    };
+    let mut idx = step(start);
+    while idx != start {
+        if !fields[idx].readonly {
+            return Some(idx);
+        }
+        idx = step(idx);
+    }
+    // No non-readonly field found other than start; check start itself.
+    if !fields[start].readonly {
+        Some(start)
+    } else {
+        None
     }
 }
 
@@ -200,6 +235,7 @@ fn build_form_fields(inputs: &[conductor_core::workflow::InputDecl]) -> Vec<Form
                 },
                 manually_edited: false,
                 required: inp.required,
+                readonly: false,
                 field_type,
             }
         })
@@ -2729,6 +2765,7 @@ impl App {
                     placeholder: "https://github.com/org/repo.git".to_string(),
                     manually_edited: true,
                     required: true,
+                    readonly: false,
                     field_type: FormFieldType::Text,
                 },
                 FormField {
@@ -2737,6 +2774,7 @@ impl App {
                     placeholder: "auto-derived from URL".to_string(),
                     manually_edited: false,
                     required: true,
+                    readonly: false,
                     field_type: FormFieldType::Text,
                 },
                 FormField {
@@ -2745,6 +2783,7 @@ impl App {
                     placeholder: "auto-derived from slug".to_string(),
                     manually_edited: false,
                     required: false,
+                    readonly: false,
                     field_type: FormFieldType::Text,
                 },
             ],
@@ -2763,8 +2802,10 @@ impl App {
         } = self.state.modal
         {
             if let Some(field) = fields.get_mut(active_field) {
-                field.value.push(c);
-                field.manually_edited = true;
+                if !field.readonly {
+                    field.value.push(c);
+                    field.manually_edited = true;
+                }
             }
             // Auto-derive dependent fields
             match on_submit {
@@ -2790,10 +2831,12 @@ impl App {
         } = self.state.modal
         {
             if let Some(field) = fields.get_mut(active_field) {
-                field.value.pop();
-                // If field emptied and it's a derived field, reset to auto-derive
-                if field.value.is_empty() && active_field > 0 {
-                    field.manually_edited = false;
+                if !field.readonly {
+                    field.value.pop();
+                    // If field emptied and it's a derived field, reset to auto-derive
+                    if field.value.is_empty() && active_field > 0 {
+                        field.manually_edited = false;
+                    }
                 }
             }
             match on_submit {
@@ -2816,7 +2859,9 @@ impl App {
             ..
         } = self.state.modal
         {
-            *active_field = (*active_field + 1) % fields.len();
+            if let Some(next) = advance_form_field(fields, *active_field, true) {
+                *active_field = next;
+            }
         }
     }
 
@@ -2827,10 +2872,8 @@ impl App {
             ..
         } = self.state.modal
         {
-            if *active_field == 0 {
-                *active_field = fields.len() - 1;
-            } else {
-                *active_field -= 1;
+            if let Some(prev) = advance_form_field(fields, *active_field, false) {
+                *active_field = prev;
             }
         }
     }
@@ -2878,6 +2921,7 @@ impl App {
                 placeholder: "e.g. project = PROJ AND status != Done".to_string(),
                 manually_edited: false,
                 required: true,
+                readonly: false,
                 field_type: FormFieldType::Text,
             });
             fields.push(FormField {
@@ -2886,6 +2930,7 @@ impl App {
                 placeholder: "e.g. https://mycompany.atlassian.net".to_string(),
                 manually_edited: false,
                 required: true,
+                readonly: false,
                 field_type: FormFieldType::Text,
             });
         } else if !is_jira && fields.len() > 1 {
@@ -2927,17 +2972,19 @@ impl App {
         } = self.state.modal
         {
             if let Some(field) = fields.get_mut(active_field) {
-                if matches!(field.field_type, FormFieldType::Boolean) {
-                    field.value = if field.value == "true" {
-                        "false".to_string()
+                if !field.readonly {
+                    if matches!(field.field_type, FormFieldType::Boolean) {
+                        field.value = if field.value == "true" {
+                            "false".to_string()
+                        } else {
+                            "true".to_string()
+                        };
+                        field.manually_edited = true;
                     } else {
-                        "true".to_string()
-                    };
-                    field.manually_edited = true;
-                } else {
-                    // For text fields, treat space as a regular character input
-                    field.value.push(' ');
-                    field.manually_edited = true;
+                        // For text fields, treat space as a regular character input
+                        field.value.push(' ');
+                        field.manually_edited = true;
+                    }
                 }
             }
         }
@@ -3080,10 +3127,19 @@ impl App {
                     field.manually_edited = true;
                 }
             }
+            // Mark engine-injected fields as readonly when they have been pre-populated
+            for field in &mut fields {
+                if ENGINE_INJECTED_KEYS.contains(&field.label.as_str()) && !field.value.is_empty() {
+                    field.readonly = true;
+                    field.manually_edited = false;
+                }
+            }
+            // Start cursor on the first editable field (or 0 as fallback)
+            let first_editable = fields.iter().position(|f| !f.readonly).unwrap_or(0);
             self.state.modal = Modal::Form {
                 title: format!("Inputs for '{}'", def.name),
                 fields,
-                active_field: 0,
+                active_field: first_editable,
                 on_submit: crate::state::FormAction::RunWorkflow(Box::new(
                     crate::state::RunWorkflowAction {
                         target,
@@ -3312,6 +3368,7 @@ impl App {
                 placeholder: "github or jira (Tab to next field)".to_string(),
                 manually_edited: false,
                 required: true,
+                readonly: false,
                 field_type: FormFieldType::Text,
             }];
 
@@ -6758,5 +6815,67 @@ workflow my-wf {
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name, "pr_url");
         assert!(decls[0].required);
+    }
+
+    fn make_field(readonly: bool) -> FormField {
+        FormField {
+            label: String::new(),
+            value: String::new(),
+            placeholder: String::new(),
+            manually_edited: false,
+            required: false,
+            readonly,
+            field_type: crate::state::FormFieldType::Text,
+        }
+    }
+
+    #[test]
+    fn test_advance_form_field_forward_skips_readonly() {
+        // [editable, readonly, editable] — from 0 forward should land on 2
+        let fields = vec![make_field(false), make_field(true), make_field(false)];
+        assert_eq!(advance_form_field(&fields, 0, true), Some(2));
+    }
+
+    #[test]
+    fn test_advance_form_field_backward_skips_readonly() {
+        // [editable, readonly, editable] — from 2 backward should land on 0
+        let fields = vec![make_field(false), make_field(true), make_field(false)];
+        assert_eq!(advance_form_field(&fields, 2, false), Some(0));
+    }
+
+    #[test]
+    fn test_advance_form_field_wraps_forward() {
+        // [editable, editable, editable] — from last position wraps to 0
+        let fields = vec![make_field(false), make_field(false), make_field(false)];
+        assert_eq!(advance_form_field(&fields, 2, true), Some(0));
+    }
+
+    #[test]
+    fn test_advance_form_field_wraps_backward() {
+        // [editable, editable] — from 0 backward wraps to last
+        let fields = vec![make_field(false), make_field(false)];
+        assert_eq!(advance_form_field(&fields, 0, false), Some(1));
+    }
+
+    #[test]
+    fn test_advance_form_field_all_readonly_returns_none() {
+        let fields = vec![make_field(true), make_field(true), make_field(true)];
+        assert_eq!(advance_form_field(&fields, 0, true), None);
+        assert_eq!(advance_form_field(&fields, 0, false), None);
+    }
+
+    #[test]
+    fn test_advance_form_field_empty_returns_none() {
+        let fields: Vec<FormField> = vec![];
+        assert_eq!(advance_form_field(&fields, 0, true), None);
+        assert_eq!(advance_form_field(&fields, 0, false), None);
+    }
+
+    #[test]
+    fn test_advance_form_field_only_start_editable() {
+        // All others are readonly — should stay at start
+        let fields = vec![make_field(false), make_field(true), make_field(true)];
+        assert_eq!(advance_form_field(&fields, 0, true), Some(0));
+        assert_eq!(advance_form_field(&fields, 0, false), Some(0));
     }
 }
