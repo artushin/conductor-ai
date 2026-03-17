@@ -13,8 +13,8 @@ use crate::workflow_dsl;
 use super::constants::{RUN_COLUMNS, STEP_COLUMNS, STEP_COLUMNS_WITH_PREFIX};
 use super::status::{WorkflowRunStatus, WorkflowStepStatus};
 use super::types::{
-    ActiveWorkflowCounts, StepKey, WorkflowRun, WorkflowRunContext, WorkflowRunStep,
-    WorkflowStepSummary,
+    ActiveWorkflowCounts, PendingGateRow, StepKey, WorkflowRun, WorkflowRunContext,
+    WorkflowRunStep, WorkflowStepSummary,
 };
 
 /// Manages workflow definitions, execution, and persistence.
@@ -1152,71 +1152,53 @@ impl<'a> WorkflowManager<'a> {
     pub fn list_all_waiting_gate_steps(
         &self,
     ) -> Result<Vec<(WorkflowRunStep, String, Option<String>)>> {
-        self.list_waiting_gate_steps_scoped(None)
+        let placeholders = sql_placeholders(WorkflowRunStatus::ACTIVE.len());
+        let active_strings = WorkflowRunStatus::active_strings();
+        let sql = format!(
+            "SELECT {cols}, r.workflow_name, r.target_label \
+             FROM workflow_run_steps s \
+             JOIN workflow_runs r ON r.id = s.workflow_run_id \
+             WHERE s.gate_type IS NOT NULL AND s.status = 'waiting' \
+             AND r.status IN ({placeholders}) \
+             ORDER BY s.started_at",
+            cols = &*STEP_COLUMNS_WITH_PREFIX,
+        );
+        crate::db::query_collect(
+            self.conn,
+            &sql,
+            rusqlite::params_from_iter(active_strings.iter()),
+            waiting_gate_step_row_mapper,
+        )
     }
 
     /// List gate steps currently in `waiting` status for a specific repo.
     ///
-    /// Same as `list_all_waiting_gate_steps` but scoped to `repo_id`. Used by the TUI repo detail
-    /// view to populate the Pending Gates pane.
-    pub fn list_waiting_gate_steps_for_repo(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<(WorkflowRunStep, String, Option<String>)>> {
-        self.list_waiting_gate_steps_scoped(Some(repo_id))
-    }
-
-    /// Shared implementation for listing waiting gate steps, optionally scoped to a repo.
-    ///
-    /// When `repo_id` is `Some`, the query adds a `LEFT JOIN worktrees` and filters to runs whose
-    /// `repo_id` matches directly or via their linked worktree.
-    fn list_waiting_gate_steps_scoped(
-        &self,
-        repo_id: Option<&str>,
-    ) -> Result<Vec<(WorkflowRunStep, String, Option<String>)>> {
-        let (extra_join, extra_where) = match repo_id {
-            Some(_) => (
-                " LEFT JOIN worktrees wt ON wt.id = r.worktree_id",
-                " AND (r.repo_id = ?1 OR wt.repo_id = ?1)",
-            ),
-            None => ("", ""),
-        };
+    /// Returns enriched [`PendingGateRow`] values that include the worktree branch and linked
+    /// ticket source_id so the TUI can display context without additional queries.
+    pub fn list_waiting_gate_steps_for_repo(&self, repo_id: &str) -> Result<Vec<PendingGateRow>> {
+        let placeholders = sql_placeholders_from(WorkflowRunStatus::ACTIVE.len(), 2);
         let active_strings = WorkflowRunStatus::active_strings();
-        let active_placeholders = match repo_id {
-            Some(_) => sql_placeholders_from(WorkflowRunStatus::ACTIVE.len(), 2),
-            None => sql_placeholders(WorkflowRunStatus::ACTIVE.len()),
-        };
         let sql = format!(
-            "SELECT {cols}, r.workflow_name, r.target_label \
+            "SELECT {cols}, r.workflow_name, r.target_label, wt.branch, t.source_id AS ticket_ref \
              FROM workflow_run_steps s \
-             JOIN workflow_runs r ON r.id = s.workflow_run_id{ej} \
+             JOIN workflow_runs r ON r.id = s.workflow_run_id \
+             LEFT JOIN worktrees wt ON wt.id = r.worktree_id \
+             LEFT JOIN tickets t ON t.id = r.ticket_id \
              WHERE s.gate_type IS NOT NULL AND s.status = 'waiting' \
-             AND r.status IN ({ai}){ew} \
+             AND r.status IN ({placeholders}) \
+             AND (r.repo_id = ?1 OR wt.repo_id = ?1) \
              ORDER BY s.started_at",
             cols = &*STEP_COLUMNS_WITH_PREFIX,
-            ej = extra_join,
-            ai = active_placeholders,
-            ew = extra_where,
         );
-        match repo_id {
-            Some(id) => {
-                let mut all_params: Vec<rusqlite::types::Value> =
-                    vec![rusqlite::types::Value::Text(id.to_owned())];
-                all_params.extend(active_strings.into_iter().map(rusqlite::types::Value::Text));
-                crate::db::query_collect(
-                    self.conn,
-                    &sql,
-                    rusqlite::params_from_iter(all_params.iter()),
-                    waiting_gate_step_row_mapper,
-                )
-            }
-            None => crate::db::query_collect(
-                self.conn,
-                &sql,
-                rusqlite::params_from_iter(active_strings.iter()),
-                waiting_gate_step_row_mapper,
-            ),
-        }
+        let mut all_params: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Text(repo_id.to_owned())];
+        all_params.extend(active_strings.into_iter().map(rusqlite::types::Value::Text));
+        crate::db::query_collect(
+            self.conn,
+            &sql,
+            rusqlite::params_from_iter(all_params.iter()),
+            pending_gate_row_mapper,
+        )
     }
 
     /// Load workflow definitions from the filesystem for a worktree.
@@ -1512,6 +1494,21 @@ fn waiting_gate_step_row_mapper(
     let workflow_name: String = row.get("workflow_name")?;
     let target_label: Option<String> = row.get("target_label")?;
     Ok((step, workflow_name, target_label))
+}
+
+fn pending_gate_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingGateRow> {
+    let step = row_to_workflow_step(row)?;
+    let workflow_name: String = row.get("workflow_name")?;
+    let target_label: Option<String> = row.get("target_label")?;
+    let branch: Option<String> = row.get("branch")?;
+    let ticket_ref: Option<String> = row.get("ticket_ref")?;
+    Ok(PendingGateRow {
+        step,
+        workflow_name,
+        target_label,
+        branch,
+        ticket_ref,
+    })
 }
 
 pub(super) fn row_to_workflow_step(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRunStep> {
@@ -2440,11 +2437,20 @@ mod tests {
             1,
             "worktree-linked gate step must appear for its repo"
         );
-        let (step, workflow_name, target_label) = &steps[0];
-        assert_eq!(step.id, step_id);
-        assert_eq!(step.step_name, "approval-gate");
-        assert_eq!(workflow_name, "wf");
-        assert!(target_label.is_none());
+        let row = &steps[0];
+        assert_eq!(row.step.id, step_id);
+        assert_eq!(row.step.step_name, "approval-gate");
+        assert_eq!(row.workflow_name, "wf");
+        assert!(row.target_label.is_none());
+        assert_eq!(
+            row.branch.as_deref(),
+            Some("feat/test"),
+            "branch must be propagated from the worktree"
+        );
+        assert!(
+            row.ticket_ref.is_none(),
+            "no ticket linked to this worktree"
+        );
     }
 
     #[test]
@@ -2467,7 +2473,51 @@ mod tests {
             1,
             "directly-linked gate step must appear for its repo"
         );
-        assert_eq!(steps[0].0.id, step_id);
+        assert_eq!(steps[0].step.id, step_id);
+        assert!(
+            steps[0].branch.is_none(),
+            "repo-targeted run has no worktree branch"
+        );
+        assert!(
+            steps[0].ticket_ref.is_none(),
+            "no ticket linked to this run"
+        );
+    }
+
+    #[test]
+    fn test_list_waiting_gate_steps_for_repo_ticket_ref_populated() {
+        // When the workflow run has a linked ticket, ticket_ref must be the ticket's source_id.
+        let conn = setup_db();
+        let mgr = WorkflowManager::new(&conn);
+        let run = create_worktree_run(&conn, "w1");
+
+        // Insert a ticket and link it to the workflow run.
+        conn.execute(
+            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, url, synced_at, raw_json) \
+             VALUES ('ticket-1', 'r1', 'github', '42', 'Fix bug', '', 'open', '[]', '', '2024-01-01T00:00:00Z', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workflow_runs SET ticket_id = 'ticket-1' WHERE id = ?1",
+            [&run.id],
+        )
+        .unwrap();
+
+        let step_id = mgr
+            .insert_step(&run.id, "approval-gate", "gate", false, 0, 0)
+            .unwrap();
+        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+            .unwrap();
+        set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
+
+        let steps = mgr.list_waiting_gate_steps_for_repo("r1").unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].ticket_ref.as_deref(),
+            Some("42"),
+            "ticket_ref must be the ticket's source_id"
+        );
     }
 
     #[test]
@@ -2490,7 +2540,7 @@ mod tests {
 
         let steps_r2 = mgr.list_waiting_gate_steps_for_repo("r2").unwrap();
         assert_eq!(steps_r2.len(), 1, "r2 should return its own gate step");
-        assert_eq!(steps_r2[0].0.id, step_id);
+        assert_eq!(steps_r2[0].step.id, step_id);
     }
 
     #[test]

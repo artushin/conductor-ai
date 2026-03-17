@@ -1,26 +1,47 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
-use crate::state::AppState;
+use crate::state::{AppState, WorkflowsFocus};
 
-/// Render the persistent workflow column split into Defs (top 40%) and Runs (bottom 60%).
+/// Render the persistent workflow column split into Defs, optional Gates, and Runs.
 pub fn render_workflow_column(frame: &mut Frame, area: Rect, state: &AppState) {
     if !state.workflow_column_visible || area.width < 20 {
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
+    let render_lower = |frame: &mut Frame, area: Rect, state: &AppState| {
+        if state.workflows_focus == WorkflowsFocus::Defs
+            && state.workflow_def_focus == crate::state::WorkflowDefFocus::Steps
+        {
+            super::workflows::render_def_steps(frame, area, state);
+        } else {
+            super::workflows::render_runs(frame, area, state);
+        }
+    };
 
-    super::workflows::render_defs(frame, chunks[0], state);
-    if state.workflows_focus == crate::state::WorkflowsFocus::Defs
-        && state.workflow_def_focus == crate::state::WorkflowDefFocus::Steps
-    {
-        super::workflows::render_def_steps(frame, chunks[1], state);
+    // Split area into top 40% for defs and the remainder for gates+runs.
+    let top_rest = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(40), Constraint::Min(0)])
+        .split(area);
+    let (defs_area, rest_area) = (top_rest[0], top_rest[1]);
+
+    super::workflows::render_defs(frame, defs_area, state);
+
+    if !state.detail_gates.is_empty() {
+        let gate_height = (state.detail_gates.len() as u16 + 2)
+            .max(3)
+            .min(area.height / 4);
+        let gate_lower = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(gate_height), Constraint::Min(0)])
+            .split(rest_area);
+
+        let gates_focused = state.workflows_focus == WorkflowsFocus::Gates;
+        super::pending_gates::render_pending_gates(frame, gate_lower[0], state, gates_focused);
+        render_lower(frame, gate_lower[1], state);
     } else {
-        super::workflows::render_runs(frame, chunks[1], state);
+        render_lower(frame, rest_area, state);
     }
 }
 
