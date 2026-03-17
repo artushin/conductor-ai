@@ -53,8 +53,8 @@ pub(super) fn tool_validate_workflow(
     use conductor_core::repo::RepoManager;
     use conductor_core::workflow::WorkflowManager;
     use conductor_core::workflow::{
-        collect_agent_names, detect_workflow_cycles, validate_script_steps,
-        validate_workflow_semantics,
+        collect_agent_names, default_skills_dir, detect_workflow_cycles, make_script_resolver,
+        validate_script_steps, validate_workflow_semantics,
     };
 
     let repo_slug = require_arg!(args, "repo");
@@ -126,7 +126,14 @@ pub(super) fn tool_validate_workflow(
             errors.push(err.message.clone());
         }
     }
-    let script_errors = validate_script_steps(&workflow, wt_path, repo_path);
+    let script_errors = validate_script_steps(
+        &workflow,
+        &make_script_resolver(
+            wt_path.to_string(),
+            repo_path.to_string(),
+            default_skills_dir(),
+        ),
+    );
     for err in &script_errors {
         if let Some(hint) = &err.hint {
             errors.push(format!("{} (hint: {hint})", err.message));
