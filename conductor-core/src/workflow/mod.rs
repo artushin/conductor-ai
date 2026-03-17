@@ -17,10 +17,10 @@ pub(crate) mod types;
 // Re-export DSL types so consumers go through `workflow::` instead of `workflow_dsl::` directly.
 pub use crate::workflow_dsl::{
     collect_agent_names, collect_workflow_refs, detect_workflow_cycles, validate_script_steps,
-    validate_workflow_semantics, AgentRef, AlwaysNode, CallNode, CallWorkflowNode, DoNode,
-    DoWhileNode, GateNode, GateType, IfNode, InputDecl, ParallelNode, UnlessNode, ValidationError,
-    ValidationReport, WhileNode, WorkflowDef, WorkflowNode, WorkflowTrigger, WorkflowWarning,
-    MAX_WORKFLOW_DEPTH,
+    validate_workflow_semantics, AgentRef, AlwaysNode, CallNode, CallWorkflowNode, Condition,
+    DoNode, DoWhileNode, GateNode, GateType, IfNode, InputDecl, InputType, ParallelNode,
+    UnlessNode, ValidationError, ValidationReport, WhileNode, WorkflowDef, WorkflowNode,
+    WorkflowTrigger, WorkflowWarning, MAX_WORKFLOW_DEPTH,
 };
 
 // Re-export all public types and functions to preserve existing import paths.
@@ -1757,6 +1757,7 @@ And here is my actual output:
             required: true,
             default: None,
             description: None,
+            input_type: Default::default(),
         }];
 
         let result = resolve_child_inputs(&raw, &vars, &decls).unwrap();
@@ -1775,6 +1776,7 @@ And here is my actual output:
             required: false,
             default: Some("fast".to_string()),
             description: None,
+            input_type: Default::default(),
         }];
 
         let result = resolve_child_inputs(&raw, &vars, &decls).unwrap();
@@ -1792,6 +1794,7 @@ And here is my actual output:
             required: true,
             default: None,
             description: None,
+            input_type: Default::default(),
         }];
 
         let err = resolve_child_inputs(&raw, &vars, &decls).unwrap_err();
@@ -1811,6 +1814,7 @@ And here is my actual output:
             required: false,
             default: Some("fast".to_string()),
             description: None,
+            input_type: Default::default(),
         }];
 
         let result = resolve_child_inputs(&raw, &vars, &decls).unwrap();
@@ -1828,10 +1832,49 @@ And here is my actual output:
             required: false,
             default: None,
             description: None,
+            input_type: Default::default(),
         }];
 
         let result = resolve_child_inputs(&raw, &vars, &decls).unwrap();
         assert!(!result.contains_key("optional_field"));
+    }
+
+    #[test]
+    fn test_resolve_child_inputs_boolean_defaults_to_false() {
+        use crate::workflow_dsl::{InputDecl, InputType};
+
+        let raw = HashMap::new(); // boolean input not explicitly passed
+        let vars: HashMap<&str, String> = HashMap::new();
+        let decls = vec![InputDecl {
+            name: "flag".to_string(),
+            required: false,
+            default: None,
+            description: None,
+            input_type: InputType::Boolean,
+        }];
+
+        let result = resolve_child_inputs(&raw, &vars, &decls).unwrap();
+        assert_eq!(result.get("flag").map(|s| s.as_str()), Some("false"));
+    }
+
+    #[test]
+    fn test_resolve_child_inputs_boolean_provided_value_not_overwritten() {
+        use crate::workflow_dsl::{InputDecl, InputType};
+
+        let mut raw = HashMap::new();
+        raw.insert("flag".to_string(), "true".to_string());
+
+        let vars: HashMap<&str, String> = HashMap::new();
+        let decls = vec![InputDecl {
+            name: "flag".to_string(),
+            required: false,
+            default: None,
+            description: None,
+            input_type: InputType::Boolean,
+        }];
+
+        let result = resolve_child_inputs(&raw, &vars, &decls).unwrap();
+        assert_eq!(result.get("flag").map(|s| s.as_str()), Some("true"));
     }
 
     // -----------------------------------------------------------------------
@@ -1862,8 +1905,10 @@ And here is my actual output:
         );
 
         let node = UnlessNode {
-            step: "build".to_string(),
-            marker: "has_errors".to_string(),
+            condition: crate::workflow_dsl::Condition::StepMarker {
+                step: "build".to_string(),
+                marker: "has_errors".to_string(),
+            },
             body: vec![], // empty body — just verify it enters the branch without error
         };
 
@@ -1895,8 +1940,10 @@ And here is my actual output:
         );
 
         let node = UnlessNode {
-            step: "build".to_string(),
-            marker: "has_errors".to_string(),
+            condition: crate::workflow_dsl::Condition::StepMarker {
+                step: "build".to_string(),
+                marker: "has_errors".to_string(),
+            },
             body: vec![], // empty body
         };
 
@@ -1911,8 +1958,10 @@ And here is my actual output:
 
         // No step results at all — step "build" not in step_results
         let node = UnlessNode {
-            step: "build".to_string(),
-            marker: "has_errors".to_string(),
+            condition: crate::workflow_dsl::Condition::StepMarker {
+                step: "build".to_string(),
+                marker: "has_errors".to_string(),
+            },
             body: vec![], // empty body
         };
 
@@ -2230,8 +2279,10 @@ And here is my actual output:
             stuck_after: None,
             on_max_iter: OnMaxIter::Fail,
             body: vec![WorkflowNode::If(IfNode {
-                step: "nonexistent".into(),
-                marker: "nope".into(),
+                condition: crate::workflow_dsl::Condition::StepMarker {
+                    step: "nonexistent".into(),
+                    marker: "nope".into(),
+                },
                 body: vec![],
             })],
         };
@@ -2266,8 +2317,10 @@ And here is my actual output:
             stuck_after: None,
             on_max_iter: OnMaxIter::Fail,
             body: vec![WorkflowNode::If(IfNode {
-                step: "nonexistent".into(),
-                marker: "nope".into(),
+                condition: crate::workflow_dsl::Condition::StepMarker {
+                    step: "nonexistent".into(),
+                    marker: "nope".into(),
+                },
                 body: vec![],
             })],
         };
@@ -4447,6 +4500,7 @@ And here is my actual output:
             required: false,
             default: Some("false".to_string()),
             description: None,
+            input_type: Default::default(),
         }]);
 
         let mut inputs = HashMap::new();
@@ -4463,6 +4517,7 @@ And here is my actual output:
             required: false,
             default: Some("false".to_string()),
             description: None,
+            input_type: Default::default(),
         }]);
 
         let mut inputs = HashMap::new();
@@ -4481,6 +4536,7 @@ And here is my actual output:
             required: true,
             default: None,
             description: None,
+            input_type: Default::default(),
         }]);
 
         let mut inputs = HashMap::new();
@@ -4502,6 +4558,7 @@ And here is my actual output:
             required: true,
             default: None,
             description: None,
+            input_type: Default::default(),
         }]);
 
         let mut inputs = HashMap::new();

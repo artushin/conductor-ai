@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use conductor_core::workflow::{AgentRef, WorkflowDef, WorkflowNode};
 
 use crate::state::AppState;
+use crate::ui::helpers::format_condition;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some(ref def) = state.selected_workflow_def else {
@@ -346,7 +347,7 @@ fn build_node_lines(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{}/{}", n.step, n.marker),
+                        format_condition(&n.condition),
                         Style::default().fg(theme.label_keyword),
                     ),
                 ])));
@@ -362,7 +363,7 @@ fn build_node_lines(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{}/{}", n.step, n.marker),
+                        format_condition(&n.condition),
                         Style::default().fg(theme.label_keyword),
                     ),
                 ])));

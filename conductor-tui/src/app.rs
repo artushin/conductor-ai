@@ -23,7 +23,7 @@ use crate::event::{BackgroundSender, EventLoop};
 use crate::input;
 use crate::state::{
     info_row, repo_info_row, AppState, ConfirmAction, DashboardRow, FormAction, FormField,
-    InputAction, Modal, PostCreateChoice, RepoDetailFocus, View, WorkflowDefFocus,
+    FormFieldType, InputAction, Modal, PostCreateChoice, RepoDetailFocus, View, WorkflowDefFocus,
     WorkflowRunDetailFocus, WorkflowsFocus, WorktreeDetailFocus,
 };
 use crate::theme::Theme;
@@ -174,6 +174,36 @@ fn send_workflow_result(
             }
         }
     }
+}
+
+/// Build `FormField`s from workflow `InputDecl`s.
+fn build_form_fields(inputs: &[conductor_core::workflow::InputDecl]) -> Vec<FormField> {
+    use conductor_core::workflow::InputType;
+    inputs
+        .iter()
+        .map(|inp| {
+            let (value, field_type) = if inp.input_type == InputType::Boolean {
+                (
+                    inp.default.clone().unwrap_or_else(|| "false".to_string()),
+                    FormFieldType::Boolean,
+                )
+            } else {
+                (inp.default.clone().unwrap_or_default(), FormFieldType::Text)
+            };
+            FormField {
+                label: inp.name.clone(),
+                value,
+                placeholder: if inp.required {
+                    "(required)".to_string()
+                } else {
+                    String::new()
+                },
+                manually_edited: false,
+                required: inp.required,
+                field_type,
+            }
+        })
+        .collect()
 }
 
 pub struct App {
@@ -477,6 +507,7 @@ impl App {
             Action::FormNextField => self.handle_form_next_field(),
             Action::FormPrevField => self.handle_form_prev_field(),
             Action::FormSubmit => self.handle_form_submit(),
+            Action::FormToggle => self.handle_form_toggle(),
 
             // CRUD
             Action::RegisterRepo => self.handle_register_repo(),
@@ -2681,6 +2712,7 @@ impl App {
                     placeholder: "https://github.com/org/repo.git".to_string(),
                     manually_edited: true,
                     required: true,
+                    field_type: FormFieldType::Text,
                 },
                 FormField {
                     label: "Slug".to_string(),
@@ -2688,6 +2720,7 @@ impl App {
                     placeholder: "auto-derived from URL".to_string(),
                     manually_edited: false,
                     required: true,
+                    field_type: FormFieldType::Text,
                 },
                 FormField {
                     label: "Local Path".to_string(),
@@ -2695,6 +2728,7 @@ impl App {
                     placeholder: "auto-derived from slug".to_string(),
                     manually_edited: false,
                     required: false,
+                    field_type: FormFieldType::Text,
                 },
             ],
             active_field: 0,
@@ -2724,6 +2758,7 @@ impl App {
                     Self::sync_issue_source_form_fields(fields);
                 }
                 FormAction::AddIssueSource { .. } => {}
+                FormAction::RunWorkflow(_) => {}
             }
         }
     }
@@ -2752,6 +2787,7 @@ impl App {
                     Self::sync_issue_source_form_fields(fields);
                 }
                 FormAction::AddIssueSource { .. } => {}
+                FormAction::RunWorkflow(_) => {}
             }
         }
     }
@@ -2825,6 +2861,7 @@ impl App {
                 placeholder: "e.g. project = PROJ AND status != Done".to_string(),
                 manually_edited: false,
                 required: true,
+                field_type: FormFieldType::Text,
             });
             fields.push(FormField {
                 label: "Jira URL".to_string(),
@@ -2832,6 +2869,7 @@ impl App {
                 placeholder: "e.g. https://mycompany.atlassian.net".to_string(),
                 manually_edited: false,
                 required: true,
+                field_type: FormFieldType::Text,
             });
         } else if !is_jira && fields.len() > 1 {
             // Remove extra fields when switching away from Jira
@@ -2852,6 +2890,37 @@ impl App {
                     repo_slug,
                     remote_url,
                 } => self.submit_add_issue_source(fields, &repo_id, &repo_slug, &remote_url),
+                FormAction::RunWorkflow(action) => {
+                    self.submit_run_workflow_with_inputs(
+                        fields,
+                        action.target,
+                        action.workflow_def,
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_form_toggle(&mut self) {
+        if let Modal::Form {
+            ref mut fields,
+            active_field,
+            ..
+        } = self.state.modal
+        {
+            if let Some(field) = fields.get_mut(active_field) {
+                if matches!(field.field_type, FormFieldType::Boolean) {
+                    field.value = if field.value == "true" {
+                        "false".to_string()
+                    } else {
+                        "true".to_string()
+                    };
+                    field.manually_edited = true;
+                } else {
+                    // For text fields, treat space as a regular character input
+                    field.value.push(' ');
+                    field.manually_edited = true;
+                }
             }
         }
     }
@@ -2976,6 +3045,185 @@ impl App {
         }
     }
 
+    /// Show the input form if the workflow declares inputs, otherwise dispatch immediately.
+    /// This is the shared entry point from both `handle_workflow_picker_confirm` and
+    /// `handle_pr_workflow_picker_confirm`.
+    fn show_workflow_inputs_or_run(
+        &mut self,
+        target: crate::state::WorkflowPickerTarget,
+        def: conductor_core::workflow::WorkflowDef,
+    ) {
+        if !def.inputs.is_empty() {
+            let fields = build_form_fields(&def.inputs);
+            self.state.modal = Modal::Form {
+                title: format!("Inputs for '{}'", def.name),
+                fields,
+                active_field: 0,
+                on_submit: crate::state::FormAction::RunWorkflow(Box::new(
+                    crate::state::RunWorkflowAction {
+                        target,
+                        workflow_def: def,
+                    },
+                )),
+            };
+        } else {
+            self.submit_run_workflow_with_inputs(vec![], target, def);
+        }
+    }
+
+    fn submit_run_workflow_with_inputs(
+        &mut self,
+        fields: Vec<FormField>,
+        target: crate::state::WorkflowPickerTarget,
+        def: conductor_core::workflow::WorkflowDef,
+    ) {
+        use crate::state::WorkflowPickerTarget;
+
+        // Collect inputs from form fields (field label = input name, value = input value)
+        let inputs: std::collections::HashMap<String, String> =
+            fields.into_iter().map(|f| (f.label, f.value)).collect();
+
+        match target {
+            WorkflowPickerTarget::Worktree {
+                worktree_id,
+                worktree_path,
+                repo_path,
+            } => {
+                // Block if a workflow run is already active on this worktree
+                {
+                    use conductor_core::workflow::WorkflowManager;
+                    let wf_mgr = WorkflowManager::new(&self.conn);
+                    match wf_mgr.get_active_run_for_worktree(&worktree_id) {
+                        Ok(Some(active)) => {
+                            self.state.status_message = Some(format!(
+                                "Workflow '{}' is already running — cancel it before starting another",
+                                active.workflow_name
+                            ));
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.state.status_message =
+                                Some(format!("Failed to check active workflow run: {e}"));
+                            return;
+                        }
+                    }
+                }
+
+                let (wt_target_label, wt_ticket_id) = self
+                    .state
+                    .data
+                    .worktrees
+                    .iter()
+                    .find(|w| w.id == worktree_id)
+                    .and_then(|w| {
+                        self.state
+                            .data
+                            .repos
+                            .iter()
+                            .find(|r| r.id == w.repo_id)
+                            .map(|r| (format!("{}/{}", r.slug, w.slug), w.ticket_id.clone()))
+                    })
+                    .unwrap_or_default();
+                self.spawn_workflow_in_background(
+                    def,
+                    worktree_id,
+                    worktree_path,
+                    repo_path,
+                    wt_ticket_id,
+                    inputs,
+                    wt_target_label,
+                );
+            }
+            WorkflowPickerTarget::Pr { pr_number, .. } => {
+                let remote_url = match self
+                    .state
+                    .selected_repo_id
+                    .as_ref()
+                    .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))
+                    .map(|r| r.remote_url.clone())
+                {
+                    Some(url) => url,
+                    None => {
+                        self.state.modal = Modal::Error {
+                            message: "No repo selected".to_string(),
+                        };
+                        return;
+                    }
+                };
+                let (owner, repo) = match conductor_core::github::parse_github_remote(&remote_url) {
+                    Some(pair) => pair,
+                    None => {
+                        self.state.modal = Modal::Error {
+                            message: format!(
+                                "Could not parse GitHub owner/repo from remote URL: {remote_url}"
+                            ),
+                        };
+                        return;
+                    }
+                };
+                let pr_ref = conductor_core::workflow_ephemeral::PrRef {
+                    owner,
+                    repo,
+                    number: pr_number as u64,
+                };
+                self.spawn_pr_workflow_in_background(pr_ref, def, inputs);
+            }
+            WorkflowPickerTarget::Ticket {
+                ticket_id,
+                ticket_title,
+                repo_id,
+                repo_path,
+                ..
+            } => {
+                self.spawn_ticket_workflow_in_background(
+                    def,
+                    ticket_id,
+                    repo_id,
+                    repo_path,
+                    ticket_title,
+                    inputs,
+                );
+            }
+            WorkflowPickerTarget::Repo {
+                repo_id,
+                repo_path,
+                repo_name,
+            } => {
+                self.spawn_repo_workflow_in_background(def, repo_id, repo_path, repo_name, inputs);
+            }
+            WorkflowPickerTarget::WorkflowRun {
+                workflow_run_id,
+                worktree_id,
+                worktree_path,
+                repo_path,
+                ..
+            } => {
+                let mut run_inputs = inputs;
+                run_inputs.insert("workflow_run_id".to_string(), workflow_run_id.clone());
+                let working_dir = worktree_path.unwrap_or_else(|| repo_path.clone());
+                if let Some(wt_id) = worktree_id {
+                    self.spawn_workflow_in_background(
+                        def,
+                        wt_id,
+                        working_dir,
+                        repo_path,
+                        None,
+                        run_inputs,
+                        format!("workflow_run:{workflow_run_id}"),
+                    );
+                } else {
+                    self.spawn_workflow_run_target_in_background(
+                        def,
+                        repo_path,
+                        run_inputs,
+                        workflow_run_id,
+                    );
+                }
+            }
+        }
+    }
+
     fn handle_manage_issue_sources(&mut self) {
         // Only available from RepoDetail view
         if self.state.view != View::RepoDetail {
@@ -3040,6 +3288,7 @@ impl App {
                 placeholder: "github or jira (Tab to next field)".to_string(),
                 manually_edited: false,
                 required: true,
+                field_type: FormFieldType::Text,
             }];
 
             // If type is pre-filled to jira, include the Jira fields up front
@@ -5350,8 +5599,6 @@ impl App {
 
     /// Confirm the workflow selection from the generic WorkflowPicker modal.
     fn handle_workflow_picker_confirm(&mut self) {
-        use crate::state::WorkflowPickerTarget;
-
         let (target, def) = if let Modal::WorkflowPicker {
             ref target,
             ref workflow_defs,
@@ -5370,148 +5617,7 @@ impl App {
 
         self.state.modal = Modal::None;
 
-        match target {
-            WorkflowPickerTarget::Worktree {
-                worktree_id,
-                worktree_path,
-                repo_path,
-            } => {
-                // Block if a workflow run is already active on this worktree
-                {
-                    use conductor_core::workflow::WorkflowManager;
-                    let wf_mgr = WorkflowManager::new(&self.conn);
-                    match wf_mgr.get_active_run_for_worktree(&worktree_id) {
-                        Ok(Some(active)) => {
-                            self.state.status_message = Some(format!(
-                                "Workflow '{}' is already running — cancel it before starting another",
-                                active.workflow_name
-                            ));
-                            return;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            self.state.status_message =
-                                Some(format!("Failed to check active workflow run: {e}"));
-                            return;
-                        }
-                    }
-                }
-
-                let (wt_target_label, wt_ticket_id) = self
-                    .state
-                    .data
-                    .worktrees
-                    .iter()
-                    .find(|w| w.id == worktree_id)
-                    .and_then(|w| {
-                        self.state
-                            .data
-                            .repos
-                            .iter()
-                            .find(|r| r.id == w.repo_id)
-                            .map(|r| (format!("{}/{}", r.slug, w.slug), w.ticket_id.clone()))
-                    })
-                    .unwrap_or_default();
-                self.spawn_workflow_in_background(
-                    def,
-                    worktree_id,
-                    worktree_path,
-                    repo_path,
-                    wt_ticket_id,
-                    std::collections::HashMap::new(),
-                    wt_target_label,
-                );
-            }
-            WorkflowPickerTarget::Pr { pr_number, .. } => {
-                // Get owner/repo from selected repo's remote_url
-                let remote_url = match self
-                    .state
-                    .selected_repo_id
-                    .as_ref()
-                    .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))
-                    .map(|r| r.remote_url.clone())
-                {
-                    Some(url) => url,
-                    None => {
-                        self.state.modal = Modal::Error {
-                            message: "No repo selected".to_string(),
-                        };
-                        return;
-                    }
-                };
-
-                let (owner, repo) = match conductor_core::github::parse_github_remote(&remote_url) {
-                    Some(pair) => pair,
-                    None => {
-                        self.state.modal = Modal::Error {
-                            message: format!(
-                                "Could not parse GitHub owner/repo from remote URL: {remote_url}"
-                            ),
-                        };
-                        return;
-                    }
-                };
-
-                let pr_ref = conductor_core::workflow_ephemeral::PrRef {
-                    owner,
-                    repo,
-                    number: pr_number as u64,
-                };
-
-                self.spawn_pr_workflow_in_background(pr_ref, def);
-            }
-            WorkflowPickerTarget::Ticket {
-                ticket_id,
-                ticket_title,
-                repo_id,
-                repo_path,
-                ..
-            } => {
-                self.spawn_ticket_workflow_in_background(
-                    def,
-                    ticket_id,
-                    repo_id,
-                    repo_path,
-                    ticket_title,
-                );
-            }
-            WorkflowPickerTarget::Repo {
-                repo_id,
-                repo_path,
-                repo_name,
-            } => {
-                self.spawn_repo_workflow_in_background(def, repo_id, repo_path, repo_name);
-            }
-            WorkflowPickerTarget::WorkflowRun {
-                workflow_run_id,
-                worktree_id,
-                worktree_path,
-                repo_path,
-                ..
-            } => {
-                let mut inputs = std::collections::HashMap::new();
-                inputs.insert("workflow_run_id".to_string(), workflow_run_id.clone());
-                let working_dir = worktree_path.unwrap_or_else(|| repo_path.clone());
-                if let Some(wt_id) = worktree_id {
-                    self.spawn_workflow_in_background(
-                        def,
-                        wt_id,
-                        working_dir,
-                        repo_path,
-                        None,
-                        inputs,
-                        workflow_run_id,
-                    );
-                } else {
-                    self.spawn_workflow_run_target_in_background(
-                        def,
-                        repo_path,
-                        inputs,
-                        workflow_run_id,
-                    );
-                }
-            }
-        }
+        self.show_workflow_inputs_or_run(target, def);
     }
 
     fn handle_run_workflow(&mut self) {
@@ -5639,6 +5745,7 @@ impl App {
         repo_id: String,
         repo_path: String,
         target_label: String,
+        inputs: std::collections::HashMap<String, String>,
     ) {
         let config = self.config.clone();
         let bg_tx = self.bg_tx.clone();
@@ -5665,7 +5772,7 @@ impl App {
                     shutdown: Some(shutdown),
                     ..WorkflowExecConfig::default()
                 },
-                inputs: std::collections::HashMap::new(),
+                inputs,
                 target_label: Some(target_label),
                 run_id_notify: None,
             };
@@ -5685,6 +5792,7 @@ impl App {
         repo_id: String,
         repo_path: String,
         repo_name: String,
+        inputs: std::collections::HashMap<String, String>,
     ) {
         let config = self.config.clone();
         let bg_tx = self.bg_tx.clone();
@@ -5709,7 +5817,7 @@ impl App {
                     shutdown: Some(shutdown),
                     ..WorkflowExecConfig::default()
                 },
-                inputs: std::collections::HashMap::new(),
+                inputs,
                 target_label: Some(repo_name),
                 run_id_notify: None,
             };
@@ -5820,6 +5928,8 @@ impl App {
     }
 
     fn handle_pr_workflow_picker_confirm(&mut self) {
+        use crate::state::WorkflowPickerTarget;
+
         let (pr_number, def) = if let Modal::PrWorkflowPicker {
             pr_number,
             ref workflow_defs,
@@ -5836,43 +5946,13 @@ impl App {
             return;
         };
 
-        // Get owner/repo from selected repo's remote_url
-        let remote_url = match self
-            .state
-            .selected_repo_id
-            .as_ref()
-            .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))
-            .map(|r| r.remote_url.clone())
-        {
-            Some(url) => url,
-            None => {
-                self.state.modal = Modal::Error {
-                    message: "No repo selected".to_string(),
-                };
-                return;
-            }
-        };
-
-        let (owner, repo) = match conductor_core::github::parse_github_remote(&remote_url) {
-            Some(pair) => pair,
-            None => {
-                self.state.modal = Modal::Error {
-                    message: format!(
-                        "Could not parse GitHub owner/repo from remote URL: {remote_url}"
-                    ),
-                };
-                return;
-            }
-        };
-
-        let pr_ref = conductor_core::workflow_ephemeral::PrRef {
-            owner,
-            repo,
-            number: pr_number as u64,
-        };
-
         self.state.modal = Modal::None;
-        self.spawn_pr_workflow_in_background(pr_ref, def);
+
+        let target = WorkflowPickerTarget::Pr {
+            pr_number,
+            pr_title: String::new(),
+        };
+        self.show_workflow_inputs_or_run(target, def);
     }
 
     /// Spawn an ephemeral PR workflow execution in a background thread.
@@ -5880,6 +5960,7 @@ impl App {
         &mut self,
         pr_ref: conductor_core::workflow_ephemeral::PrRef,
         def: conductor_core::workflow::WorkflowDef,
+        inputs: std::collections::HashMap<String, String>,
     ) {
         use conductor_core::config::db_path;
         use conductor_core::db::open_database;
@@ -5923,7 +6004,7 @@ impl App {
                 &def.name,
                 None,
                 exec_config,
-                std::collections::HashMap::new(),
+                inputs,
                 false,
             );
 

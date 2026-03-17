@@ -10,7 +10,7 @@ use conductor_core::workflow::WorkflowNode;
 use conductor_core::workflow::{WorkflowDef, WorkflowRun, WorkflowRunStatus};
 
 use super::common::truncate;
-use super::helpers::{shorten_paths, visual_idx_with_headers};
+use super::helpers::{format_condition, shorten_paths, visual_idx_with_headers};
 use crate::state::AppState;
 use crate::state::ColumnFocus;
 use crate::state::TargetType;
@@ -527,7 +527,7 @@ pub(crate) fn build_def_step_lines<'a>(
                     Span::raw(indent.clone()),
                     Span::styled("[if]    ", Style::default().fg(theme.label_accent)),
                     Span::styled(
-                        format!("{}.{}", n.step, n.marker),
+                        format_condition(&n.condition),
                         Style::default().fg(theme.label_secondary),
                     ),
                 ])));
@@ -547,7 +547,7 @@ pub(crate) fn build_def_step_lines<'a>(
                     Span::styled("[unless]", Style::default().fg(theme.label_accent)),
                     Span::raw("  "),
                     Span::styled(
-                        format!("{}.{}", n.step, n.marker),
+                        format_condition(&n.condition),
                         Style::default().fg(theme.label_secondary),
                     ),
                 ])));
@@ -1749,9 +1749,12 @@ mod tests {
     }
 
     fn if_node(body: Vec<WorkflowNode>) -> WorkflowNode {
+        use conductor_core::workflow::Condition;
         WorkflowNode::If(IfNode {
-            step: "some-step".to_string(),
-            marker: "done".to_string(),
+            condition: Condition::StepMarker {
+                step: "some-step".to_string(),
+                marker: "done".to_string(),
+            },
             body,
         })
     }
