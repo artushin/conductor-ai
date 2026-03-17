@@ -242,6 +242,16 @@ fn build_form_fields(inputs: &[conductor_core::workflow::InputDecl]) -> Vec<Form
         .collect()
 }
 
+/// Filter `steps` to only those from the latest iteration for each `step_name`.
+/// Keeps `workflow_step_index` valid since it's an index into the filtered list.
+fn collapse_loop_iterations(
+    mut steps: Vec<conductor_core::workflow::WorkflowRunStep>,
+) -> Vec<conductor_core::workflow::WorkflowRunStep> {
+    let max_iter = crate::state::max_iter_by_step_name(&steps);
+    steps.retain(|s| s.iteration == *max_iter.get(&s.step_name).unwrap_or(&0));
+    steps
+}
+
 pub struct App {
     state: AppState,
     conn: Connection,
@@ -816,7 +826,7 @@ impl App {
                     })
                     .collect();
                 self.state.data.workflow_runs = payload.workflow_runs;
-                self.state.data.workflow_steps = payload.workflow_steps;
+                self.state.data.workflow_steps = collapse_loop_iterations(payload.workflow_steps);
                 self.state.data.step_agent_events = payload.step_agent_events;
                 self.state.data.step_agent_run = payload.step_agent_run;
                 self.state.data.workflow_run_steps = payload.all_run_steps;
@@ -5378,7 +5388,8 @@ impl App {
 
         if let Some(ref run_id) = self.state.selected_workflow_run_id {
             let wf_mgr = WorkflowManager::new(&self.conn);
-            self.state.data.workflow_steps = wf_mgr.get_workflow_steps(run_id).unwrap_or_default();
+            self.state.data.workflow_steps =
+                collapse_loop_iterations(wf_mgr.get_workflow_steps(run_id).unwrap_or_default());
         } else {
             self.state.data.workflow_steps.clear();
         }
@@ -6652,6 +6663,47 @@ mod tests {
             state.column_focus = crate::state::ColumnFocus::Workflow;
         }
         assert_eq!(state.column_focus, crate::state::ColumnFocus::Content);
+    }
+
+    fn make_step(
+        step_name: &str,
+        iteration: i64,
+        position: i64,
+    ) -> conductor_core::workflow::WorkflowRunStep {
+        crate::state::tests::make_iter_step("run1", step_name, iteration, position)
+    }
+
+    #[test]
+    fn collapse_loop_iterations_single_iteration_passthrough() {
+        let steps = vec![make_step("a", 0, 0), make_step("b", 0, 1)];
+        let result = collapse_loop_iterations(steps);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|s| s.iteration == 0));
+    }
+
+    #[test]
+    fn collapse_loop_iterations_keeps_latest_per_step_name() {
+        // "a" appears in iterations 0, 1, 2 — only 2 should survive.
+        // "b" appears only in iteration 0 — should survive.
+        let steps = vec![
+            make_step("a", 0, 0),
+            make_step("b", 0, 1),
+            make_step("a", 1, 0),
+            make_step("a", 2, 0),
+        ];
+        let result = collapse_loop_iterations(steps);
+        // Should keep "a" at iter 2 and "b" at iter 0.
+        assert_eq!(result.len(), 2);
+        let a = result.iter().find(|s| s.step_name == "a").unwrap();
+        assert_eq!(a.iteration, 2);
+        let b = result.iter().find(|s| s.step_name == "b").unwrap();
+        assert_eq!(b.iteration, 0);
+    }
+
+    #[test]
+    fn collapse_loop_iterations_empty_input() {
+        let result = collapse_loop_iterations(vec![]);
+        assert!(result.is_empty());
     }
 
     #[test]
