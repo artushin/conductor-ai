@@ -82,6 +82,7 @@ impl<'a> WorkflowManager<'a> {
             definition_snapshot,
             None,
             None,
+            None,
         )
     }
 
@@ -99,6 +100,7 @@ impl<'a> WorkflowManager<'a> {
         definition_snapshot: Option<&str>,
         parent_workflow_run_id: Option<&str>,
         target_label: Option<&str>,
+        feature_id: Option<&str>,
     ) -> Result<WorkflowRun> {
         let id = crate::new_id();
         let now = Utc::now().to_rfc3339();
@@ -106,8 +108,8 @@ impl<'a> WorkflowManager<'a> {
         self.conn.execute(
             "INSERT INTO workflow_runs (id, workflow_name, worktree_id, ticket_id, repo_id, \
              parent_run_id, status, dry_run, trigger, started_at, definition_snapshot, \
-             parent_workflow_run_id, target_label) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             parent_workflow_run_id, target_label, feature_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 workflow_name,
@@ -122,6 +124,7 @@ impl<'a> WorkflowManager<'a> {
                 definition_snapshot,
                 parent_workflow_run_id,
                 target_label,
+                feature_id,
             ],
         )?;
 
@@ -145,7 +148,7 @@ impl<'a> WorkflowManager<'a> {
             default_bot_name: None,
             iteration: 0,
             blocked_on: None,
-            feature_id: None,
+            feature_id: feature_id.map(String::from),
         })
     }
 
@@ -154,15 +157,6 @@ impl<'a> WorkflowManager<'a> {
         self.conn.execute(
             "UPDATE workflow_runs SET iteration = ?1 WHERE id = ?2",
             params![iteration, run_id],
-        )?;
-        Ok(())
-    }
-
-    /// Persist the feature_id for a workflow run.
-    pub fn set_workflow_run_feature_id(&self, run_id: &str, feature_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE workflow_runs SET feature_id = ?1 WHERE id = ?2",
-            params![feature_id, run_id],
         )?;
         Ok(())
     }
@@ -1654,6 +1648,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
     }
@@ -1697,6 +1692,7 @@ mod tests {
                 &parent_id,
                 false,
                 "manual",
+                None,
                 None,
                 None,
                 None,
@@ -2434,6 +2430,7 @@ mod tests {
                 None,
                 None,
                 Some("conductor-ai/feat-123"),
+                None,
             )
             .unwrap();
 
@@ -2705,29 +2702,5 @@ mod tests {
         mgr.set_workflow_run_iteration(&run.id, 0).unwrap();
         let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
         assert_eq!(fetched.iteration, 0);
-    }
-
-    #[test]
-    fn test_set_workflow_run_feature_id_round_trip() {
-        let conn = setup_db();
-        // Insert a feature record for FK constraint
-        conn.execute(
-            "INSERT INTO features (id, repo_id, name, branch, base_branch, status, created_at)
-             VALUES ('feat-123', 'r1', 'test-feature', 'feat/test-feature', 'main', 'active', '2024-01-01T00:00:00Z')",
-            [],
-        ).unwrap();
-
-        let run = create_worktree_run(&conn, "w1");
-        let mgr = WorkflowManager::new(&conn);
-
-        // Initially no feature_id
-        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
-        assert!(fetched.feature_id.is_none());
-
-        // Set feature_id and read back
-        mgr.set_workflow_run_feature_id(&run.id, "feat-123")
-            .unwrap();
-        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
-        assert_eq!(fetched.feature_id.as_deref(), Some("feat-123"));
     }
 }
