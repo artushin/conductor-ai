@@ -18,12 +18,15 @@ workflow iterate-pr {
     call workflow review-pr
 
     if review-aggregator.has_blocking_findings {
-      call address-reviews
+      call address-reviews {
+        as = "developer"
+      }
       script fmt-fix {
         run = ".conductor/scripts/fmt-fix.sh"
       }
       script push {
         run = ".conductor/scripts/push.sh"
+        as  = "developer"
       }
       call workflow lint-fix
     }

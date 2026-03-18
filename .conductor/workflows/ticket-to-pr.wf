@@ -23,6 +23,7 @@ workflow ticket-to-pr {
 
   call implement {
     retries = 2
+    as      = "developer"
   }
 
   call workflow lint-fix
@@ -33,6 +34,7 @@ workflow ticket-to-pr {
 
   script push-and-pr {
     run = ".conductor/scripts/push-and-pr.sh"
+    as  = "developer"
   }
 
   call workflow iterate-pr
