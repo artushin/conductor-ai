@@ -11,6 +11,8 @@ use crate::error::{ConductorError, Result};
 use crate::workflow_dsl;
 
 use super::constants::{RUN_COLUMNS, STEP_COLUMNS, STEP_COLUMNS_WITH_PREFIX};
+use crate::workflow_dsl::GateType;
+
 use super::status::{WorkflowRunStatus, WorkflowStepStatus};
 use super::types::{
     ActiveWorkflowCounts, PendingGateRow, StepKey, WorkflowRun, WorkflowRunContext,
@@ -377,7 +379,7 @@ impl<'a> WorkflowManager<'a> {
     pub fn set_step_gate_info(
         &self,
         step_id: &str,
-        gate_type: &str,
+        gate_type: GateType,
         gate_prompt: Option<&str>,
         gate_timeout: &str,
     ) -> Result<()> {
@@ -1841,8 +1843,13 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "approval-gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", Some("Please approve"), "1h")
-            .unwrap();
+        mgr.set_step_gate_info(
+            &step_id,
+            GateType::HumanApproval,
+            Some("Please approve"),
+            "1h",
+        )
+        .unwrap();
         // Mark step as waiting so it appears in the query.
         set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
 
@@ -2351,7 +2358,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         // Mark as completed (approved) — must not appear in waiting list.
         conn.execute(
@@ -2389,7 +2396,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "approve-deploy", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
 
@@ -2427,8 +2434,13 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "approval-gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", Some("Please approve"), "1h")
-            .unwrap();
+        mgr.set_step_gate_info(
+            &step_id,
+            GateType::HumanApproval,
+            Some("Please approve"),
+            "1h",
+        )
+        .unwrap();
         set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
 
         let steps = mgr.list_waiting_gate_steps_for_repo("r1").unwrap();
@@ -2463,7 +2475,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "direct-gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
 
@@ -2507,7 +2519,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "approval-gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
 
@@ -2531,7 +2543,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "gate-other", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         set_step_status(&mgr, &step_id, WorkflowStepStatus::Waiting);
 
@@ -2568,7 +2580,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         conn.execute(
             "UPDATE workflow_run_steps SET status = 'completed', gate_approved_at = '2024-01-01T00:00:00Z' WHERE id = ?1",
@@ -2591,7 +2603,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         conn.execute(
             "UPDATE workflow_runs SET status = 'cancelled' WHERE id = ?1",
@@ -2615,7 +2627,7 @@ mod tests {
         let step_id = mgr
             .insert_step(&run.id, "gate", "gate", false, 0, 0)
             .unwrap();
-        mgr.set_step_gate_info(&step_id, "human", None, "1h")
+        mgr.set_step_gate_info(&step_id, GateType::HumanApproval, None, "1h")
             .unwrap();
         conn.execute(
             "UPDATE workflow_runs SET status = 'failed' WHERE id = ?1",
