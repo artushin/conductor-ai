@@ -545,15 +545,23 @@ pub fn render_form(
     frame.render_widget(content, popup);
 }
 
-pub fn render_post_create_picker(
+/// Configuration for a numbered picker modal.
+struct NumberedPickerConfig<'a> {
+    title: &'a str,
+    subtitle: &'a str,
+    labels: &'a [&'a str],
+    selected: usize,
+    hint: &'a str,
+}
+
+/// Shared rendering for numbered picker modals (branch picker, post-create picker, etc.).
+fn render_numbered_picker(
     frame: &mut Frame,
     area: Rect,
-    items: &[crate::state::PostCreateChoice],
-    selected: usize,
-    ticket_source_id: &str,
+    cfg: &NumberedPickerConfig,
     theme: &Theme,
 ) {
-    let height = (items.len() as u16 + 6).min(20);
+    let height = (cfg.labels.len() as u16 + 6).min(20);
     let percent_y = ((height as f32 / area.height as f32) * 100.0) as u16;
     let popup = centered_rect(50, percent_y.max(25), area);
     frame.render_widget(Clear, popup);
@@ -561,14 +569,14 @@ pub fn render_post_create_picker(
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  Start work on #{ticket_source_id}?"),
+            format!("  {}", cfg.subtitle),
             Style::default().fg(theme.label_accent),
         )),
         Line::from(""),
     ];
 
-    for (i, item) in items.iter().enumerate() {
-        let is_selected = i == selected;
+    for (i, label) in cfg.labels.iter().enumerate() {
+        let is_selected = i == cfg.selected;
         let prefix = if is_selected { "▸ " } else { "  " };
         let number = format!("{}. ", i + 1);
 
@@ -582,13 +590,13 @@ pub fn render_post_create_picker(
 
         lines.push(Line::from(vec![
             Span::styled(format!("  {prefix}{number}"), style),
-            Span::styled(format!("{item}"), style),
+            Span::styled(*label, style),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  1-9 select  Enter confirm  Esc skip",
+        format!("  {}", cfg.hint),
         Style::default().fg(theme.label_secondary),
     )));
 
@@ -596,10 +604,85 @@ pub fn render_post_create_picker(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused))
-            .title(" Post-Create Actions "),
+            .title(format!(" {} ", cfg.title)),
     );
 
     frame.render_widget(content, popup);
+}
+
+pub fn render_branch_picker(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[crate::state::BranchPickerItem],
+    selected: usize,
+    theme: &Theme,
+) {
+    let label_strings: Vec<String> = items
+        .iter()
+        .map(|item| match &item.branch {
+            None => "default branch".to_string(),
+            Some(branch) => {
+                let mut parts = Vec::new();
+                if item.worktree_count > 0 {
+                    parts.push(format!(
+                        "{} worktree{}",
+                        item.worktree_count,
+                        if item.worktree_count == 1 { "" } else { "s" }
+                    ));
+                }
+                if item.ticket_count > 0 {
+                    parts.push(format!(
+                        "{} ticket{}",
+                        item.ticket_count,
+                        if item.ticket_count == 1 { "" } else { "s" }
+                    ));
+                }
+                if parts.is_empty() {
+                    branch.clone()
+                } else {
+                    format!("{} ({})", branch, parts.join(", "))
+                }
+            }
+        })
+        .collect();
+    let labels: Vec<&str> = label_strings.iter().map(|s| s.as_str()).collect();
+    render_numbered_picker(
+        frame,
+        area,
+        &NumberedPickerConfig {
+            title: "Branch Picker",
+            subtitle: "Target branch:",
+            labels: &labels,
+            selected,
+            hint: "1-9 select  Enter confirm  Esc cancel",
+        },
+        theme,
+    );
+}
+
+pub fn render_post_create_picker(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[crate::state::PostCreateChoice],
+    selected: usize,
+    ticket_source_id: &str,
+    theme: &Theme,
+) {
+    let label_strings: Vec<String> = items.iter().map(|item| format!("{item}")).collect();
+    let labels: Vec<&str> = label_strings.iter().map(|s| s.as_str()).collect();
+    let subtitle = format!("Start work on #{ticket_source_id}?");
+    render_numbered_picker(
+        frame,
+        area,
+        &NumberedPickerConfig {
+            title: "Post-Create Actions",
+            subtitle: &subtitle,
+            labels: &labels,
+            selected,
+            hint: "1-9 select  Enter confirm  Esc skip",
+        },
+        theme,
+    );
 }
 
 pub fn render_pr_workflow_picker(

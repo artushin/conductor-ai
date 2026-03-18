@@ -356,6 +356,17 @@ impl std::fmt::Display for PostCreateChoice {
     }
 }
 
+/// One selectable row in the branch picker modal.
+#[derive(Debug, Clone)]
+pub struct BranchPickerItem {
+    /// `None` → repo default branch; `Some(branch)` → feature branch name.
+    pub branch: Option<String>,
+    /// Number of worktrees on this branch (0 for default branch entry).
+    pub worktree_count: i64,
+    /// Number of linked tickets (0 for default branch entry).
+    pub ticket_count: i64,
+}
+
 #[derive(Clone)]
 pub enum Modal {
     None,
@@ -492,6 +503,14 @@ pub enum Modal {
     Progress {
         message: String,
     },
+    /// Branch picker shown during worktree creation: select a target branch.
+    BranchPicker {
+        repo_slug: String,
+        wt_name: String,
+        ticket_id: Option<String>,
+        items: Vec<BranchPickerItem>,
+        selected: usize,
+    },
     /// In-TUI theme picker: browse named themes with live preview.
     ThemePicker {
         /// Snapshot of all available themes at picker-open time (built-ins + custom).
@@ -547,6 +566,7 @@ impl fmt::Debug for Modal {
                     "Modal::GithubDiscover(owner={owner:?}, loading={loading})"
                 )
             }
+            Modal::BranchPicker { .. } => write!(f, "Modal::BranchPicker"),
             Modal::PostCreatePicker { .. } => write!(f, "Modal::PostCreatePicker"),
             Modal::PrWorkflowPicker {
                 pr_number,
@@ -615,6 +635,7 @@ pub enum ConfirmAction {
         wt_name: String,
         ticket_id: Option<String>,
         from_pr: Option<u32>,
+        from_branch: Option<String>,
     },
     DeleteWorktree {
         repo_slug: String,
@@ -686,6 +707,7 @@ pub enum InputAction {
         repo_slug: String,
         wt_name: String,
         ticket_id: Option<String>,
+        from_branch: Option<String>,
     },
     LinkTicket {
         worktree_id: String,

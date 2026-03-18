@@ -273,6 +273,20 @@ pub enum Action {
         errors: Vec<String>,
     },
 
+    // Branch picker (during worktree creation)
+    /// Background result: feature branches loaded for branch picker.
+    FeatureBranchesLoaded {
+        repo_slug: String,
+        wt_name: String,
+        ticket_id: Option<String>,
+        items: Vec<crate::state::BranchPickerItem>,
+    },
+    /// Background result: feature branch load failed.
+    FeatureBranchesFailed {
+        error: String,
+    },
+    SelectBranch(Option<usize>),
+
     // Post-create picker (after worktree creation)
     SelectPostCreateChoice(usize),
     /// Background result: workflow defs loaded, ready to show post-create picker.

@@ -195,6 +195,23 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 _ => Action::None,
             };
         }
+        Modal::BranchPicker { ref items, .. } => {
+            return match key.code {
+                KeyCode::Esc => Action::DismissModal,
+                KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
+                KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
+                KeyCode::Enter => Action::SelectBranch(None),
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let n = c.to_digit(10).unwrap() as usize;
+                    if n >= 1 && n <= items.len() {
+                        Action::SelectBranch(Some(n - 1))
+                    } else {
+                        Action::None
+                    }
+                }
+                _ => Action::None,
+            };
+        }
         Modal::PostCreatePicker { ref items, .. } => {
             return match key.code {
                 KeyCode::Esc => Action::DismissModal,
@@ -640,6 +657,116 @@ mod tests {
     #[test]
     fn post_create_picker_unhandled_key_is_none() {
         let state = post_create_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Char('x')), &state),
+            Action::None
+        ));
+    }
+
+    // --- BranchPicker tests ---
+
+    use crate::state::BranchPickerItem;
+
+    fn branch_picker_state(item_count: usize) -> AppState {
+        let mut items = Vec::with_capacity(item_count);
+        // First item: default branch (branch = None)
+        if item_count > 0 {
+            items.push(BranchPickerItem {
+                branch: None,
+                worktree_count: 0,
+                ticket_count: 0,
+            });
+        }
+        for i in 1..item_count {
+            items.push(BranchPickerItem {
+                branch: Some(format!("feat/branch-{i}")),
+                worktree_count: 0,
+                ticket_count: 0,
+            });
+        }
+        let mut state = AppState::new();
+        state.modal = Modal::BranchPicker {
+            repo_slug: "test-repo".into(),
+            wt_name: "wt-name".into(),
+            ticket_id: None,
+            items,
+            selected: 0,
+        };
+        state
+    }
+
+    #[test]
+    fn branch_picker_esc_dismisses_modal() {
+        let state = branch_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Esc), &state),
+            Action::DismissModal
+        ));
+    }
+
+    #[test]
+    fn branch_picker_up_down_navigation() {
+        let state = branch_picker_state(3);
+        assert!(matches!(map_key(key(KeyCode::Up), &state), Action::MoveUp));
+        assert!(matches!(
+            map_key(key(KeyCode::Down), &state),
+            Action::MoveDown
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('k')), &state),
+            Action::MoveUp
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('j')), &state),
+            Action::MoveDown
+        ));
+    }
+
+    #[test]
+    fn branch_picker_enter_selects_with_none() {
+        let state = branch_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Enter), &state),
+            Action::SelectBranch(None)
+        ));
+    }
+
+    #[test]
+    fn branch_picker_valid_digit_selects_item() {
+        let state = branch_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Char('1')), &state),
+            Action::SelectBranch(Some(0))
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('3')), &state),
+            Action::SelectBranch(Some(2))
+        ));
+    }
+
+    #[test]
+    fn branch_picker_out_of_range_digit_is_none() {
+        let state = branch_picker_state(3);
+        // '0' is out of range (valid is 1..=3)
+        assert!(matches!(
+            map_key(key(KeyCode::Char('0')), &state),
+            Action::None
+        ));
+        // '4' exceeds item count
+        assert!(matches!(
+            map_key(key(KeyCode::Char('4')), &state),
+            Action::None
+        ));
+        // '9' exceeds item count
+        assert!(matches!(
+            map_key(key(KeyCode::Char('9')), &state),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn branch_picker_unhandled_key_is_none() {
+        let state = branch_picker_state(3);
         assert!(matches!(
             map_key(key(KeyCode::Char('x')), &state),
             Action::None
