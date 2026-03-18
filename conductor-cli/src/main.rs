@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use conductor_core::agent::{
     build_startup_context, parse_events_from_line, AgentManager, PlanStep,
 };
-use conductor_core::agent_config::AgentSpec;
 use conductor_core::config::{ensure_dirs, load_config};
 use conductor_core::db::open_database;
 use conductor_core::error::ConductorError;
@@ -18,12 +17,8 @@ use conductor_core::issue_source::{GitHubConfig, IssueSourceManager, JiraConfig}
 use conductor_core::jira_acli;
 use conductor_core::orchestrator::{self, OrchestratorConfig};
 use conductor_core::repo::{derive_local_path, derive_slug_from_url, RepoManager};
-use conductor_core::schema_config;
 use conductor_core::tickets::{build_agent_prompt, TicketInput, TicketSyncer};
-use conductor_core::workflow::{
-    collect_agent_names, default_skills_dir, detect_workflow_cycles, make_script_resolver,
-    validate_script_steps, validate_workflow_semantics, WorkflowExecConfig, WorkflowManager,
-};
+use conductor_core::workflow::{WorkflowExecConfig, WorkflowManager};
 use conductor_core::workflow_config;
 use conductor_core::worktree::WorktreeManager;
 
@@ -226,8 +221,11 @@ enum WorkflowCommands {
     },
     /// Validate a workflow definition (check all agents exist)
     Validate {
-        /// Workflow name
-        name: String,
+        /// Workflow name (required unless --all is set)
+        name: Option<String>,
+        /// Validate all workflows in .conductor/workflows/
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
         /// Repo slug (optional; auto-detected from CWD when omitted)
         repo: Option<String>,
         /// Worktree slug (optional; auto-detected from CWD when omitted)
@@ -1719,8 +1717,16 @@ fn main() -> Result<()> {
                 repo,
                 worktree,
                 name,
+                all,
                 path,
             } => {
+                if !all && name.is_none() {
+                    anyhow::bail!(
+                        "either <NAME> or --all must be provided. \
+                         Use --all to validate every workflow."
+                    );
+                }
+
                 let (wt_path, repo_path) = if let Some(ref dir) = path {
                     (dir.clone(), dir.clone())
                 } else if repo.is_some() && worktree.is_some() {
@@ -1753,160 +1759,77 @@ fn main() -> Result<()> {
                     (wt.path, r.local_path)
                 };
 
-                let workflow = WorkflowManager::load_def_by_name(&wt_path, &repo_path, &name)?;
+                // Collect workflows to validate.
+                let workflows: Vec<conductor_core::workflow::WorkflowDef>;
+                let mut parse_errors: Vec<String> = Vec::new();
 
-                let mut all_refs = collect_agent_names(&workflow.body);
-                all_refs.extend(collect_agent_names(&workflow.always));
-
-                // Deduplicate
-                all_refs.sort();
-                all_refs.dedup();
-
-                let specs: Vec<AgentSpec> = all_refs.iter().map(AgentSpec::from).collect();
-                let missing = conductor_core::agent_config::find_missing_agents(
-                    &wt_path,
-                    &repo_path,
-                    &specs,
-                    Some(&name),
-                );
-
-                println!("Workflow: {}", workflow.name);
-                println!("  Description: {}", workflow.description);
-                println!("  Trigger: {}", workflow.trigger);
-                let node_count = workflow.total_nodes();
-                println!("  Nodes: {node_count}");
-                println!("  Agents referenced: {}", all_refs.len());
-
-                // Collect and validate prompt snippets
-                let all_snippets = workflow.collect_all_snippet_refs();
-
-                let missing_snippets = conductor_core::prompt_config::find_missing_snippets(
-                    &wt_path,
-                    &repo_path,
-                    &all_snippets,
-                    Some(&name),
-                );
-
-                let mut has_errors = false;
-
-                if missing.is_empty() {
-                    println!("  All agents found.");
+                if all {
+                    let (defs, warnings) = WorkflowManager::list_defs(&wt_path, &repo_path)?;
+                    for w in &warnings {
+                        parse_errors.push(format!("{}: {}", w.file, w.message));
+                    }
+                    workflows = defs;
+                    if workflows.is_empty() && parse_errors.is_empty() {
+                        println!("No workflow files found.");
+                        return Ok(());
+                    }
                 } else {
-                    println!("\n  MISSING agents ({}/{}):", missing.len(), all_refs.len());
-                    for agent in &missing {
-                        println!("    - {agent}");
-                    }
-                    has_errors = true;
-                }
-
-                if !all_snippets.is_empty() {
-                    println!("  Prompt snippets referenced: {}", all_snippets.len());
-                    if missing_snippets.is_empty() {
-                        println!("  All prompt snippets found.");
-                    } else {
-                        println!(
-                            "\n  MISSING prompt snippets ({}/{}):",
-                            missing_snippets.len(),
-                            all_snippets.len()
-                        );
-                        for snippet in &missing_snippets {
-                            println!("    - {snippet}");
-                        }
-                        has_errors = true;
-                    }
-                }
-
-                // Collect and validate output schemas.
-                let all_schemas = workflow.collect_all_schema_refs();
-                let schema_issues =
-                    schema_config::check_schemas(&wt_path, &repo_path, &all_schemas, Some(&name));
-                if !all_schemas.is_empty() {
-                    println!("  Schemas referenced: {}", all_schemas.len());
-                    if schema_issues.is_empty() {
-                        println!("  All schemas found and valid.");
-                    } else {
-                        for issue in &schema_issues {
-                            match issue {
-                                schema_config::SchemaIssue::Missing(s) => {
-                                    println!("\n  MISSING schema: {s}");
-                                }
-                                schema_config::SchemaIssue::Invalid { name: s, error } => {
-                                    println!("\n  INVALID schema: {s}\n    {error}");
-                                }
-                            }
-                        }
-                        has_errors = true;
-                    }
-                }
-
-                // Check bot names against config.
-                let all_bots = workflow.collect_all_bot_names();
-                let unknown_bots: Vec<_> = all_bots
-                    .iter()
-                    .filter(|b| !config.github.apps.contains_key(b.as_str()))
-                    .cloned()
-                    .collect();
-                if !all_bots.is_empty() {
-                    println!("  Bot names referenced: {}", all_bots.len());
-                    if unknown_bots.is_empty() {
-                        println!("  All bot names found in config.");
-                    } else {
-                        println!(
-                            "\n  WARNING: unknown bot names ({}/{}):",
-                            unknown_bots.len(),
-                            all_bots.len()
-                        );
-                        for b in &unknown_bots {
-                            println!("    ~ {b} (not in [github.apps])");
-                        }
-                        // does NOT set has_errors = true — bot config is per-environment
-                    }
-                }
-
-                // Build a loader closure for cycle detection and semantic validation.
-                let wt_path = wt_path.clone();
-                let repo_path = repo_path.clone();
-                let loader = |wf_name: &str| {
-                    WorkflowManager::load_def_by_name(&wt_path, &repo_path, wf_name)
-                        .map_err(|e| e.to_string())
+                    // SAFETY: the `!all && name.is_none()` guard above ensures `name` is `Some` here.
+                    let wf_name = name
+                        .as_deref()
+                        .expect("name must be Some when --all is not set");
+                    workflows = vec![WorkflowManager::load_def_by_name(
+                        &wt_path, &repo_path, wf_name,
+                    )?];
                 };
 
-                // Cycle detection.
-                if let Err(cycle_msg) = detect_workflow_cycles(&workflow.name, &loader) {
-                    println!("\n  CYCLE DETECTED: {cycle_msg}");
-                    has_errors = true;
-                }
-
-                // Semantic validation (dataflow + required inputs).
-                let report = validate_workflow_semantics(&workflow, &loader);
-                if !report.is_ok() {
-                    println!("\n  SEMANTIC ERRORS ({}):", report.errors.len());
-                    for err in &report.errors {
-                        println!("    \u{2717} {}", err.message);
-                        if let Some(hint) = &err.hint {
-                            println!("      hint: {hint}");
-                        }
-                    }
-                    has_errors = true;
-                }
-
-                // Script step validation (existence + executable bit).
-                let script_errors = validate_script_steps(
-                    &workflow,
-                    &make_script_resolver(wt_path.clone(), repo_path.clone(), default_skills_dir()),
+                let known_bots: std::collections::HashSet<String> =
+                    config.github.apps.keys().cloned().collect();
+                let wt_ref = wt_path.clone();
+                let repo_ref = repo_path.clone();
+                let loader = |name: &str| {
+                    conductor_core::workflow::load_workflow_by_name(&wt_ref, &repo_ref, name)
+                        .map_err(|e| e.to_string())
+                };
+                let result = conductor_core::workflow::validate_workflows_batch(
+                    &workflows,
+                    &parse_errors,
+                    &wt_path,
+                    &repo_path,
+                    &known_bots,
+                    &loader,
                 );
-                if !script_errors.is_empty() {
-                    println!("\n  SCRIPT STEP ERRORS ({}):", script_errors.len());
-                    for err in &script_errors {
-                        println!("    \u{2717} {}", err.message);
-                        if let Some(hint) = &err.hint {
-                            println!("      hint: {hint}");
-                        }
-                    }
-                    has_errors = true;
+
+                // Report parse failures first.
+                for err in &result.parse_errors {
+                    println!("FAIL  {err}");
                 }
 
-                if has_errors {
+                // Report per-workflow results.
+                for entry in &result.entries {
+                    if entry.errors.is_empty() {
+                        println!("PASS  {}", entry.name);
+                    } else {
+                        println!("FAIL  {}", entry.name);
+                        for e in &entry.errors {
+                            match &e.hint {
+                                Some(h) => println!("      \u{2717} {} (hint: {h})", e.message),
+                                None => println!("      \u{2717} {}", e.message),
+                            }
+                        }
+                    }
+                    for w in &entry.warnings {
+                        println!("      ~ warning: {}", w.message);
+                    }
+                }
+
+                // Summary when validating multiple workflows.
+                if all {
+                    let passed = result.total() - result.failed_count();
+                    println!("\n{passed}/{} workflow(s) passed.", result.total());
+                }
+
+                if result.failed_count() > 0 {
                     std::process::exit(1);
                 }
             }
