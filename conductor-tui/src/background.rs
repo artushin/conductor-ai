@@ -87,15 +87,43 @@ pub fn spawn_db_poller(tx: BackgroundSender, interval: Duration) {
         // INSERT OR IGNORE attempts on every subsequent tick.
         let mut notified_feedback_ids: HashSet<String> = HashSet::new();
         let mut notified_gate_ids: HashSet<String> = HashSet::new();
+        // Incremental turn-counting state: run_id → (byte_offset, turn_count).
+        // Keyed by run ID (not worktree ID) so that a new run on the same
+        // worktree starts with a fresh offset instead of inheriting a stale one.
+        let mut turn_state: HashMap<String, (u64, i64)> = HashMap::new();
         loop {
             thread::sleep(interval);
             if let Some(PollResult {
-                action,
+                mut action,
                 config,
                 conn,
             }) = poll_data()
             {
-                if let Action::DataRefreshed(ref payload) = action {
+                // Compute live turn counts incrementally, reusing byte offsets from
+                // the previous tick so only newly-appended log bytes are parsed.
+                if let Action::DataRefreshed(ref mut payload) = action {
+                    use conductor_core::agent::{count_turns_incremental, AgentRunStatus};
+
+                    let mut live_turns = HashMap::new();
+                    let mut live_run_ids = HashSet::new();
+                    for (wt_id, run) in &payload.latest_agent_runs {
+                        if run.status == AgentRunStatus::Running {
+                            if let Some(ref path) = run.log_file {
+                                let (prev_offset, prev_count) =
+                                    turn_state.get(&run.id).copied().unwrap_or((0, 0));
+                                let (new_offset, new_count) =
+                                    count_turns_incremental(path, prev_offset, prev_count);
+                                turn_state.insert(run.id.clone(), (new_offset, new_count));
+                                live_turns.insert(wt_id.clone(), new_count);
+                                live_run_ids.insert(run.id.clone());
+                            }
+                        }
+                    }
+                    // Prune entries for runs that are no longer active.
+                    turn_state.retain(|run_id, _| live_run_ids.contains(run_id));
+
+                    payload.live_turns_by_worktree = live_turns;
+
                     // Reuse the connection returned by poll_data() — no need to open a
                     // second connection just for notification claims.
                     let claim_conn = if config.notifications.enabled {
@@ -293,19 +321,9 @@ pub fn poll_data() -> Option<PollResult> {
         })
     });
 
-    // Compute live turn counts for running agents off the main thread.
-    let live_turns_by_worktree = {
-        use conductor_core::agent::{count_turns_in_log, AgentRunStatus};
-        let mut map = std::collections::HashMap::new();
-        for (wt_id, run) in &latest_agent_runs {
-            if run.status == AgentRunStatus::Running {
-                if let Some(ref path) = run.log_file {
-                    map.insert(wt_id.clone(), count_turns_in_log(path));
-                }
-            }
-        }
-        map
-    };
+    // Live turn counts are computed incrementally by the background loop caller.
+    // Return an empty map here; the loop merges in the incremental state.
+    let live_turns_by_worktree = std::collections::HashMap::new();
 
     let action = Action::DataRefreshed(Box::new(DataRefreshedPayload {
         repos,
