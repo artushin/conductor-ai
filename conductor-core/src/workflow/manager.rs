@@ -143,7 +143,17 @@ impl<'a> WorkflowManager<'a> {
             parent_workflow_run_id: parent_workflow_run_id.map(String::from),
             target_label: target_label.map(String::from),
             default_bot_name: None,
+            iteration: 0,
         })
+    }
+
+    /// Persist the loop iteration number for a workflow run.
+    pub fn set_workflow_run_iteration(&self, run_id: &str, iteration: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE workflow_runs SET iteration = ?1 WHERE id = ?2",
+            params![iteration, run_id],
+        )?;
+        Ok(())
     }
 
     /// Persist the default bot name for a workflow run.
@@ -1468,6 +1478,7 @@ pub(super) fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<Workf
     let parent_workflow_run_id: Option<String> = row.get(14)?;
     let target_label: Option<String> = row.get(15)?;
     let default_bot_name: Option<String> = row.get(16)?;
+    let iteration: i64 = row.get(17)?;
     Ok(WorkflowRun {
         id: row.get(0)?,
         workflow_name: row.get(1)?,
@@ -1486,6 +1497,7 @@ pub(super) fn row_to_workflow_run(row: &rusqlite::Row) -> rusqlite::Result<Workf
         parent_workflow_run_id,
         target_label,
         default_bot_name,
+        iteration,
     })
 }
 
@@ -2640,5 +2652,26 @@ mod tests {
             steps.is_empty(),
             "waiting gate steps from failed runs must not be returned"
         );
+    }
+
+    #[test]
+    fn test_set_workflow_run_iteration() {
+        let conn = setup_db();
+        let run = create_worktree_run(&conn, "w1");
+        let mgr = WorkflowManager::new(&conn);
+
+        // Default iteration should be 0.
+        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched.iteration, 0);
+
+        // Set iteration to 3.
+        mgr.set_workflow_run_iteration(&run.id, 3).unwrap();
+        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched.iteration, 3);
+
+        // Set iteration to 0 again.
+        mgr.set_workflow_run_iteration(&run.id, 0).unwrap();
+        let fetched = mgr.get_workflow_run(&run.id).unwrap().unwrap();
+        assert_eq!(fetched.iteration, 0);
     }
 }

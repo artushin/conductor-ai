@@ -897,6 +897,7 @@ fn test_cannot_start_workflow_run_when_active() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let err = execute_workflow(&input).unwrap_err();
@@ -940,6 +941,7 @@ fn test_can_start_workflow_run_after_completion() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     // Guard should pass; empty workflow completes successfully.
@@ -985,6 +987,7 @@ fn test_child_workflow_not_blocked_by_parent() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let result = execute_workflow(&input);
@@ -1024,6 +1027,7 @@ fn test_run_id_notify_slot_is_populated() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: Some(std::sync::Arc::clone(&slot)),
     };
 
@@ -1071,6 +1075,7 @@ fn test_execute_workflow_falls_back_to_repo_root_when_worktree_path_missing() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
 
@@ -2026,6 +2031,7 @@ fn test_execute_workflow_injects_repo_variables() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let result = execute_workflow(&input).unwrap();
@@ -2075,6 +2081,7 @@ fn test_execute_workflow_injects_ticket_variables() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let result = execute_workflow(&input).unwrap();
@@ -2128,6 +2135,7 @@ fn test_execute_workflow_existing_input_not_overwritten_by_injection() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let result = execute_workflow(&input).unwrap();
@@ -2168,6 +2176,7 @@ fn test_execute_workflow_unknown_ticket_id_returns_error() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     assert!(
@@ -2199,6 +2208,7 @@ fn test_execute_workflow_unknown_repo_id_returns_error() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     assert!(
@@ -2235,6 +2245,7 @@ fn test_execute_workflow_ephemeral_skips_concurrent_guard() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let result1 = execute_workflow(&input1);
@@ -2265,6 +2276,7 @@ fn test_execute_workflow_ephemeral_skips_concurrent_guard() {
         parent_workflow_run_id: None,
         target_label: None,
         default_bot_name: None,
+        iteration: 0,
         run_id_notify: None,
     };
     let result2 = execute_workflow(&input2);
@@ -2569,5 +2581,66 @@ fn test_parallel_min_success_with_skipped_resume_agents() {
         status_fail,
         WorkflowStepStatus::Failed,
         "should fail when effective successes don't meet min_required"
+    );
+}
+
+#[test]
+fn test_execute_workflow_iteration_persisted() {
+    // When iteration > 0, execute_workflow should persist the iteration on the
+    // created workflow run record via set_workflow_run_iteration.
+    let conn = setup_db();
+    let config = Config::default();
+    let exec_config = WorkflowExecConfig::default();
+    let workflow = make_empty_workflow();
+
+    // Use run_id_notify to capture the workflow run ID.
+    let slot: RunIdSlot =
+        std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+
+    let input = WorkflowExecInput {
+        conn: &conn,
+        config: &config,
+        workflow: &workflow,
+        worktree_id: None,
+        working_dir: "",
+        repo_path: "",
+        ticket_id: None,
+        repo_id: None,
+        model: None,
+        exec_config: &exec_config,
+        inputs: HashMap::new(),
+        depth: 1,
+        parent_workflow_run_id: None,
+        target_label: None,
+        default_bot_name: None,
+        iteration: 3,
+        run_id_notify: Some(slot.clone()),
+    };
+
+    let result = execute_workflow(&input);
+    // The workflow will complete (empty body, no agents to spawn).
+    assert!(
+        result.is_ok(),
+        "execute_workflow should succeed: {:?}",
+        result
+    );
+
+    // Retrieve the run ID from the notify slot.
+    let run_id = slot
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("run_id should be set");
+
+    // Verify the run record has iteration == 3.
+    let wf_mgr = WorkflowManager::new(&conn);
+    let run = wf_mgr
+        .get_workflow_run(&run_id)
+        .unwrap()
+        .expect("run should exist");
+    assert_eq!(
+        run.iteration, 3,
+        "iteration should be persisted on the workflow run"
     );
 }
