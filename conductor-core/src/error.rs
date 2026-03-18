@@ -20,6 +20,9 @@ pub enum ConductorError {
     #[error("git error: {0}")]
     Git(String),
 
+    #[error("gh cli error: {0}")]
+    GhCli(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -61,6 +64,12 @@ pub enum ConductorError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("feature not found: {name}")]
+    FeatureNotFound { name: String },
+
+    #[error("feature already exists: {name}")]
+    FeatureAlreadyExists { name: String },
 }
 
 pub type Result<T> = std::result::Result<T, ConductorError>;

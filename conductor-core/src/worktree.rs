@@ -8,6 +8,7 @@ use std::process::Command;
 use crate::config::Config;
 use crate::db::query_collect;
 use crate::error::{ConductorError, Result};
+use crate::git::{check_output, git_in};
 use crate::repo::RepoManager;
 
 /// Typed representation of the three worktree lifecycle states stored in the DB.
@@ -448,7 +449,11 @@ impl<'a> WorktreeManager<'a> {
                 .unwrap_or(false)
         });
         let is_merged = ticket_closed
-            || is_branch_merged(&repo.local_path, &worktree.branch, &repo.default_branch);
+            || crate::git::is_branch_merged_local(
+                &repo.local_path,
+                &worktree.branch,
+                &repo.default_branch,
+            );
         let new_status = if is_merged {
             WorktreeStatus::Merged
         } else {
@@ -866,40 +871,6 @@ fn remove_git_artifacts(repo_path: &str, worktree_path: &str, branch: &str) {
         }
         Ok(_) => {}
     }
-}
-
-/// Check if a branch has been merged into the default branch.
-fn is_branch_merged(repo_path: &str, branch: &str, default_branch: &str) -> bool {
-    let output = git_in(repo_path)
-        .args(["branch", "--merged", default_branch])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout
-                .lines()
-                .any(|line| line.trim().trim_start_matches("* ") == branch)
-        }
-        _ => false,
-    }
-}
-
-/// Return a `Command` for `git` rooted at `dir`.
-pub(crate) fn git_in(dir: impl AsRef<std::path::Path>) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(dir);
-    cmd
-}
-
-/// Run `cmd`, returning its `Output` on success or a `ConductorError::Git` on non-zero exit.
-pub(crate) fn check_output(cmd: &mut Command) -> Result<std::process::Output> {
-    let output = cmd.output()?;
-    if !output.status.success() {
-        return Err(ConductorError::Git(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-    Ok(output)
 }
 
 /// Clone a remote repository into `local_path`.

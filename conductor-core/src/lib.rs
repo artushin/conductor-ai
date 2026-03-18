@@ -32,6 +32,8 @@ pub mod agent_runtime;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod feature;
+pub(crate) mod git;
 pub mod github;
 pub mod github_app;
 pub mod issue_source;

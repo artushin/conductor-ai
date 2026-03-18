@@ -727,6 +727,20 @@ pub fn run(conn: &Connection) -> Result<()> {
         bump_version(conn, 41)?;
     }
 
+    // --- Migration 42: features + feature_tickets tables ---
+    if version < 42 {
+        conn.execute_batch(include_str!("migrations/042_features.sql"))?;
+        bump_version(conn, 42)?;
+    }
+
+    // --- Migration 43: index on worktrees(repo_id, base_branch) for feature list subquery ---
+    if version < 43 {
+        conn.execute_batch(include_str!(
+            "migrations/043_idx_worktrees_repo_base_branch.sql"
+        ))?;
+        bump_version(conn, 43)?;
+    }
+
     Ok(())
 }
 
@@ -759,7 +773,8 @@ mod tests {
             CREATE TABLE worktrees (
                 id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
                 slug TEXT NOT NULL, branch TEXT NOT NULL, path TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+                status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+                base_branch TEXT NOT NULL DEFAULT 'main'
             );
             CREATE TABLE repo_issue_sources (
                 id          TEXT PRIMARY KEY,
@@ -813,7 +828,7 @@ mod tests {
             INSERT INTO repos VALUES ('r1', 'test-repo', '/tmp/repo',
                 'https://github.com/test/repo.git', 'main', '/tmp/ws', '2024-01-01T00:00:00Z');
             INSERT INTO worktrees VALUES ('w1', 'r1', 'feat-test', 'feat/test',
-                '/tmp/ws/feat-test', 'active', '2024-01-01T00:00:00Z');
+                '/tmp/ws/feat-test', 'active', '2024-01-01T00:00:00Z', 'main');
             INSERT INTO agent_runs (id, worktree_id, prompt, started_at)
                 VALUES ('ar1', 'w1', 'workflow', '2024-01-01T00:00:00Z');
             INSERT INTO workflow_runs (id, workflow_name, worktree_id, parent_run_id,
