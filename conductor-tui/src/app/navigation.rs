@@ -612,14 +612,7 @@ impl App {
                             let repo_id = repo.id.clone();
                             let remote_url = repo.remote_url.clone();
                             self.state.selected_repo_id = Some(repo_id.clone());
-                            self.state.detail_worktrees = self
-                                .state
-                                .data
-                                .worktrees
-                                .iter()
-                                .filter(|wt| wt.repo_id == repo_id)
-                                .cloned()
-                                .collect();
+                            self.state.rebuild_detail_worktree_tree(&repo_id);
                             self.state.detail_tickets = self
                                 .state
                                 .data

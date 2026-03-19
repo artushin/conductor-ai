@@ -935,14 +935,7 @@ impl App {
 
         // If in repo detail, refresh scoped data before rebuilding filtered vecs
         if let Some(ref repo_id) = self.state.selected_repo_id.clone() {
-            self.state.detail_worktrees = self
-                .state
-                .data
-                .worktrees
-                .iter()
-                .filter(|wt| &wt.repo_id == repo_id)
-                .cloned()
-                .collect();
+            self.state.rebuild_detail_worktree_tree(repo_id);
             self.state.detail_tickets = self
                 .state
                 .data
