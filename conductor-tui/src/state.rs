@@ -82,24 +82,30 @@ impl TreePosition {
     }
 }
 
-/// Reorder worktrees into tree order based on `base_branch` parent-child relationships.
+/// Tree-order worktrees by `base_branch` parent-child relationships, returning
+/// indices into the input and parallel `TreePosition`s — no cloning.
 ///
-/// A worktree is a child of another worktree when its `base_branch` matches the other's `branch`.
-/// Returns `(tree_ordered_worktrees, parallel_tree_positions)`.
-pub fn build_worktree_tree(
-    worktrees: &[Worktree],
+/// Accepts anything deref-able to `Worktree` so callers with `&[Worktree]` or
+/// `&[&Worktree]` can both use it.
+pub fn build_worktree_tree_indices<W: std::borrow::Borrow<Worktree>>(
+    worktrees: &[W],
     default_branch: &str,
-) -> (Vec<Worktree>, Vec<TreePosition>) {
+) -> (Vec<usize>, Vec<TreePosition>) {
     if worktrees.is_empty() {
         return (Vec::new(), Vec::new());
     }
 
+    let borrow = |i: usize| -> &Worktree { worktrees[i].borrow() };
+
     // Map branch name → indices of worktrees whose base_branch matches that branch (children).
     let mut children_of: HashMap<&str, Vec<usize>> = HashMap::new();
-    let branch_set: HashSet<&str> = worktrees.iter().map(|wt| wt.branch.as_str()).collect();
+    let branch_set: HashSet<&str> = worktrees
+        .iter()
+        .map(|wt| wt.borrow().branch.as_str())
+        .collect();
 
     for (i, wt) in worktrees.iter().enumerate() {
-        let parent_branch = wt.base_branch.as_deref().unwrap_or(default_branch);
+        let parent_branch = wt.borrow().base_branch.as_deref().unwrap_or(default_branch);
         children_of.entry(parent_branch).or_default().push(i);
     }
 
@@ -107,19 +113,19 @@ pub fn build_worktree_tree(
     // or doesn't match any other worktree's branch in the list.
     let mut roots: Vec<usize> = Vec::new();
     for (i, wt) in worktrees.iter().enumerate() {
-        let parent = wt.base_branch.as_deref().unwrap_or(default_branch);
+        let parent = wt.borrow().base_branch.as_deref().unwrap_or(default_branch);
         if parent == default_branch || !branch_set.contains(parent) {
             roots.push(i);
         }
     }
-    roots.sort_by(|a, b| worktrees[*a].branch.cmp(&worktrees[*b].branch));
+    roots.sort_by(|a, b| borrow(*a).branch.cmp(&borrow(*b).branch));
 
     // Sort each child group by branch name.
     for children in children_of.values_mut() {
-        children.sort_by(|a, b| worktrees[*a].branch.cmp(&worktrees[*b].branch));
+        children.sort_by(|a, b| borrow(*a).branch.cmp(&borrow(*b).branch));
     }
 
-    let mut result: Vec<Worktree> = Vec::with_capacity(worktrees.len());
+    let mut indices: Vec<usize> = Vec::with_capacity(worktrees.len());
     let mut positions: Vec<TreePosition> = Vec::with_capacity(worktrees.len());
     let mut visited: HashSet<usize> = HashSet::new();
 
@@ -141,9 +147,9 @@ pub fn build_worktree_tree(
             is_last_sibling: is_last,
             ancestors_are_last: ancestors_are_last.clone(),
         });
-        result.push(worktrees[idx].clone());
+        indices.push(idx);
 
-        let branch = worktrees[idx].branch.as_str();
+        let branch = borrow(idx).branch.as_str();
         if let Some(children) = children_of.get(branch) {
             let len = children.len();
             let mut child_ancestors = ancestors_are_last;
@@ -156,19 +162,32 @@ pub fn build_worktree_tree(
     }
 
     // Append any unvisited worktrees (cycle members) as roots.
-    for (i, wt) in worktrees.iter().enumerate() {
+    for i in 0..worktrees.len() {
         if !visited.contains(&i) {
             positions.push(TreePosition {
                 depth: 0,
                 is_last_sibling: true,
                 ancestors_are_last: Vec::new(),
             });
-            result.push(wt.clone());
+            indices.push(i);
             visited.insert(i);
         }
     }
 
-    (result, positions)
+    (indices, positions)
+}
+
+/// Reorder worktrees into tree order based on `base_branch` parent-child relationships.
+///
+/// A worktree is a child of another worktree when its `base_branch` matches the other's `branch`.
+/// Returns `(tree_ordered_worktrees, parallel_tree_positions)`.
+pub fn build_worktree_tree(
+    worktrees: &[Worktree],
+    default_branch: &str,
+) -> (Vec<Worktree>, Vec<TreePosition>) {
+    let (indices, positions) = build_worktree_tree_indices(worktrees, default_branch);
+    let ordered = indices.into_iter().map(|i| worktrees[i].clone()).collect();
+    (ordered, positions)
 }
 
 /// Reorder branch picker items into tree order based on `base_branch` parent-child relationships.
@@ -290,23 +309,14 @@ pub enum View {
     WorkflowDefDetail,
 }
 
-/// A row in the unified dashboard list — repo header, feature header, or worktree entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A row in the unified dashboard list — repo header or worktree entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardRow {
     /// Index into `AppState::data.repos`.
     Repo(usize),
-    /// A feature header row. `repo_idx` indexes `data.repos`, `feature_idx` indexes
-    /// `data.features_by_repo[&repo.id]`. `total` / `merged` are pre-computed child
-    /// worktree counts so render and input handlers don't rescan worktrees.
-    Feature {
-        repo_idx: usize,
-        feature_idx: usize,
-        total: usize,
-        merged: usize,
-    },
-    /// Index into `AppState::data.worktrees`. `is_feature_child` is `true` when
-    /// this worktree belongs to a feature group (used for indentation in the UI).
-    Worktree { idx: usize, is_feature_child: bool },
+    /// Index into `AppState::data.worktrees`. `prefix` carries the tree-drawing
+    /// prefix string (e.g. "├ ", "│ └ ") produced by `TreePosition::to_prefix()`.
+    Worktree { idx: usize, prefix: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1304,8 +1314,6 @@ pub struct AppState {
     pub selected_workflow_run_id: Option<String>,
     /// Set of parent workflow run IDs that are currently collapsed in the runs pane.
     pub collapsed_workflow_run_ids: HashSet<String>,
-    /// Set of feature IDs that are currently collapsed in the dashboard view.
-    pub collapsed_features: HashSet<String>,
     /// Set of repo slugs whose group header is collapsed in global mode.
     pub collapsed_repo_headers: HashSet<String>,
     /// Set of composite `"repo_slug/target_key"` strings whose target header is collapsed in global mode.
@@ -1696,7 +1704,6 @@ impl AppState {
             step_agent_event_index: 0,
             selected_workflow_run_id: None,
             collapsed_workflow_run_ids: HashSet::new(),
-            collapsed_features: HashSet::new(),
             collapsed_repo_headers: HashSet::new(),
             collapsed_target_headers: HashSet::new(),
             collapse_initialized: HashSet::new(),
@@ -2230,11 +2237,8 @@ impl AppState {
     }
 
     /// Ordered list of rows for the unified dashboard panel.
-    /// Each repo appears first, then feature groups with their child worktrees,
-    /// then ungrouped worktrees.
-    ///
-    /// Builds a per-repo worktree index up-front so the inner loop is O(W) total
-    /// rather than O(F×W).
+    /// Each repo appears first, then its worktrees in `build_worktree_tree()` order
+    /// with tree-drawing prefixes from `TreePosition::to_prefix()`.
     pub fn dashboard_rows(&self) -> Vec<DashboardRow> {
         // Build an index: repo_id → [(global_wt_idx, &Worktree)]
         let mut wts_by_repo: HashMap<&str, Vec<(usize, &conductor_core::worktree::Worktree)>> =
@@ -2250,61 +2254,40 @@ impl AppState {
         for (repo_idx, repo) in self.data.repos.iter().enumerate() {
             rows.push(DashboardRow::Repo(repo_idx));
 
-            let empty_features = Vec::new();
-            let features = self
-                .data
-                .features_by_repo
-                .get(&repo.id)
-                .unwrap_or(&empty_features);
-
             let repo_wts = wts_by_repo.get(repo.id.as_str());
             let empty_wts = Vec::new();
             let repo_wts = repo_wts.unwrap_or(&empty_wts);
 
-            // Track which worktrees are grouped under a feature
-            let mut grouped_wt_indices: HashSet<usize> = HashSet::new();
-
-            for (fi, feature) in features.iter().enumerate() {
-                let mut total = 0usize;
-                let mut merged = 0usize;
-                let mut children = Vec::new();
-
-                for &(wt_idx, wt) in repo_wts {
-                    if wt.belongs_to_feature(&repo.id, &feature.branch) {
-                        grouped_wt_indices.insert(wt_idx);
-                        total += 1;
-                        if wt.status.is_done() {
-                            merged += 1;
-                        }
-                        children.push(wt_idx);
-                    }
-                }
-
-                rows.push(DashboardRow::Feature {
-                    repo_idx,
-                    feature_idx: fi,
-                    total,
-                    merged,
-                });
-
-                if !self.collapsed_features.contains(&feature.id) {
-                    for wt_idx in children {
-                        rows.push(DashboardRow::Worktree {
-                            idx: wt_idx,
-                            is_feature_child: true,
-                        });
-                    }
-                }
+            if repo_wts.is_empty() {
+                continue;
             }
 
-            // Ungrouped worktrees (not under any feature)
-            for &(wt_idx, _) in repo_wts {
-                if !grouped_wt_indices.contains(&wt_idx) {
-                    rows.push(DashboardRow::Worktree {
-                        idx: wt_idx,
-                        is_feature_child: false,
-                    });
-                }
+            // Map local index → global index
+            let local_to_global: Vec<usize> = repo_wts.iter().map(|&(idx, _)| idx).collect();
+
+            // Collect worktree refs for tree ordering (no cloning needed)
+            let wt_refs: Vec<&Worktree> = repo_wts.iter().map(|&(_, wt)| wt).collect();
+            let (ordered_local_indices, positions) =
+                build_worktree_tree_indices(&wt_refs, &repo.default_branch);
+
+            for (local_idx, pos) in ordered_local_indices.iter().zip(positions.iter()) {
+                let global_idx = local_to_global[*local_idx];
+                // Build the full display prefix: "  " indent under repo header,
+                // plus tree connectors. to_prefix() returns empty for depth-0
+                // roots, so we add their connectors here.
+                let prefix = if pos.depth == 0 {
+                    if pos.is_last_sibling {
+                        "  └ ".to_string()
+                    } else {
+                        "  ├ ".to_string()
+                    }
+                } else {
+                    format!("  {}", pos.to_prefix())
+                };
+                rows.push(DashboardRow::Worktree {
+                    idx: global_idx,
+                    prefix,
+                });
             }
         }
         rows
@@ -2313,14 +2296,7 @@ impl AppState {
     /// Returns the dashboard row at `dashboard_index`.
     /// Delegates to `dashboard_rows()` to guarantee the two can never diverge.
     pub fn current_dashboard_row(&self) -> Option<DashboardRow> {
-        self.dashboard_rows().get(self.dashboard_index).copied()
-    }
-
-    /// Look up a feature by repo index and feature index.
-    /// Resolves the three-level lookup: repo_idx → repo.id → features_by_repo → feature.
-    pub fn feature_at(&self, repo_idx: usize, feature_idx: usize) -> Option<&FeatureRow> {
-        let repo = self.data.repos.get(repo_idx)?;
-        self.data.features_by_repo.get(&repo.id)?.get(feature_idx)
+        self.dashboard_rows().get(self.dashboard_index).cloned()
     }
 
     /// Get the currently selected repo, if any.
@@ -2328,7 +2304,6 @@ impl AppState {
     pub fn selected_repo(&self) -> Option<&Repo> {
         match self.current_dashboard_row()? {
             DashboardRow::Repo(idx) => self.data.repos.get(idx),
-            DashboardRow::Feature { repo_idx, .. } => self.data.repos.get(repo_idx),
             DashboardRow::Worktree { idx, .. } => {
                 let wt = self.data.worktrees.get(idx)?;
                 self.data.repos.iter().find(|r| r.id == wt.repo_id)
@@ -4026,19 +4001,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn make_feature_row(id: &str, branch: &str) -> conductor_core::feature::FeatureRow {
-        conductor_core::feature::FeatureRow {
-            id: id.into(),
-            name: id.into(),
-            branch: branch.into(),
-            base_branch: "main".into(),
-            status: conductor_core::feature::FeatureStatus::Active,
-            created_at: String::new(),
-            worktree_count: 0,
-            ticket_count: 0,
-        }
-    }
-
     #[test]
     fn dashboard_rows_repo_only() {
         let mut state = AppState::new();
@@ -4048,7 +4010,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dashboard_rows_ungrouped_worktrees() {
+    fn dashboard_rows_flat_worktrees() {
         let mut state = AppState::new();
         state.data.repos = vec![make_repo("r1", "repo-a")];
         state.data.worktrees = vec![
@@ -4066,35 +4028,28 @@ pub(crate) mod tests {
             ),
         ];
         let rows = state.dashboard_rows();
-        assert_eq!(
-            rows,
-            vec![
-                DashboardRow::Repo(0),
-                DashboardRow::Worktree {
-                    idx: 0,
-                    is_feature_child: false,
-                },
-                DashboardRow::Worktree {
-                    idx: 1,
-                    is_feature_child: false,
-                },
-            ]
-        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], DashboardRow::Repo(0));
+        // Both are root-level (no parent); dashboard prefixes include indent + connector
+        match &rows[1] {
+            DashboardRow::Worktree { prefix, .. } => assert_eq!(prefix, "  ├ "),
+            other => panic!("expected Worktree, got {other:?}"),
+        }
+        match &rows[2] {
+            DashboardRow::Worktree { prefix, .. } => assert_eq!(prefix, "  └ "),
+            other => panic!("expected Worktree, got {other:?}"),
+        }
     }
 
     #[test]
-    fn dashboard_rows_feature_groups_worktrees() {
+    fn dashboard_rows_tree_ordered_parent_child() {
         let mut state = AppState::new();
         state.data.repos = vec![make_repo("r1", "repo-a")];
-        state
-            .data
-            .features_by_repo
-            .insert("r1".into(), vec![make_feature_row("f1", "feat/big-thing")]);
         state.data.worktrees = vec![
             make_worktree(
                 "wt1",
                 "r1",
-                Some("feat/big-thing"),
+                Some("feat/wt2"),
                 conductor_core::worktree::WorktreeStatus::Active,
             ),
             make_worktree(
@@ -4105,69 +4060,27 @@ pub(crate) mod tests {
             ),
         ];
         let rows = state.dashboard_rows();
-        assert_eq!(
-            rows,
-            vec![
-                DashboardRow::Repo(0),
-                DashboardRow::Feature {
-                    repo_idx: 0,
-                    feature_idx: 0,
-                    total: 1,
-                    merged: 0,
-                },
-                DashboardRow::Worktree {
-                    idx: 0,
-                    is_feature_child: true,
-                }, // grouped under feature
-                DashboardRow::Worktree {
-                    idx: 1,
-                    is_feature_child: false,
-                }, // ungrouped
-            ]
-        );
-    }
-
-    #[test]
-    fn dashboard_rows_collapsed_feature_hides_children() {
-        let mut state = AppState::new();
-        state.data.repos = vec![make_repo("r1", "repo-a")];
-        state
-            .data
-            .features_by_repo
-            .insert("r1".into(), vec![make_feature_row("f1", "feat/big-thing")]);
-        state.data.worktrees = vec![
-            make_worktree(
-                "wt1",
-                "r1",
-                Some("feat/big-thing"),
-                conductor_core::worktree::WorktreeStatus::Active,
-            ),
-            make_worktree(
-                "wt2",
-                "r1",
-                None,
-                conductor_core::worktree::WorktreeStatus::Active,
-            ),
-        ];
-        state.collapsed_features.insert("f1".into());
-        let rows = state.dashboard_rows();
-        assert_eq!(
-            rows,
-            vec![
-                DashboardRow::Repo(0),
-                DashboardRow::Feature {
-                    repo_idx: 0,
-                    feature_idx: 0,
-                    total: 1,
-                    merged: 0,
-                },
-                // wt1 is hidden (collapsed)
-                DashboardRow::Worktree {
-                    idx: 1,
-                    is_feature_child: false,
-                }, // ungrouped still shows
-            ]
-        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], DashboardRow::Repo(0));
+        // wt2 is parent (base_branch=main), wt1 is child (base_branch=feat/wt2)
+        // Tree order: wt2 first, then wt1
+        match &rows[1] {
+            DashboardRow::Worktree { idx, prefix } => {
+                assert_eq!(*idx, 1, "wt2 should come first (parent)");
+                assert_eq!(prefix, "  └ ", "sole root gets └ connector");
+            }
+            other => panic!("expected Worktree, got {other:?}"),
+        }
+        match &rows[2] {
+            DashboardRow::Worktree { idx, prefix } => {
+                assert_eq!(*idx, 0, "wt1 should come second (child)");
+                assert_eq!(
+                    prefix, "    └ ",
+                    "child prefix: 2-space repo indent + to_prefix(depth=1, last)"
+                );
+            }
+            other => panic!("expected Worktree, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4188,13 +4101,10 @@ pub(crate) mod tests {
         state.dashboard_index = 0;
         assert_eq!(state.current_dashboard_row(), Some(DashboardRow::Repo(0)));
         state.dashboard_index = 1;
-        assert_eq!(
+        assert!(matches!(
             state.current_dashboard_row(),
-            Some(DashboardRow::Worktree {
-                idx: 0,
-                is_feature_child: false,
-            })
-        );
+            Some(DashboardRow::Worktree { idx: 0, .. })
+        ));
     }
 
     #[test]
@@ -4206,52 +4116,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn current_dashboard_row_skips_collapsed_children() {
-        let mut state = AppState::new();
-        state.data.repos = vec![make_repo("r1", "repo-a")];
-        state
-            .data
-            .features_by_repo
-            .insert("r1".into(), vec![make_feature_row("f1", "feat/big-thing")]);
-        state.data.worktrees = vec![
-            make_worktree(
-                "wt1",
-                "r1",
-                Some("feat/big-thing"),
-                conductor_core::worktree::WorktreeStatus::Active,
-            ),
-            make_worktree(
-                "wt2",
-                "r1",
-                None,
-                conductor_core::worktree::WorktreeStatus::Active,
-            ),
-        ];
-        state.collapsed_features.insert("f1".into());
-        // Rows: Repo(0), Feature{0,0}, Worktree{1,false} (wt1 hidden)
-        state.dashboard_index = 2;
-        assert_eq!(
-            state.current_dashboard_row(),
-            Some(DashboardRow::Worktree {
-                idx: 1,
-                is_feature_child: false,
-            })
-        );
-    }
-
-    #[test]
     fn current_dashboard_row_agrees_with_dashboard_rows() {
         let mut state = AppState::new();
         state.data.repos = vec![make_repo("r1", "repo-a"), make_repo("r2", "repo-b")];
-        state
-            .data
-            .features_by_repo
-            .insert("r1".into(), vec![make_feature_row("f1", "feat/thing")]);
         state.data.worktrees = vec![
             make_worktree(
                 "wt1",
                 "r1",
-                Some("feat/thing"),
+                None,
                 conductor_core::worktree::WorktreeStatus::Active,
             ),
             make_worktree(
@@ -4298,73 +4170,60 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dashboard_rows_feature_stats_count_correctly() {
+    fn dashboard_rows_multi_level_tree() {
         let mut state = AppState::new();
         state.data.repos = vec![make_repo("r1", "repo-a")];
-        state
-            .data
-            .features_by_repo
-            .insert("r1".into(), vec![make_feature_row("f1", "feat/big-thing")]);
+        // Chain: wt_root → wt_mid → wt_leaf (3 levels deep)
         state.data.worktrees = vec![
             make_worktree(
-                "wt1",
+                "wt_leaf",
                 "r1",
-                Some("feat/big-thing"),
+                Some("feat/wt_mid"),
                 conductor_core::worktree::WorktreeStatus::Active,
             ),
             make_worktree(
-                "wt2",
-                "r1",
-                Some("feat/big-thing"),
-                conductor_core::worktree::WorktreeStatus::Merged,
-            ),
-            make_worktree(
-                "wt3",
-                "r1",
-                Some("feat/big-thing"),
-                conductor_core::worktree::WorktreeStatus::Abandoned,
-            ),
-            make_worktree(
-                "wt4",
+                "wt_root",
                 "r1",
                 None,
                 conductor_core::worktree::WorktreeStatus::Active,
             ),
+            make_worktree(
+                "wt_mid",
+                "r1",
+                Some("feat/wt_root"),
+                conductor_core::worktree::WorktreeStatus::Active,
+            ),
         ];
         let rows = state.dashboard_rows();
-        // The Feature row should have total=3, merged=2
-        let feature_row = rows
-            .iter()
-            .find(|r| matches!(r, DashboardRow::Feature { .. }))
-            .unwrap();
-        match feature_row {
-            DashboardRow::Feature { total, merged, .. } => {
-                assert_eq!(*total, 3);
-                assert_eq!(*merged, 2);
+        assert_eq!(rows.len(), 4); // Repo + 3 worktrees
+                                   // Tree order should be: wt_root, wt_mid, wt_leaf
+        match &rows[1] {
+            DashboardRow::Worktree { idx, prefix } => {
+                assert_eq!(*idx, 1, "wt_root first");
+                assert_eq!(prefix, "  └ ", "sole root gets └ connector");
             }
-            _ => unreachable!(),
+            other => panic!("expected Worktree, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn selected_repo_returns_repo_for_feature_row() {
-        let mut state = AppState::new();
-        let repo = make_repo("r1", "my-repo");
-        state.data.repos = vec![repo];
-        state
-            .data
-            .features_by_repo
-            .insert("r1".into(), vec![make_feature_row("f1", "feat/thing")]);
-        // Build dashboard rows and select the feature row
-        let rows = state.dashboard_rows();
-        let feature_pos = rows
-            .iter()
-            .position(|r| matches!(r, DashboardRow::Feature { .. }))
-            .expect("should have a Feature row");
-        state.dashboard_index = feature_pos;
-        let selected = state.selected_repo().expect("should resolve owning repo");
-        assert_eq!(selected.id, "r1");
-        assert_eq!(selected.slug, "my-repo");
+        match &rows[2] {
+            DashboardRow::Worktree { idx, prefix } => {
+                assert_eq!(*idx, 2, "wt_mid second");
+                assert_eq!(
+                    prefix, "    └ ",
+                    "child prefix: 2-space repo indent + to_prefix(depth=1, last)"
+                );
+            }
+            other => panic!("expected Worktree, got {other:?}"),
+        }
+        match &rows[3] {
+            DashboardRow::Worktree { idx, prefix } => {
+                assert_eq!(*idx, 0, "wt_leaf third");
+                assert_eq!(
+                    prefix, "      └ ",
+                    "grandchild prefix: 2-space repo indent + to_prefix(depth=2, last)"
+                );
+            }
+            other => panic!("expected Worktree, got {other:?}"),
+        }
     }
 
     fn make_wt(branch: &str, base_branch: Option<&str>) -> Worktree {
