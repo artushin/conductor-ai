@@ -79,6 +79,7 @@ pub struct FeatureRow {
 pub struct UnregisteredBranch {
     pub branch: String,
     pub worktree_count: i64,
+    pub base_branch: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +632,7 @@ impl<'a> FeatureManager<'a> {
     ) -> Result<Vec<UnregisteredBranch>> {
         query_collect(
             self.conn,
-            "SELECT DISTINCT w.branch, COUNT(*) as worktree_count
+            "SELECT w.branch, COUNT(*) as worktree_count, MIN(w.base_branch) as base_branch
              FROM worktrees w
              WHERE w.repo_id = ?1
                AND w.status = 'active'
@@ -643,6 +644,7 @@ impl<'a> FeatureManager<'a> {
                 Ok(UnregisteredBranch {
                     branch: row.get(0)?,
                     worktree_count: row.get(1)?,
+                    base_branch: row.get(2)?,
                 })
             },
         )
@@ -2022,6 +2024,7 @@ mod tests {
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].branch, "feat/orphan");
         assert_eq!(orphans[0].worktree_count, 1);
+        assert_eq!(orphans[0].base_branch.as_deref(), Some("main"));
     }
 
     #[test]
@@ -2061,6 +2064,7 @@ mod tests {
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].branch, "feat/active-orphan");
         assert_eq!(orphans[0].worktree_count, 1);
+        assert_eq!(orphans[0].base_branch.as_deref(), Some("main"));
     }
 
     #[test]

@@ -614,33 +614,42 @@ pub fn render_branch_picker(
     frame: &mut Frame,
     area: Rect,
     items: &[crate::state::BranchPickerItem],
+    tree_positions: &[crate::state::TreePosition],
     selected: usize,
     theme: &Theme,
 ) {
     let label_strings: Vec<String> = items
         .iter()
-        .map(|item| match &item.branch {
-            None => "default branch".to_string(),
-            Some(branch) => {
-                let mut parts = Vec::new();
-                if item.worktree_count > 0 {
-                    parts.push(format!(
-                        "{} worktree{}",
-                        item.worktree_count,
-                        if item.worktree_count == 1 { "" } else { "s" }
-                    ));
-                }
-                if item.ticket_count > 0 {
-                    parts.push(format!(
-                        "{} ticket{}",
-                        item.ticket_count,
-                        if item.ticket_count == 1 { "" } else { "s" }
-                    ));
-                }
-                if parts.is_empty() {
-                    branch.clone()
-                } else {
-                    format!("{} ({})", branch, parts.join(", "))
+        .enumerate()
+        .map(|(i, item)| {
+            let tree_prefix = tree_positions
+                .get(i)
+                .map(|pos| pos.to_prefix())
+                .unwrap_or_default();
+            match &item.branch {
+                None => "default branch".to_string(),
+                Some(branch) => {
+                    let mut parts = Vec::new();
+                    if item.worktree_count > 0 {
+                        parts.push(format!(
+                            "{} worktree{}",
+                            item.worktree_count,
+                            if item.worktree_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if item.ticket_count > 0 {
+                        parts.push(format!(
+                            "{} ticket{}",
+                            item.ticket_count,
+                            if item.ticket_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    let label = if parts.is_empty() {
+                        branch.clone()
+                    } else {
+                        format!("{} ({})", branch, parts.join(", "))
+                    };
+                    format!("{tree_prefix}{label}")
                 }
             }
         })
