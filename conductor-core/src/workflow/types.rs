@@ -72,6 +72,14 @@ pub struct WorkflowRun {
     pub feature_id: Option<String>,
 }
 
+impl WorkflowRun {
+    /// Whether this run was triggered by a workflow hook (prevents infinite chains).
+    /// Derived from `trigger == "hook"` rather than stored separately.
+    pub fn is_triggered_by_hook(&self) -> bool {
+        self.trigger == "hook"
+    }
+}
+
 /// A workflow step execution record from the database.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowRunStep {
@@ -344,6 +352,8 @@ pub struct WorkflowExecInput<'a> {
     /// The `Condvar` is notified once the ID has been written, allowing waiters to
     /// block efficiently instead of spinning.
     pub run_id_notify: Option<RunIdSlot>,
+    /// Whether this run was triggered by a workflow hook (prevents infinite chains).
+    pub triggered_by_hook: bool,
 }
 
 /// Owned inputs for [`execute_workflow_standalone`], avoiding lifetime issues
@@ -367,6 +377,8 @@ pub struct WorkflowExecStandalone {
     /// If set, the workflow run ID is written here immediately after the run record is
     /// created (before any steps execute). See [`WorkflowExecInput::run_id_notify`].
     pub run_id_notify: Option<RunIdSlot>,
+    /// Whether this run was triggered by a workflow hook (prevents infinite chains).
+    pub triggered_by_hook: bool,
 }
 
 /// Owned inputs for [`resume_workflow_standalone`], avoiding lifetime issues

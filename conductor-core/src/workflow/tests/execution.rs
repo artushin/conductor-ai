@@ -900,6 +900,7 @@ fn test_cannot_start_workflow_run_when_active() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let err = execute_workflow(&input).unwrap_err();
     assert!(
@@ -945,6 +946,7 @@ fn test_can_start_workflow_run_after_completion() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     // Guard should pass; empty workflow completes successfully.
     let result = execute_workflow(&input);
@@ -992,6 +994,7 @@ fn test_child_workflow_not_blocked_by_parent() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result = execute_workflow(&input);
     assert!(
@@ -1033,6 +1036,7 @@ fn test_run_id_notify_slot_is_populated() {
         feature_id: None,
         iteration: 0,
         run_id_notify: Some(std::sync::Arc::clone(&slot)),
+        triggered_by_hook: false,
     };
 
     execute_workflow(&input).expect("workflow should complete");
@@ -1082,6 +1086,7 @@ fn test_execute_workflow_falls_back_to_repo_root_when_worktree_path_missing() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
 
     let result = execute_workflow(&input).expect(
@@ -2039,6 +2044,7 @@ fn test_execute_workflow_injects_repo_variables() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result = execute_workflow(&input).unwrap();
 
@@ -2090,6 +2096,7 @@ fn test_execute_workflow_injects_ticket_variables() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result = execute_workflow(&input).unwrap();
 
@@ -2145,6 +2152,7 @@ fn test_execute_workflow_existing_input_not_overwritten_by_injection() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result = execute_workflow(&input).unwrap();
 
@@ -2187,6 +2195,7 @@ fn test_execute_workflow_unknown_ticket_id_returns_error() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     assert!(
         execute_workflow(&input).is_err(),
@@ -2220,6 +2229,7 @@ fn test_execute_workflow_unknown_repo_id_returns_error() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     assert!(
         execute_workflow(&input).is_err(),
@@ -2258,6 +2268,7 @@ fn test_execute_workflow_ephemeral_skips_concurrent_guard() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result1 = execute_workflow(&input1);
     assert!(
@@ -2290,6 +2301,7 @@ fn test_execute_workflow_ephemeral_skips_concurrent_guard() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result2 = execute_workflow(&input2);
     assert!(
@@ -2628,6 +2640,7 @@ fn test_execute_workflow_iteration_persisted() {
         feature_id: None,
         iteration: 3,
         run_id_notify: Some(slot.clone()),
+        triggered_by_hook: false,
     };
 
     let result = execute_workflow(&input);
@@ -2701,6 +2714,7 @@ fn test_execute_workflow_fails_on_invalid_schema() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
 
     let err = execute_workflow(&input).unwrap_err();
@@ -2774,6 +2788,7 @@ fn test_execute_workflow_fails_on_invalid_schema_parse() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
 
     let err = execute_workflow(&input).unwrap_err();
@@ -2851,6 +2866,7 @@ fn test_execute_workflow_passes_preflight_with_valid_schema() {
         feature_id: None,
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
 
     // execute_workflow should pass pre-flight validation (schema exists and is valid).
@@ -2903,6 +2919,7 @@ fn test_execute_workflow_injects_feature_variables() {
         feature_id: Some("f1"),
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result = execute_workflow(&input).unwrap();
 
@@ -2952,6 +2969,7 @@ fn test_execute_workflow_invalid_feature_id_returns_error() {
         feature_id: Some("nonexistent-feature-id"),
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let err = execute_workflow(&input).unwrap_err();
     assert!(
@@ -3016,6 +3034,7 @@ fn test_call_workflow_propagates_feature_id_to_child() {
         feature_id: Some("f1"),
         iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
     };
     let result = execute_workflow(&input).unwrap();
 
@@ -3053,5 +3072,307 @@ fn test_call_workflow_propagates_feature_id_to_child() {
         child_run.inputs.get("feature_branch").map(String::as_str),
         Some("feat/my-feature"),
         "child run should have feature_branch in its inputs"
+    );
+}
+
+#[test]
+fn test_call_workflow_propagates_triggered_by_hook_to_child() {
+    let conn = setup_db();
+    let config = Config::default();
+    let exec_config = WorkflowExecConfig::default();
+
+    // Create a temp dir with a child workflow file.
+    let tmp = tempfile::tempdir().unwrap();
+    let wf_dir = tmp.path().join(".conductor/workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("child.wf"),
+        "workflow child { meta { targets = [\"worktree\"] } }",
+    )
+    .unwrap();
+    let working_dir = tmp.path().to_str().unwrap();
+
+    // Parent workflow that calls the child, triggered by hook.
+    let mut parent = make_empty_workflow();
+    parent
+        .body
+        .push(WorkflowNode::CallWorkflow(CallWorkflowNode {
+            workflow: "child".into(),
+            inputs: HashMap::new(),
+            retries: 0,
+            on_fail: None,
+            bot_name: None,
+        }));
+
+    let input = WorkflowExecInput {
+        conn: &conn,
+        config: &config,
+        workflow: &parent,
+        worktree_id: None,
+        working_dir,
+        repo_path: "",
+        ticket_id: None,
+        repo_id: None,
+        model: None,
+        exec_config: &exec_config,
+        inputs: HashMap::new(),
+        depth: 0,
+        parent_workflow_run_id: None,
+        target_label: None,
+        default_bot_name: None,
+        feature_id: None,
+        iteration: 0,
+        run_id_notify: None,
+        triggered_by_hook: true,
+    };
+    let result = execute_workflow(&input).unwrap();
+    assert!(result.all_succeeded);
+
+    // Parent run must have trigger='hook'.
+    let wf_mgr = WorkflowManager::new(&conn);
+    let parent_run = wf_mgr
+        .get_workflow_run(&result.workflow_run_id)
+        .unwrap()
+        .expect("parent run should exist");
+    assert!(
+        parent_run.is_triggered_by_hook(),
+        "parent run should have trigger='hook'"
+    );
+
+    // Child run must also have trigger='hook' (propagated via triggered_by_hook).
+    use rusqlite::params;
+    let child_run_id: String = conn
+        .query_row(
+            "SELECT id FROM workflow_runs WHERE parent_workflow_run_id = ?1",
+            params![result.workflow_run_id],
+            |row| row.get(0),
+        )
+        .expect("child run should exist");
+    let child_run = wf_mgr
+        .get_workflow_run(&child_run_id)
+        .unwrap()
+        .expect("child run should exist");
+    assert_eq!(
+        child_run.trigger, "hook",
+        "child run should inherit trigger='hook' from parent"
+    );
+    assert!(
+        child_run.is_triggered_by_hook(),
+        "child run should be marked as triggered by hook"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// evaluate_hooks integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a temp dir with `.conductor/config.toml` and optional workflow files.
+fn setup_hooks_dir(config_toml: &str, workflows: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let conductor_dir = dir.path().join(".conductor");
+    std::fs::create_dir_all(conductor_dir.join("workflows")).unwrap();
+    std::fs::write(conductor_dir.join("config.toml"), config_toml).unwrap();
+    for (name, content) in workflows {
+        std::fs::write(conductor_dir.join("workflows").join(name), content).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn test_hook_chain_prevention_when_triggered_by_hook() {
+    // When triggered_by_hook is true, hooks should NOT fire (prevents infinite chains).
+    let dir = setup_hooks_dir(
+        r#"
+[hooks.test-wf]
+on_complete = "should-not-fire"
+"#,
+        &[(
+            "should-not-fire.wf",
+            r#"workflow should-not-fire {
+  meta {
+    description = "should never run"
+    trigger = "manual"
+    targets = ["worktree"]
+  }
+}"#,
+        )],
+    );
+
+    let conn = setup_db();
+    let config = Config::default();
+    let exec_config = WorkflowExecConfig::default();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let workflow = make_empty_workflow();
+    let input = WorkflowExecInput {
+        conn: &conn,
+        config: &config,
+        workflow: &workflow,
+        worktree_id: None,
+        working_dir: dir_path,
+        repo_path: dir_path,
+        ticket_id: None,
+        repo_id: None,
+        model: None,
+        exec_config: &exec_config,
+        inputs: HashMap::new(),
+        depth: 0,
+        parent_workflow_run_id: None,
+        target_label: None,
+        default_bot_name: None,
+        feature_id: None,
+        iteration: 0,
+        run_id_notify: None,
+        triggered_by_hook: true,
+    };
+
+    let result = execute_workflow(&input).unwrap();
+    assert!(result.all_succeeded);
+
+    // Verify no hook workflow run was created — only the main run should exist.
+    // Query all runs directly (no worktree_id filter).
+    let all_runs: Vec<WorkflowRun> = crate::db::query_collect(
+        &conn,
+        &format!(
+            "SELECT {} FROM workflow_runs ORDER BY started_at",
+            crate::workflow::constants::RUN_COLUMNS
+        ),
+        [],
+        crate::workflow::manager::row_to_workflow_run,
+    )
+    .unwrap();
+    assert_eq!(
+        all_runs.len(),
+        1,
+        "only the main run should exist (no hook run)"
+    );
+    assert!(
+        all_runs[0].is_triggered_by_hook(),
+        "main run should have trigger='hook'"
+    );
+}
+
+#[test]
+fn test_hook_skips_missing_workflow() {
+    // When hooks config references a workflow that doesn't exist, the main
+    // workflow should still complete successfully.
+    let dir = setup_hooks_dir(
+        r#"
+[hooks.test-wf]
+on_complete = "nonexistent-hook-wf"
+"#,
+        &[], // no workflow files
+    );
+
+    let conn = setup_db();
+    let config = Config::default();
+    let exec_config = WorkflowExecConfig::default();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let workflow = make_empty_workflow();
+    let input = WorkflowExecInput {
+        conn: &conn,
+        config: &config,
+        workflow: &workflow,
+        worktree_id: None,
+        working_dir: dir_path,
+        repo_path: dir_path,
+        ticket_id: None,
+        repo_id: None,
+        model: None,
+        exec_config: &exec_config,
+        inputs: HashMap::new(),
+        depth: 0,
+        parent_workflow_run_id: None,
+        target_label: None,
+        default_bot_name: None,
+        feature_id: None,
+        iteration: 0,
+        run_id_notify: None,
+        triggered_by_hook: false,
+    };
+
+    let result = execute_workflow(&input).unwrap();
+    assert!(
+        result.all_succeeded,
+        "main workflow should succeed even when hook workflow is missing"
+    );
+}
+
+#[test]
+fn test_hook_fires_on_complete() {
+    // When a top-level workflow completes and hooks config has an on_complete
+    // entry, the hook workflow should be triggered with trigger='hook'.
+    let dir = setup_hooks_dir(
+        r#"
+[hooks.test-wf]
+on_complete = "post-complete"
+"#,
+        &[(
+            "post-complete.wf",
+            r#"workflow post-complete {
+  meta {
+    description = "post-complete hook"
+    trigger = "manual"
+    targets = ["worktree"]
+  }
+}"#,
+        )],
+    );
+
+    let conn = setup_db();
+    let config = Config::default();
+    let exec_config = WorkflowExecConfig::default();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let workflow = make_empty_workflow();
+    let input = WorkflowExecInput {
+        conn: &conn,
+        config: &config,
+        workflow: &workflow,
+        worktree_id: None,
+        working_dir: dir_path,
+        repo_path: dir_path,
+        ticket_id: None,
+        repo_id: None,
+        model: None,
+        exec_config: &exec_config,
+        inputs: HashMap::new(),
+        depth: 0,
+        parent_workflow_run_id: None,
+        target_label: None,
+        default_bot_name: None,
+        feature_id: None,
+        iteration: 0,
+        run_id_notify: None,
+        triggered_by_hook: false,
+    };
+
+    let result = execute_workflow(&input).unwrap();
+    assert!(result.all_succeeded);
+
+    // Verify that a hook workflow run was created with trigger='hook'.
+    let all_runs: Vec<WorkflowRun> = crate::db::query_collect(
+        &conn,
+        &format!(
+            "SELECT {} FROM workflow_runs ORDER BY started_at",
+            crate::workflow::constants::RUN_COLUMNS
+        ),
+        [],
+        crate::workflow::manager::row_to_workflow_run,
+    )
+    .unwrap();
+    assert_eq!(all_runs.len(), 2, "main + hook run should exist");
+
+    let hook_run = all_runs
+        .iter()
+        .find(|r| r.workflow_name == "post-complete")
+        .expect("hook workflow run should exist");
+    assert_eq!(hook_run.trigger, "hook");
+    assert!(hook_run.is_triggered_by_hook());
+    assert_eq!(
+        hook_run.parent_workflow_run_id.as_deref(),
+        Some(result.workflow_run_id.as_str()),
+        "hook run should link to parent"
     );
 }
