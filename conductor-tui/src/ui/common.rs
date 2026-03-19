@@ -1,4 +1,5 @@
 use conductor_core::tickets::TicketLabel;
+use conductor_core::workflow::GateType;
 use conductor_core::worktree::{Worktree, WorktreeStatus};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -7,6 +8,7 @@ use ratatui::widgets::{ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::state::{AppState, View};
+use crate::theme::Theme;
 
 /// Parse a 6-digit hex color string (with or without `#`) into `Color::Rgb`.
 /// Falls back to `Color::DarkGray` on any parse error.
@@ -347,6 +349,74 @@ pub fn ticket_agent_total_spans(
     )]
 }
 
+/// Return the canonical (icon, color) pair for a gate type.
+///
+/// Used by both the pending-gates panel and the workflow run list to ensure
+/// consistent iconography across views.
+pub fn gate_type_icon(gate_type: Option<&GateType>, theme: &Theme) -> (&'static str, Color) {
+    match gate_type {
+        Some(GateType::PrChecks) => ("⏳", theme.status_waiting),
+        Some(GateType::PrApproval | GateType::HumanApproval | GateType::HumanReview) => {
+            ("👤", theme.label_warning)
+        }
+        None => ("⏸", theme.status_waiting),
+    }
+}
+
+/// Format an ISO 8601 timestamp as a compact elapsed duration string.
+///
+/// Returns strings like `"3m"`, `"1h 20m"`, `"2d 5h"`.
+/// Returns an empty string if parsing fails or the timestamp is in the future.
+pub fn format_elapsed(started_at: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(started_at).or_else(|_| {
+        // Also accept "YYYY-MM-DD HH:MM:SS" (no timezone) as UTC
+        let with_tz = format!("{started_at}Z")
+            .replace(' ', "T")
+            .replace("ZZ", "Z");
+        chrono::DateTime::parse_from_rfc3339(&with_tz)
+    });
+
+    let Ok(started) = parsed else {
+        return String::new();
+    };
+
+    let now = chrono::Utc::now();
+    let elapsed = now.signed_duration_since(started);
+    if elapsed.num_seconds() <= 0 {
+        return String::new();
+    }
+
+    format_duration_compact(elapsed)
+}
+
+/// Format a chrono Duration as a compact human-readable string.
+fn format_duration_compact(elapsed: chrono::Duration) -> String {
+    let total_secs = elapsed.num_seconds();
+    let mins = total_secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+
+    if days > 0 {
+        let remaining_hours = hours % 24;
+        if remaining_hours > 0 {
+            format!("{days}d {remaining_hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        let remaining_mins = mins % 60;
+        if remaining_mins > 0 {
+            format!("{hours}h {remaining_mins}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "<1m".to_string()
+    }
+}
+
 /// Truncate a string to at most `max` characters, appending "…" if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -354,5 +424,63 @@ pub fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_elapsed_minutes() {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(3)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "3m");
+    }
+
+    #[test]
+    fn format_elapsed_hours_and_minutes() {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(80)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "1h 20m");
+    }
+
+    #[test]
+    fn format_elapsed_days_and_hours() {
+        let ts = (chrono::Utc::now() - chrono::Duration::hours(53)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "2d 5h");
+    }
+
+    #[test]
+    fn format_elapsed_less_than_one_minute() {
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "<1m");
+    }
+
+    #[test]
+    fn format_elapsed_future_timestamp_returns_empty() {
+        let ts = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "");
+    }
+
+    #[test]
+    fn format_elapsed_invalid_input_returns_empty() {
+        assert_eq!(format_elapsed("not-a-date"), "");
+        assert_eq!(format_elapsed(""), "");
+    }
+
+    #[test]
+    fn format_elapsed_fractional_seconds() {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert_eq!(format_elapsed(&ts), "5m");
+    }
+
+    #[test]
+    fn format_elapsed_with_timezone_offset() {
+        // Use a fixed offset timestamp that is ~2 hours ago
+        let now = chrono::Utc::now();
+        let two_hours_ago = now - chrono::Duration::hours(2);
+        let offset = chrono::FixedOffset::east_opt(5 * 3600).unwrap();
+        let with_offset = two_hours_ago.with_timezone(&offset).to_rfc3339();
+        assert_eq!(format_elapsed(&with_offset), "2h");
     }
 }
