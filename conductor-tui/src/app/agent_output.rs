@@ -38,7 +38,11 @@ impl App {
 
         let summary_prefix = truncate_to_char_boundary(&ev.summary, 60);
         let title = format!("[{}] {}", ev.kind, summary_prefix);
-        let body = ev.summary.clone();
+        let body = if let Some(error_text) = ev.error_detail_text() {
+            format!("{}\n\n--- Error Details ---\n{}", ev.summary, error_text)
+        } else {
+            ev.summary.clone()
+        };
         let line_count = body.lines().count();
 
         self.state.modal = Modal::EventDetail {
