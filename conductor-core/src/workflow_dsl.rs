@@ -192,6 +192,10 @@ pub struct CallNode {
     pub with: Vec<String>,
     /// Named GitHub App bot identity to use for this call (matches `[github.apps.<name>]`).
     pub bot_name: Option<String>,
+    /// Per-call plugin directory overrides. When non-empty, replaces the repo-level plugin_dirs
+    /// for this call only. Passed as `--plugin-dir` args to the Claude session.
+    #[serde(default)]
+    pub plugin_dirs: Vec<String>,
 }
 
 /// A sub-workflow invocation node.
@@ -276,6 +280,10 @@ pub struct ParallelNode {
     /// Per-call prompt snippet additions, keyed by index in `calls`.
     #[serde(default)]
     pub call_with: HashMap<usize, Vec<String>>,
+    /// Per-call plugin directory overrides, keyed by index in `calls`.
+    /// When present, replaces repo-level plugin_dirs for that call only.
+    #[serde(default)]
+    pub call_plugin_dirs: HashMap<usize, Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -897,6 +905,7 @@ impl Parser {
         let mut output = None;
         let mut with = Vec::new();
         let mut bot_name = None;
+        let mut plugin_dirs = Vec::new();
 
         if self.peek() == &Token::LBrace {
             self.advance();
@@ -921,6 +930,9 @@ impl Parser {
             if let Some(b) = kvs.remove("as") {
                 bot_name = Some(b.into_string());
             }
+            if let Some(p) = kvs.remove("plugin_dirs") {
+                plugin_dirs = p.into_string_array();
+            }
         }
 
         Ok(CallNode {
@@ -930,6 +942,7 @@ impl Parser {
             output,
             with,
             bot_name,
+            plugin_dirs,
         })
     }
 
@@ -1156,6 +1169,7 @@ impl Parser {
         let mut calls = Vec::new();
         let mut call_outputs: HashMap<usize, String> = HashMap::new();
         let mut call_with: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut call_plugin_dirs: HashMap<usize, Vec<String>> = HashMap::new();
         while self.peek() == &Token::Call {
             self.advance(); // consume "call"
             let agent = self.expect_agent_ref()?;
@@ -1170,6 +1184,9 @@ impl Parser {
                 }
                 if let Some(w) = call_kvs.remove("with") {
                     call_with.insert(idx, w.into_string_array());
+                }
+                if let Some(p) = call_kvs.remove("plugin_dirs") {
+                    call_plugin_dirs.insert(idx, p.into_string_array());
                 }
             }
             calls.push(agent);
@@ -1188,6 +1205,7 @@ impl Parser {
             call_outputs,
             with: block_with,
             call_with,
+            call_plugin_dirs,
         })
     }
 

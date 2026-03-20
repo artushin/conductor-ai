@@ -58,6 +58,16 @@ pub struct TicketLabel {
     pub color: Option<String>,
 }
 
+/// Fields for partially updating an existing ticket.
+pub struct TicketUpdate {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub state: Option<String>,
+    pub priority: Option<String>,
+    pub labels: Option<Vec<String>>,
+    pub assignee: Option<String>,
+}
+
 /// Filter options for [`TicketSyncer::list_filtered`].
 pub struct TicketFilter {
     /// Only include tickets that have ALL of these labels.
@@ -489,6 +499,90 @@ impl<'a> TicketSyncer<'a> {
         // External source_id path
         let ticket = self.get_by_source_id(&repo.id, ticket_id_str)?;
         Ok((ticket.source_type, ticket.source_id))
+    }
+
+    /// Create a new local ticket (source_type = "local"). Returns the created Ticket.
+    pub fn create_ticket(
+        &self,
+        repo_id: &str,
+        title: &str,
+        body: &str,
+        priority: Option<&str>,
+        labels: &[String],
+    ) -> Result<Ticket> {
+        let id = ulid::Ulid::new().to_string();
+        let source_id = ulid::Ulid::new().to_string();
+        let now = Utc::now().to_rfc3339();
+        let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+
+        self.conn.execute(
+            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json)
+             VALUES (?1, ?2, 'local', ?3, ?4, ?5, 'open', ?6, NULL, ?7, '', ?8, '{}')",
+            params![id, repo_id, source_id, title, body, labels_json, priority, now],
+        )?;
+
+        self.get_by_id(&id)
+    }
+
+    /// Update an existing ticket's fields. Only provided (Some) fields are changed.
+    /// Returns the updated Ticket.
+    pub fn update_ticket(&self, ticket_id: &str, updates: TicketUpdate) -> Result<Ticket> {
+        // Verify the ticket exists first.
+        self.get_by_id(ticket_id)?;
+
+        let mut set_clauses: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ref title) = updates.title {
+            set_clauses.push("title = ?".to_string());
+            param_values.push(Box::new(title.clone()));
+        }
+        if let Some(ref body) = updates.body {
+            set_clauses.push("body = ?".to_string());
+            param_values.push(Box::new(body.clone()));
+        }
+        if let Some(ref state) = updates.state {
+            set_clauses.push("state = ?".to_string());
+            param_values.push(Box::new(state.clone()));
+        }
+        if let Some(ref priority) = updates.priority {
+            set_clauses.push("priority = ?".to_string());
+            param_values.push(Box::new(priority.clone()));
+        }
+        if let Some(ref labels) = updates.labels {
+            let labels_json =
+                serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+            set_clauses.push("labels = ?".to_string());
+            param_values.push(Box::new(labels_json));
+        }
+        if let Some(ref assignee) = updates.assignee {
+            set_clauses.push("assignee = ?".to_string());
+            param_values.push(Box::new(assignee.clone()));
+        }
+
+        if set_clauses.is_empty() {
+            // Nothing to update — just return the ticket as-is.
+            return self.get_by_id(ticket_id);
+        }
+
+        // Always bump synced_at on update.
+        let now = Utc::now().to_rfc3339();
+        set_clauses.push("synced_at = ?".to_string());
+        param_values.push(Box::new(now));
+
+        // ticket_id goes last as the WHERE parameter.
+        param_values.push(Box::new(ticket_id.to_string()));
+
+        let sql = format!(
+            "UPDATE tickets SET {} WHERE id = ?",
+            set_clauses.join(", ")
+        );
+
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        self.conn.prepare(&sql)?.execute(params.as_slice())?;
+
+        self.get_by_id(ticket_id)
     }
 }
 
@@ -1731,5 +1825,207 @@ mod tests {
             result.unwrap_err(),
             ConductorError::TicketNotFound { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // create_ticket / update_ticket tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_ticket_roundtrip() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let labels = vec!["bug".to_string(), "urgent".to_string()];
+        let ticket = syncer
+            .create_ticket("r1", "New local ticket", "Some body text", Some("high"), &labels)
+            .unwrap();
+
+        assert_eq!(ticket.repo_id, "r1");
+        assert_eq!(ticket.source_type, "local");
+        assert_eq!(ticket.title, "New local ticket");
+        assert_eq!(ticket.body, "Some body text");
+        assert_eq!(ticket.state, "open");
+        assert_eq!(ticket.priority, Some("high".to_string()));
+        assert!(ticket.url.is_empty());
+
+        // Labels should be stored as JSON array
+        let parsed: Vec<String> = serde_json::from_str(&ticket.labels).unwrap();
+        assert_eq!(parsed, labels);
+
+        // Fetch again by id and verify round-trip
+        let fetched = syncer.get_by_id(&ticket.id).unwrap();
+        assert_eq!(fetched.id, ticket.id);
+        assert_eq!(fetched.title, "New local ticket");
+        assert_eq!(fetched.source_type, "local");
+        assert_eq!(fetched.source_id, ticket.source_id);
+    }
+
+    #[test]
+    fn test_update_ticket_fields() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let ticket = syncer
+            .create_ticket("r1", "Original title", "Original body", None, &[])
+            .unwrap();
+
+        let updated = syncer
+            .update_ticket(
+                &ticket.id,
+                TicketUpdate {
+                    title: Some("Updated title".to_string()),
+                    body: None,
+                    state: None,
+                    priority: None,
+                    labels: None,
+                    assignee: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.id, ticket.id);
+        assert_eq!(updated.title, "Updated title");
+        assert_eq!(updated.body, "Original body"); // unchanged
+    }
+
+    #[test]
+    fn test_update_nonexistent_ticket() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let result = syncer.update_ticket(
+            "nonexistent-id",
+            TicketUpdate {
+                title: Some("Won't work".to_string()),
+                body: None,
+                state: None,
+                priority: None,
+                labels: None,
+                assignee: None,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ConductorError::TicketNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn test_create_ticket_empty_labels() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let ticket = syncer
+            .create_ticket("r1", "No labels ticket", "body", None, &[])
+            .unwrap();
+
+        assert_eq!(ticket.labels, "[]");
+        assert_eq!(ticket.priority, None);
+        assert_eq!(ticket.source_type, "local");
+    }
+
+    #[test]
+    fn test_update_ticket_multiple_fields() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let ticket = syncer
+            .create_ticket("r1", "Original", "Original body", None, &[])
+            .unwrap();
+
+        let updated = syncer
+            .update_ticket(
+                &ticket.id,
+                TicketUpdate {
+                    title: Some("New title".to_string()),
+                    body: Some("New body".to_string()),
+                    state: Some("closed".to_string()),
+                    priority: Some("critical".to_string()),
+                    labels: None,
+                    assignee: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.title, "New title");
+        assert_eq!(updated.body, "New body");
+        assert_eq!(updated.state, "closed");
+        assert_eq!(updated.priority, Some("critical".to_string()));
+    }
+
+    #[test]
+    fn test_update_ticket_no_fields_returns_unchanged() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let ticket = syncer
+            .create_ticket("r1", "Stay the same", "body", Some("low"), &[])
+            .unwrap();
+
+        let result = syncer
+            .update_ticket(
+                &ticket.id,
+                TicketUpdate {
+                    title: None,
+                    body: None,
+                    state: None,
+                    priority: None,
+                    labels: None,
+                    assignee: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.title, "Stay the same");
+        assert_eq!(result.body, "body");
+        assert_eq!(result.priority, Some("low".to_string()));
+    }
+
+    #[test]
+    fn test_create_ticket_label_serialization_special_chars() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let labels = vec![
+            "bug: critical".to_string(),
+            "area/frontend".to_string(),
+            "won't fix".to_string(),
+        ];
+        let ticket = syncer
+            .create_ticket("r1", "Special labels", "", None, &labels)
+            .unwrap();
+
+        let parsed: Vec<String> = serde_json::from_str(&ticket.labels).unwrap();
+        assert_eq!(parsed, labels);
+    }
+
+    #[test]
+    fn test_update_ticket_labels_via_update() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let ticket = syncer
+            .create_ticket("r1", "Label test", "", None, &["old".to_string()])
+            .unwrap();
+
+        let updated = syncer
+            .update_ticket(
+                &ticket.id,
+                TicketUpdate {
+                    title: None,
+                    body: None,
+                    state: None,
+                    priority: None,
+                    labels: Some(vec!["new-label".to_string(), "another".to_string()]),
+                    assignee: None,
+                },
+            )
+            .unwrap();
+
+        let parsed: Vec<String> = serde_json::from_str(&updated.labels).unwrap();
+        assert_eq!(parsed, vec!["new-label", "another"]);
     }
 }

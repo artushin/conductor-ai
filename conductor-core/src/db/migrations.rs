@@ -628,6 +628,17 @@ pub fn run(conn: &Connection) -> Result<()> {
         bump_version(conn, 36)?;
     }
 
+    // Migration 037: expand tickets.source_type CHECK to allow 'local'.
+    // SQLite requires a table swap to alter CHECK constraints.
+    if version < 37 {
+        conn.pragma_update(None, "foreign_keys", "off")?;
+
+        conn.execute_batch(include_str!("migrations/037_ticket_local_source_type.sql"))?;
+
+        conn.pragma_update(None, "foreign_keys", "on")?;
+        bump_version(conn, 37)?;
+    }
+
     Ok(())
 }
 

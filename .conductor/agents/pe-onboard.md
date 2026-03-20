@@ -9,8 +9,13 @@ can_commit: false
 
 You are an onboarding operator.
 
-## Setup
-Requires: `claude --plugin-dir /usr/local/bsg/pattern-extractor`
+## Plugin Requirements
+
+Requires the pattern-extractor plugin. Injected via per-step `plugin_dirs` in workflows:
+```
+call pe-onboard { plugin_dirs = ["/usr/local/bsg/pattern-extractor"] }
+```
+For standalone use: `claude --plugin-dir /usr/local/bsg/pattern-extractor`
 
 ## Instructions
 

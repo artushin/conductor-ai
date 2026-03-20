@@ -2707,6 +2707,7 @@ fn run_on_fail_agent(
         output: None,
         with: Vec::new(),
         bot_name: None,
+        plugin_dirs: vec![],
     };
     if let Err(e) = execute_call(state, &on_fail_node, iteration) {
         tracing::warn!("on_fail agent '{}' also failed: {e}", on_fail_agent.label(),);
@@ -2918,6 +2919,13 @@ fn execute_call_with_schema(
     let prompt = build_agent_prompt(state, &agent_def, schema.as_ref(), &snippet_text);
     let step_model = agent_def.model.as_deref().or(state.model.as_deref());
 
+    // Per-call plugin_dirs override: call replaces state-level when non-empty
+    let effective_plugin_dirs = if node.plugin_dirs.is_empty() {
+        &state.plugin_dirs
+    } else {
+        &node.plugin_dirs
+    };
+
     // Retry loop
     let max_attempts = 1 + node.retries;
     let mut last_error = String::new();
@@ -2980,7 +2988,7 @@ fn execute_call_with_schema(
             step_model,
             &child_window,
             effective_bot_name,
-            &state.plugin_dirs,
+            effective_plugin_dirs,
         ) {
             tracing::warn!("Failed to spawn child: {e}");
             let _ = state
@@ -3824,6 +3832,13 @@ fn execute_parallel(
             effective_with.extend(extra.iter().cloned());
         }
 
+        // Per-call plugin_dirs override: call replaces state-level when present
+        let effective_plugin_dirs = if let Some(call_dirs) = node.call_plugin_dirs.get(&i) {
+            call_dirs
+        } else {
+            &state.plugin_dirs
+        };
+
         let snippet_text = prompt_config::load_and_concat_snippets(
             &state.working_dir,
             &state.repo_path,
@@ -3879,7 +3894,7 @@ fn execute_parallel(
             step_model,
             &window_name,
             state.default_bot_name.as_deref(),
-            &state.plugin_dirs,
+            effective_plugin_dirs,
         ) {
             tracing::warn!("Failed to spawn parallel agent '{agent_label}': {e}");
             let _ = state
@@ -7308,6 +7323,7 @@ And here is my actual output:
                 output: None,
                 with: vec![],
                 bot_name: None,
+                plugin_dirs: vec![],
             })],
         };
 
@@ -7454,6 +7470,7 @@ And here is my actual output:
             output: None,
             with: vec!["call-snippet".into()],
             bot_name: None,
+            plugin_dirs: vec![],
         };
 
         // Call will error on load_agent, but the merging logic should execute
@@ -7485,6 +7502,7 @@ And here is my actual output:
             output: Some("call-schema".into()),
             with: vec![],
             bot_name: None,
+            plugin_dirs: vec![],
         };
 
         let result = execute_call(&mut state, &node, 0);
@@ -7777,6 +7795,7 @@ And here is my actual output:
                 output: None,
                 with: vec![],
                 bot_name: None,
+                plugin_dirs: vec![],
             })],
         };
 
@@ -7811,6 +7830,7 @@ And here is my actual output:
                 output: None,
                 with: vec![],
                 bot_name: None,
+                plugin_dirs: vec![],
             })],
         };
 
@@ -7870,6 +7890,7 @@ And here is my actual output:
                     output: None,
                     with: vec![],
                     bot_name: None,
+                    plugin_dirs: vec![],
                 }),
                 WorkflowNode::Call(CallNode {
                     agent: crate::workflow_dsl::AgentRef::Name("step-b".to_string()),
@@ -7878,6 +7899,7 @@ And here is my actual output:
                     output: None,
                     with: vec![],
                     bot_name: None,
+                    plugin_dirs: vec![],
                 }),
             ],
         };
@@ -7922,6 +7944,7 @@ And here is my actual output:
                     call_outputs: HashMap::new(),
                     with: vec![],
                     call_with: HashMap::new(),
+                    call_plugin_dirs: HashMap::new(),
                 }),
                 WorkflowNode::Gate(GateNode {
                     name: "approval".to_string(),

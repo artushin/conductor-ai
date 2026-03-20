@@ -8,20 +8,20 @@ workflow bsg-pattern-sync {
     pe_path default = "/usr/local/bsg/pattern-extractor"
   }
 
-  # Assess each target repo
-  # NOTE: parallel assessment would require separate pe-assess-{target} agents
-  # For v1, run sequentially
-
+  # Assess each target repo with pattern-extractor plugin injected per-step
   call pe-assess {
-    output = "assess-agent-arch"
+    output      = "assess-agent-arch"
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   call pe-assess {
-    output = "assess-fsm-engine"
+    output      = "assess-fsm-engine"
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   call pe-assess {
-    output = "assess-vantage"
+    output      = "assess-vantage"
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   # Check for drift — if any assessment shows fidelity < 80

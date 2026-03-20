@@ -1,0 +1,19 @@
+workflow ticket-to-plan {
+  meta {
+    description = "Create a milestone plan from a ticket"
+    trigger     = "manual"
+    targets     = ["worktree"]
+  }
+
+  inputs {
+    ticket_id required
+  }
+
+  call fetch-ticket-context { output = "ticket-context" }
+
+  call plan-ticket {
+    plugin_dirs = ["/usr/local/bsg/agent-architecture"]
+    retries     = 1
+    on_fail     = plan-failure-report
+  }
+}

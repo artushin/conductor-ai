@@ -12,8 +12,9 @@ workflow extract-patterns {
 
   # Step 1: Discover patterns in source
   call pe-discover {
-    output  = "discover-result"
-    retries = 1
+    output      = "discover-result"
+    retries     = 1
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   gate human_review {
@@ -24,19 +25,22 @@ workflow extract-patterns {
 
   # Step 2: Capture operational structures
   call pe-operate {
-    output  = "operate-result"
-    retries = 1
+    output      = "operate-result"
+    retries     = 1
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   # Step 3: Extract patterns
   call pe-extract {
-    output  = "extract-result"
-    retries = 1
+    output      = "extract-result"
+    retries     = 1
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   # Step 4: Assess fidelity
   call pe-assess {
-    output = "assess-result"
+    output      = "assess-result"
+    plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
   }
 
   gate human_review {

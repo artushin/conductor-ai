@@ -109,7 +109,7 @@ meta           := "meta" "{" kv* "}"
 inputs         := "inputs" "{" input_decl* "}"
 input_decl     := IDENT ("required" | "default" "=" STRING)
 node           := call | if | unless | while | do_while | do | parallel | gate | always
-call           := "call" IDENT ("{" kv* "}")?
+call           := "call" IDENT ("{" kv* "}")?          # kv includes: output, retries, on_fail, with, as, plugin_dirs
 if             := "if" condition "{" kv* node* "}"
 unless         := "unless" condition "{" kv* node* "}"
 while          := "while" condition "{" kv* node* "}"
@@ -373,6 +373,45 @@ modifying shared files.
 
 For the planned explicit-path and extended resolution features, see
 [agent-path-resolution.md](./agent-path-resolution.md).
+
+### Per-step plugin directories
+
+By default, all agents in a workflow receive the repo-level `plugin_dirs`
+(set via `conductor repo set-plugin-dirs`). You can override this per-call
+to give specific steps only the plugins they need:
+
+```
+call pe-discover {
+  plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
+  output = "discover-result"
+}
+```
+
+When `plugin_dirs` is specified on a call, it **replaces** (not appends to)
+the repo-level plugin_dirs for that step only. Other steps without an
+explicit `plugin_dirs` still inherit the repo-level configuration.
+
+This works in parallel blocks too, with per-call override:
+
+```
+parallel {
+  output    = "review-findings"
+  fail_fast = false
+  call review-architecture                                                # inherits repo plugin_dirs
+  call pe-assess { plugin_dirs = ["/usr/local/bsg/pattern-extractor"] }   # override for this call only
+}
+```
+
+**Override precedence** (first non-empty wins):
+1. Per-call `plugin_dirs` (in the `.wf` call block)
+2. Repo-level `plugin_dirs` (from `conductor repo set-plugin-dirs`)
+3. `CONDUCTOR_PLUGIN_DIRS` environment variable
+4. Empty (no plugins)
+
+**When to use per-step override:**
+- Agent needs a plugin not in the repo-level config (e.g., PE agents need pattern-extractor)
+- Agent should NOT receive plugins from repo-level config (to reduce context window cost)
+- Different steps need mutually exclusive plugin sets
 
 ---
 

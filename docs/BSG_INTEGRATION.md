@@ -39,7 +39,7 @@ Five agents in `.conductor/agents/` invoke pattern-extractor commands:
 | pe-onboard | opus | `/onboard` | onboard_complete |
 | pe-implement | opus | `/implement` | implement_complete |
 
-Each agent sets up Claude with `--plugin-dir /usr/local/bsg/pattern-extractor` and passes context via `{{prior_context}}`.
+Each agent requires the pattern-extractor plugin. This is injected per-step in workflows via `plugin_dirs` (see below), not hardcoded globally.
 
 ## BSG Workflows
 
@@ -59,17 +59,37 @@ All workflows use `human_review` gates with 72-hour timeouts.
 - **Reads**: `/usr/local/bsg/pattern-extractor/extraction-roadmap`
 - **Displays**: Active extraction cycles with task counts (total/completed/blocked), inferred cycle status
 
-## Registering a Repo with Plugin Dirs
+## Plugin Directory Configuration
+
+### Per-repo (applies to all workflow steps)
 
 ```bash
-# Add a repo to conductor
 conductor repo add /path/to/repo
-
-# Set plugin directories for that repo
 conductor repo set-plugin-dirs <slug> \
   /usr/local/bsg/agent-architecture \
   /usr/local/bsg/fsm-engine
 ```
+
+### Per-step (overrides repo-level for specific calls)
+
+Individual workflow steps can override the repo-level plugin_dirs. This is used
+by the BSG workflows to inject pattern-extractor only for PE-invoking steps:
+
+```
+# PE steps get pattern-extractor; review steps get repo-level defaults
+call pe-discover {
+  plugin_dirs = ["/usr/local/bsg/pattern-extractor"]
+  output = "discover-result"
+}
+
+call review-architecture {
+  output = "review"
+  # No plugin_dirs — inherits repo-level agent-architecture + fsm-engine
+}
+```
+
+Per-step `plugin_dirs` **replaces** repo-level for that call only. See
+[workflow engine docs](workflow/engine.md#per-step-plugin-directories) for details.
 
 ## Related Repositories
 

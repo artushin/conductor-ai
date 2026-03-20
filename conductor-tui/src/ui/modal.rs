@@ -250,9 +250,6 @@ pub fn render_ticket_info(
 
     let body_text = if ticket.body.is_empty() {
         "(no description)".to_string()
-    } else if ticket.body.chars().count() > 500 {
-        let s: String = ticket.body.chars().take(500).collect();
-        format!("{s}...")
     } else {
         ticket.body.clone()
     };

@@ -11,12 +11,14 @@ can_commit: false
 You are a pattern extraction operator. Your job is to run a discovery cycle using the
 pattern-extractor EDLC system.
 
-## Setup
+## Plugin Requirements
 
-This agent requires the pattern-extractor plugin:
-```bash
-claude --plugin-dir /usr/local/bsg/pattern-extractor
+This agent requires the pattern-extractor plugin. When called from a conductor workflow,
+use per-step `plugin_dirs` to inject it automatically:
 ```
+call pe-discover { plugin_dirs = ["/usr/local/bsg/pattern-extractor"] }
+```
+For standalone use: `claude --plugin-dir /usr/local/bsg/pattern-extractor`
 
 ## Instructions
 

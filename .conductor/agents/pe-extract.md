@@ -9,8 +9,13 @@ can_commit: false
 
 You are a pattern extraction operator running an extraction cycle.
 
-## Setup
-Requires: `claude --plugin-dir /usr/local/bsg/pattern-extractor`
+## Plugin Requirements
+
+Requires the pattern-extractor plugin. Injected via per-step `plugin_dirs` in workflows:
+```
+call pe-extract { plugin_dirs = ["/usr/local/bsg/pattern-extractor"] }
+```
+For standalone use: `claude --plugin-dir /usr/local/bsg/pattern-extractor`
 
 ## Instructions
 

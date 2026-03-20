@@ -17,7 +17,7 @@ use conductor_core::issue_source::{GitHubConfig, IssueSourceManager, JiraConfig}
 use conductor_core::jira_acli;
 use conductor_core::orchestrator::{self, OrchestratorConfig};
 use conductor_core::repo::{derive_local_path, derive_slug_from_url, RepoManager};
-use conductor_core::tickets::{build_agent_prompt, TicketInput, TicketSyncer};
+use conductor_core::tickets::{build_agent_prompt, TicketInput, TicketSyncer, TicketUpdate};
 use conductor_core::workflow::{
     collect_agent_names, detect_workflow_cycles, validate_workflow_semantics, WorkflowExecConfig,
     WorkflowManager,
@@ -480,6 +480,41 @@ enum TicketCommands {
     Stats {
         /// Filter by repo slug
         repo: Option<String>,
+    },
+    /// Create a new local ticket
+    Create {
+        /// Repository slug
+        #[arg(long)]
+        repo: String,
+        /// Ticket title
+        #[arg(long)]
+        title: String,
+        /// Ticket body/description
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Priority level
+        #[arg(long)]
+        priority: Option<String>,
+        /// Labels (can be specified multiple times)
+        #[arg(long)]
+        label: Vec<String>,
+    },
+    /// Update an existing ticket
+    Update {
+        /// Ticket ID (ULID or source_id)
+        ticket: String,
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+        /// New body
+        #[arg(long)]
+        body: Option<String>,
+        /// New state (e.g., "open", "closed", "done")
+        #[arg(long)]
+        state: Option<String>,
+        /// New priority
+        #[arg(long)]
+        priority: Option<String>,
     },
 }
 
@@ -1139,6 +1174,75 @@ fn main() -> Result<()> {
                 if !found {
                     println!("No agent stats. Run agents on ticket-linked worktrees first.");
                 }
+            }
+            TicketCommands::Create {
+                repo,
+                title,
+                body,
+                priority,
+                label,
+            } => {
+                let repo_mgr = RepoManager::new(&conn, &config);
+                let r = repo_mgr.get_by_slug(&repo)?;
+
+                let syncer = TicketSyncer::new(&conn);
+                let ticket =
+                    syncer.create_ticket(&r.id, &title, &body, priority.as_deref(), &label)?;
+                println!("Created ticket {} — {}", ticket.id, ticket.title);
+            }
+            TicketCommands::Update {
+                ticket,
+                title,
+                body,
+                state,
+                priority,
+            } => {
+                if title.is_none() && body.is_none() && state.is_none() && priority.is_none() {
+                    anyhow::bail!(
+                        "No update fields provided. Use --title, --body, --state, or --priority."
+                    );
+                }
+
+                let syncer = TicketSyncer::new(&conn);
+
+                // Try ULID lookup first, then fall back to source_id search.
+                let resolved_id = if ticket.len() == 26 {
+                    match syncer.get_by_id(&ticket) {
+                        Ok(t) => t.id,
+                        Err(_) => {
+                            // Not a ULID — fall through to source_id search below
+                            let t: String = conn
+                                .query_row(
+                                    "SELECT id FROM tickets WHERE source_id = ?1",
+                                    rusqlite::params![ticket],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|_| anyhow::anyhow!("Ticket not found: {ticket}"))?;
+                            t
+                        }
+                    }
+                } else {
+                    let t: String = conn
+                        .query_row(
+                            "SELECT id FROM tickets WHERE source_id = ?1",
+                            rusqlite::params![ticket],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| anyhow::anyhow!("Ticket not found: {ticket}"))?;
+                    t
+                };
+
+                let updates = TicketUpdate {
+                    title,
+                    body,
+                    state,
+                    priority,
+                    labels: None,
+                    assignee: None,
+                };
+
+                let updated = syncer.update_ticket(&resolved_id, updates)?;
+                println!("Updated ticket {} — {}", updated.id, updated.title);
             }
         },
         Commands::Workflow { command } => match command {
