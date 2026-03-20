@@ -1020,3 +1020,82 @@ workflow parent {
 
 // resolve_script_path and script_search_paths tests live in
 // conductor-core/src/workflow_dsl/script_utils.rs
+
+#[test]
+fn test_quality_gate_source_validation_passes() {
+    let input = r#"
+workflow review {
+    meta { targets = ["worktree"] }
+    call aggregator
+    gate quality_gate {
+        source    = "aggregator"
+        threshold = 85
+    }
+}
+"#;
+    let def = parse_workflow_str(input, "test.wf").unwrap();
+    let report = validate_workflow_semantics(&def, &no_loader);
+    assert!(
+        report.is_ok(),
+        "quality gate referencing produced step should pass: {:?}",
+        report.errors
+    );
+}
+
+#[test]
+fn test_quality_gate_source_validation_fails_missing_step() {
+    let input = r#"
+workflow review {
+    meta { targets = ["worktree"] }
+    gate quality_gate {
+        source    = "nonexistent"
+        threshold = 85
+    }
+}
+"#;
+    let def = parse_workflow_str(input, "test.wf").unwrap();
+    let report = validate_workflow_semantics(&def, &no_loader);
+    assert!(
+        !report.is_ok(),
+        "quality gate referencing missing step should fail"
+    );
+    let msg = &report.errors[0].message;
+    assert!(
+        msg.contains("nonexistent"),
+        "error should mention the missing source: {msg}"
+    );
+}
+
+#[test]
+fn test_quality_gate_validation_missing_config() {
+    // Construct a GateNode directly (bypassing parser which always sets quality_gate)
+    // to test the validation branch for missing config.
+    let mut def = parse_workflow_str(
+        r#"
+workflow test {
+    meta { targets = ["worktree"] }
+    call review
+    gate quality_gate {
+        source    = "review"
+        threshold = 70
+    }
+}
+"#,
+        "test.wf",
+    )
+    .unwrap();
+    // Manually clear quality_gate to simulate missing config
+    if let WorkflowNode::Gate(ref mut g) = def.body[1] {
+        g.quality_gate = None;
+    }
+    let report = validate_workflow_semantics(&def, &no_loader);
+    assert!(
+        !report.is_ok(),
+        "missing quality_gate config should fail validation"
+    );
+    assert!(
+        report.errors.iter().any(|e| e.message.contains("source")),
+        "error should mention missing fields: {:?}",
+        report.errors
+    );
+}

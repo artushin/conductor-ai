@@ -38,9 +38,14 @@ mod validation;
 pub use types::{
     collect_agent_names, collect_workflow_refs, AgentRef, AlwaysNode, ApprovalMode, CallNode,
     CallWorkflowNode, Condition, DoNode, DoWhileNode, GateNode, GateType, IfNode, InputDecl,
-    InputType, OnMaxIter, OnTimeout, ParallelNode, ScriptNode, UnlessNode, WhileNode, WorkflowDef,
-    WorkflowNode, WorkflowTrigger, WorkflowWarning,
+    InputType, OnFailAction, OnMaxIter, OnTimeout, ParallelNode, ScriptNode, UnlessNode, WhileNode,
+    WorkflowDef, WorkflowNode, WorkflowTrigger, WorkflowWarning,
 };
+// QualityGateConfig is a field type on the public GateNode struct and must be
+// part of the public API so callers can name the type. It is only constructed
+// in tests within this crate, hence the allow.
+#[allow(unused_imports)]
+pub use types::QualityGateConfig;
 // Tree-walking helpers used in tests and available for external callers
 pub use api::{
     detect_workflow_cycles, load_workflow_by_name, load_workflow_defs, validate_workflow_name,

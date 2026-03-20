@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use super::types::{Condition, InputType, ScriptNode, WorkflowDef, WorkflowNode};
+use super::types::{Condition, GateType, InputType, ScriptNode, WorkflowDef, WorkflowNode};
 
 // ---------------------------------------------------------------------------
 // Semantic validation
@@ -193,7 +193,33 @@ fn validate_nodes<F>(
             WorkflowNode::Do(n) => {
                 validate_nodes(&n.body, produced, errors, loader, bool_inputs);
             }
-            WorkflowNode::Gate(_) => {}
+            WorkflowNode::Gate(n) => {
+                // Quality gates require a quality_gate config block.
+                if n.gate_type == GateType::QualityGate && n.quality_gate.is_none() {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "Quality gate '{}' is missing required `source` and `threshold` fields",
+                            n.name
+                        ),
+                        hint: Some("Add `source = \"step_name\"` and `threshold = 70` to configure the quality gate".to_string()),
+                    });
+                }
+                // Quality gates reference a prior step's structured output.
+                if let Some(source) = n.quality_gate.as_ref().map(|qg| &qg.source) {
+                    if !produced.contains(source.as_str()) {
+                        errors.push(ValidationError {
+                            message: format!(
+                                "Quality gate '{}' references source step '{}' which has not been produced at this point in the workflow",
+                                n.name, source
+                            ),
+                            hint: Some(format!(
+                                "Ensure a call or script step named '{}' appears before this gate",
+                                source
+                            )),
+                        });
+                    }
+                }
+            }
             WorkflowNode::Script(n) => {
                 produced.insert(n.name.clone());
             }

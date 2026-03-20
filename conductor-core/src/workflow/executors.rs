@@ -8,7 +8,7 @@ use crate::agent_config::AgentSpec;
 use crate::error::{ConductorError, Result};
 use crate::workflow_dsl::{
     ApprovalMode, CallNode, CallWorkflowNode, Condition, DoNode, DoWhileNode, GateNode, GateType,
-    IfNode, OnTimeout, ParallelNode, ScriptNode, UnlessNode, WhileNode,
+    IfNode, OnFailAction, OnTimeout, ParallelNode, ScriptNode, UnlessNode, WhileNode,
 };
 
 use super::engine::{
@@ -1308,7 +1308,7 @@ pub(super) fn execute_parallel(
     }
 
     // Store merged markers as a synthetic result
-    use super::types::StepResult;
+    use crate::workflow::types::StepResult;
     let synthetic_result = StepResult {
         step_name: format!("parallel:{}", group_id),
         status: if effective_successes >= min_required {
@@ -1346,6 +1346,11 @@ pub(super) fn execute_gate(
         tracing::info!("Skipping completed gate '{}'", node.name);
         restore_step(state, &node.name, iteration);
         return Ok(());
+    }
+
+    // Quality gates evaluate immediately — no blocking/waiting.
+    if node.gate_type == GateType::QualityGate {
+        return execute_quality_gate(state, node, pos, iteration);
     }
 
     // Dry-run: auto-approve all gates
@@ -1414,6 +1419,7 @@ pub(super) fn execute_gate(
             approvals_needed: node.min_approvals,
         },
         GateType::PrChecks => super::types::BlockedOn::PrChecks { gate_name },
+        GateType::QualityGate => unreachable!("quality gates are handled above"),
     };
     state
         .wf_mgr
@@ -1694,7 +1700,143 @@ pub(super) fn execute_gate(
                 thread::sleep(state.exec_config.poll_interval);
             }
         }
+        GateType::QualityGate => {
+            // Quality gates are handled earlier in execute_gate via execute_quality_gate.
+            unreachable!("quality gates should not reach the blocking gate poll loop");
+        }
     }
+}
+
+/// Evaluate a quality gate by checking a prior step's structured output against a threshold.
+///
+/// Quality gates are non-blocking: they evaluate immediately by reading the
+/// `structured_output` from `step_results` for the configured `source` step,
+/// parsing the JSON, and comparing the `confidence` field against `threshold`.
+fn execute_quality_gate(
+    state: &mut ExecutionState<'_>,
+    node: &GateNode,
+    pos: i64,
+    iteration: u32,
+) -> Result<()> {
+    let qg = node.quality_gate.as_ref().ok_or_else(|| {
+        ConductorError::Workflow(format!(
+            "Quality gate '{}' is missing required quality_gate configuration (source, threshold)",
+            node.name
+        ))
+    })?;
+    let source = qg.source.as_str();
+    let threshold = qg.threshold;
+    let on_fail_action = qg.on_fail_action.clone();
+
+    let step_id = state.wf_mgr.insert_step(
+        &state.workflow_run_id,
+        &node.name,
+        "gate",
+        false,
+        pos,
+        iteration as i64,
+    )?;
+
+    // Helper: update_step_status with no run_id, cost, duration, or attempt fields.
+    let set_step_status = |status: WorkflowStepStatus, context: &str| -> Result<()> {
+        state
+            .wf_mgr
+            .update_step_status(&step_id, status, None, Some(context), None, None, None)
+    };
+
+    // Look up the source step's structured output
+    let (confidence, degradation_reason): (u32, Option<String>) = match state
+        .step_results
+        .get(source)
+    {
+        Some(result) => {
+            if let Some(ref json_str) = result.structured_output {
+                // Parse JSON and extract confidence field
+                match serde_json::from_str::<serde_json::Value>(json_str) {
+                    Ok(val) => {
+                        // Try integer first, then fall back to float.
+                        // Clamp to 100 to prevent u64→u32 truncation from wrapping
+                        // large values into the passing range.
+                        if let Some(c) = val.get("confidence").and_then(|v| v.as_u64()) {
+                            (c.min(100) as u32, None)
+                        } else if let Some(f) = val.get("confidence").and_then(|v| v.as_f64()) {
+                            ((f as u64).min(100) as u32, None)
+                        } else {
+                            let reason = format!(
+                                    "'confidence' key missing or not a number in structured output from '{}'",
+                                    source
+                                );
+                            tracing::warn!("quality_gate '{}': {}", node.name, reason);
+                            (0, Some(reason))
+                        }
+                    }
+                    Err(e) => {
+                        let reason =
+                            format!("failed to parse structured output from '{}': {}", source, e);
+                        tracing::warn!("quality_gate '{}': {}", node.name, reason);
+                        (0, Some(reason))
+                    }
+                }
+            } else {
+                let reason = format!("source step '{}' has no structured output", source);
+                tracing::warn!("quality_gate '{}': {}", node.name, reason);
+                (0, Some(reason))
+            }
+        }
+        None => {
+            let msg = format!(
+                "Quality gate '{}': source step '{}' not found in step results",
+                node.name, source
+            );
+            set_step_status(WorkflowStepStatus::Failed, &msg)?;
+            return Err(ConductorError::Workflow(msg));
+        }
+    };
+
+    let passed = confidence >= threshold;
+    let mut context = format!(
+        "quality_gate: confidence={}, threshold={}, result={}",
+        confidence,
+        threshold,
+        if passed { "pass" } else { "fail" }
+    );
+    if let Some(ref reason) = degradation_reason {
+        context.push_str(&format!(" (confidence defaulted to 0: {})", reason));
+    }
+
+    if passed {
+        tracing::info!(
+            "quality_gate '{}': passed (confidence {} >= threshold {})",
+            node.name,
+            confidence,
+            threshold
+        );
+        set_step_status(WorkflowStepStatus::Completed, &context)?;
+    } else {
+        tracing::warn!(
+            "quality_gate '{}': failed (confidence {} < threshold {})",
+            node.name,
+            confidence,
+            threshold
+        );
+        match on_fail_action {
+            OnFailAction::Fail => {
+                set_step_status(WorkflowStepStatus::Failed, &context)?;
+                return Err(ConductorError::Workflow(format!(
+                    "Quality gate '{}' failed: confidence {} is below threshold {}",
+                    node.name, confidence, threshold
+                )));
+            }
+            OnFailAction::Continue => {
+                set_step_status(
+                    WorkflowStepStatus::Completed,
+                    &format!("{} (on_fail=continue, proceeding)", context),
+                )?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(super) fn handle_gate_timeout(
@@ -2132,6 +2274,8 @@ pub(super) fn execute_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::types::StepResult;
+    use crate::workflow_dsl::QualityGateConfig;
 
     // -----------------------------------------------------------------------
     // Shared test helper: build an ExecutionState backed by a real in-memory DB.
@@ -2790,5 +2934,271 @@ mod tests {
             body: vec![],
         };
         assert!(execute_unless(&mut state, &node).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_quality_gate tests
+    // -----------------------------------------------------------------------
+
+    fn make_step_result(structured_output: Option<&str>) -> StepResult {
+        StepResult {
+            step_name: "review".to_string(),
+            status: WorkflowStepStatus::Completed,
+            result_text: None,
+            cost_usd: None,
+            num_turns: None,
+            duration_ms: None,
+            markers: vec![],
+            context: String::new(),
+            child_run_id: None,
+            structured_output: structured_output.map(|s| s.to_string()),
+            output_file: None,
+        }
+    }
+
+    fn make_quality_gate_node(
+        name: &str,
+        source: Option<&str>,
+        threshold: Option<u32>,
+        on_fail: OnFailAction,
+    ) -> GateNode {
+        let quality_gate = match (source, threshold) {
+            (Some(s), Some(t)) => Some(QualityGateConfig {
+                source: s.to_string(),
+                threshold: t,
+                on_fail_action: on_fail,
+            }),
+            // Allow constructing nodes with missing config for error-path tests
+            _ => None,
+        };
+        GateNode {
+            name: name.to_string(),
+            gate_type: GateType::QualityGate,
+            prompt: None,
+            min_approvals: 1,
+            approval_mode: ApprovalMode::default(),
+            timeout_secs: 60,
+            on_timeout: OnTimeout::Fail,
+            bot_name: None,
+            quality_gate,
+        }
+    }
+
+    #[test]
+    fn test_quality_gate_passes_when_confidence_meets_threshold() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 80}"#)),
+        );
+
+        let node = make_quality_gate_node("qg", Some("review"), Some(70), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(result.is_ok(), "gate should pass: {result:?}");
+    }
+
+    #[test]
+    fn test_quality_gate_fails_when_confidence_below_threshold() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 40}"#)),
+        );
+
+        let node = make_quality_gate_node("qg", Some("review"), Some(70), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("below threshold"), "got: {err}");
+    }
+
+    #[test]
+    fn test_quality_gate_continues_on_fail_when_configured() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 20}"#)),
+        );
+
+        let node = make_quality_gate_node("qg", Some("review"), Some(70), OnFailAction::Continue);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(
+            result.is_ok(),
+            "on_fail=continue should not error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_quality_gate_errors_when_source_step_missing() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        let node = make_quality_gate_node("qg", Some("nonexistent"), Some(70), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found in step results"), "got: {err}");
+    }
+
+    #[test]
+    fn test_quality_gate_errors_when_config_missing() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        let node = make_quality_gate_node("qg", None, None, OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing required quality_gate configuration"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_quality_gate_malformed_json_treats_as_zero_confidence() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some("not valid json")),
+        );
+
+        // threshold=0 so even confidence=0 passes
+        let node = make_quality_gate_node("qg", Some("review"), Some(0), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(
+            result.is_ok(),
+            "malformed JSON → confidence=0, threshold=0 should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_quality_gate_missing_confidence_key_treats_as_zero() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"score": 95}"#)),
+        );
+
+        // JSON is valid but has no "confidence" key — should fail at threshold 70
+        let node = make_quality_gate_node("qg", Some("review"), Some(70), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("below threshold"), "got: {err}");
+    }
+
+    #[test]
+    fn test_quality_gate_no_structured_output_treats_as_zero() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state
+            .step_results
+            .insert("review".to_string(), make_step_result(None));
+
+        let node = make_quality_gate_node("qg", Some("review"), Some(50), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("below threshold"), "got: {err}");
+    }
+
+    #[test]
+    fn test_quality_gate_float_confidence_handled() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 85.5}"#)),
+        );
+
+        // Float 85.5 should be truncated to 85 and pass threshold of 70
+        let node = make_quality_gate_node("qg", Some("review"), Some(70), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(
+            result.is_ok(),
+            "float confidence should be handled: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_quality_gate_clamps_large_confidence_to_100() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 999999}"#)),
+        );
+
+        // Large value should be clamped to 100, passing threshold of 90
+        let node = make_quality_gate_node("qg", Some("review"), Some(90), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(
+            result.is_ok(),
+            "large confidence should be clamped to 100 and pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_quality_gate_clamps_large_float_confidence_to_100() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        // Use a float value to exercise the as_f64() fallback branch
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 9999.9}"#)),
+        );
+
+        // Large float should be clamped to 100, passing threshold of 90
+        let node = make_quality_gate_node("qg", Some("review"), Some(90), OnFailAction::Fail);
+        let result = execute_quality_gate(&mut state, &node, 0, 0);
+        assert!(
+            result.is_ok(),
+            "large float confidence should be clamped to 100 and pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_execute_gate_dispatches_quality_gate() {
+        let conn = crate::test_helpers::setup_db();
+        let config = crate::config::Config::default();
+        let mut state = make_test_state(&conn, &config, "/tmp", Default::default());
+
+        state.step_results.insert(
+            "review".to_string(),
+            make_step_result(Some(r#"{"confidence": 90}"#)),
+        );
+
+        let node = make_quality_gate_node("qg", Some("review"), Some(70), OnFailAction::Fail);
+        let result = execute_gate(&mut state, &node, 0);
+        assert!(
+            result.is_ok(),
+            "execute_gate should dispatch QualityGate correctly: {result:?}"
+        );
     }
 }

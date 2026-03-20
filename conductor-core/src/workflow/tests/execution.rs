@@ -770,6 +770,7 @@ fn test_do_while_iterates_body_multiple_times() {
             timeout_secs: 1,
             on_timeout: OnTimeout::Fail,
             bot_name: None,
+            quality_gate: None,
         })],
     };
 
@@ -1144,6 +1145,7 @@ fn test_execute_do_sets_and_restores_block_state() {
             timeout_secs: 1,
             on_timeout: OnTimeout::Fail,
             bot_name: None,
+            quality_gate: None,
         })],
     };
 
@@ -1210,6 +1212,7 @@ fn test_execute_do_fail_fast_exits_early() {
                 timeout_secs: 1,
                 on_timeout: OnTimeout::Fail,
                 bot_name: None,
+                quality_gate: None,
             }),
             WorkflowNode::Gate(GateNode {
                 name: "g2".into(),
@@ -1220,6 +1223,7 @@ fn test_execute_do_fail_fast_exits_early() {
                 timeout_secs: 1,
                 on_timeout: OnTimeout::Fail,
                 bot_name: None,
+                quality_gate: None,
             }),
         ],
     };
@@ -1255,6 +1259,7 @@ fn test_execute_do_nested_with_combination() {
                 timeout_secs: 1,
                 on_timeout: OnTimeout::Fail,
                 bot_name: None,
+                quality_gate: None,
             })],
         })],
     };
@@ -1291,6 +1296,7 @@ fn test_execute_do_nested_inner_output_overrides_outer() {
                 timeout_secs: 1,
                 on_timeout: OnTimeout::Fail,
                 bot_name: None,
+                quality_gate: None,
             })],
         })],
     };
@@ -1866,6 +1872,7 @@ fn test_find_max_completed_while_iteration_with_parallel_and_gate() {
                 timeout_secs: 300,
                 on_timeout: crate::workflow_dsl::OnTimeout::Fail,
                 bot_name: None,
+                quality_gate: None,
             }),
         ],
     };
