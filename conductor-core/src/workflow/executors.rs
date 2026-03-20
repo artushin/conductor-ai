@@ -423,6 +423,7 @@ pub(super) fn execute_call_workflow(
             model: state.model.as_deref(),
             from_step: None,
             restart: false,
+            conductor_bin_dir: state.conductor_bin_dir.clone(),
         };
 
         match super::engine::resume_workflow(&resume_input) {
@@ -590,6 +591,7 @@ pub(super) fn execute_call_workflow(
             iteration,
             run_id_notify: None,
             triggered_by_hook: state.triggered_by_hook,
+            conductor_bin_dir: state.conductor_bin_dir.clone(),
         };
 
         match super::engine::execute_workflow(&child_input) {
@@ -1941,6 +1943,11 @@ pub(super) fn execute_script(
             .stdout(output_file)
             .stderr(stderr_file)
             .current_dir(&state.working_dir);
+        // Inject conductor's binary directory into PATH so scripts can call `conductor`
+        if let Some(ref bin_dir) = state.conductor_bin_dir {
+            let path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", bin_dir.display(), path));
+        }
         match crate::github_app::resolve_named_app_token(state.config, effective_bot, "script") {
             crate::github_app::TokenResolution::AppToken(token) => {
                 cmd.env("GH_TOKEN", token);
@@ -2181,6 +2188,7 @@ mod tests {
             default_bot_name: None,
             feature_id: None,
             triggered_by_hook: false,
+            conductor_bin_dir: None,
         }
     }
 
@@ -2710,6 +2718,62 @@ mod tests {
             body: vec![],
         };
         assert!(execute_unless(&mut state, &node).is_ok());
+    }
+
+    #[test]
+    fn test_execute_script_injects_conductor_on_path() {
+        // Verify that the conductor binary's directory is prepended to PATH
+        // by printing PATH from inside the script and checking it contains
+        // the current exe's parent directory.
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_script(
+            &dir.path().join("check_path.sh"),
+            "#!/bin/sh\necho \"$PATH\"",
+        );
+
+        let conn = crate::test_helpers::setup_db();
+        let config = Box::leak(Box::new(crate::config::Config::default()));
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mut state = make_test_state(
+            &conn,
+            config,
+            &dir_str,
+            crate::workflow::types::WorkflowExecConfig::default(),
+        );
+
+        // Simulate what binary crates do: resolve conductor binary dir from current_exe.
+        let bin_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        state.conductor_bin_dir = bin_dir;
+
+        let node = crate::workflow_dsl::ScriptNode {
+            name: "check_path".into(),
+            run: script_path,
+            env: std::collections::HashMap::new(),
+            timeout: Some(10),
+            retries: 0,
+            on_fail: None,
+            bot_name: None,
+        };
+
+        let result = execute_script(&mut state, &node, 0);
+        assert!(result.is_ok(), "execute_script should succeed: {result:?}");
+
+        // Read the stdout log to verify PATH contains the conductor binary dir
+        let ctx = state.contexts.last().unwrap();
+        let log_path = ctx.output_file.as_ref().unwrap();
+        let output = std::fs::read_to_string(log_path).unwrap();
+        let exe_dir = state
+            .conductor_bin_dir
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            output.contains(&exe_dir),
+            "PATH should contain conductor binary dir '{exe_dir}', got: {output}"
+        );
     }
 
     #[test]

@@ -1506,6 +1506,7 @@ fn main() -> Result<()> {
                         exec_config,
                         input_map,
                         dry_run,
+                        conductor_core::workflow::resolve_conductor_bin_dir(),
                     ) {
                         Ok(result) => report_workflow_result(result),
                         Err(e) => {
@@ -1560,6 +1561,8 @@ fn main() -> Result<()> {
                             iteration: 0,
                             run_id_notify: None,
                             triggered_by_hook: false,
+                            conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
+                            ),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1613,6 +1616,8 @@ fn main() -> Result<()> {
                             iteration: 0,
                             run_id_notify: None,
                             triggered_by_hook: false,
+                            conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
+                            ),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1666,6 +1671,8 @@ fn main() -> Result<()> {
                             iteration: 0,
                             run_id_notify: None,
                             triggered_by_hook: false,
+                            conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
+                            ),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1722,6 +1729,8 @@ fn main() -> Result<()> {
                             iteration: 0,
                             run_id_notify: None,
                             triggered_by_hook: false,
+                            conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
+                            ),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1956,6 +1965,7 @@ fn main() -> Result<()> {
                     model: model.as_deref(),
                     from_step: from_step.as_deref(),
                     restart,
+                    conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(),
                 };
 
                 if restart {
