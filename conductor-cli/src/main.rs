@@ -462,6 +462,14 @@ enum TicketCommands {
         /// Repo slug (syncs all if omitted)
         repo: Option<String>,
     },
+    /// Show full details for a single ticket
+    Get {
+        /// Ticket ID (ULID or source_id)
+        ticket: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List cached tickets
     List {
         /// Filter by repo slug
@@ -1087,6 +1095,47 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            TicketCommands::Get { ticket, json } => {
+                let syncer = TicketSyncer::new(&conn);
+                let t = syncer
+                    .get_ticket(&ticket)
+                    .map_err(|_| anyhow::anyhow!("Ticket not found: {ticket}"))?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&t)
+                            .unwrap_or_else(|e| format!("JSON error: {e}"))
+                    );
+                } else {
+                    let repo_mgr = RepoManager::new(&conn, &config);
+                    let repo_slug = repo_mgr
+                        .get_by_id(&t.repo_id)
+                        .map(|r| r.slug)
+                        .unwrap_or_else(|_| t.repo_id.clone());
+                    println!("ID:          {}", t.id);
+                    println!("Source:      {} #{}", t.source_type, t.source_id);
+                    println!("Title:       {}", t.title);
+                    println!("State:       {}", t.state);
+                    if let Some(ref p) = t.priority {
+                        println!("Priority:    {}", p);
+                    }
+                    if !t.labels.is_empty() {
+                        println!("Labels:      {}", t.labels);
+                    }
+                    if let Some(ref a) = t.assignee {
+                        println!("Assignee:    {}", a);
+                    }
+                    println!("Repo:        {}", repo_slug);
+                    if !t.url.is_empty() {
+                        println!("URL:         {}", t.url);
+                    }
+                    if !t.body.is_empty() {
+                        println!();
+                        println!("{}", t.body);
+                    }
+                }
+            }
             TicketCommands::List { repo } => {
                 let repo_mgr = RepoManager::new(&conn, &config);
                 let repo_id = if let Some(slug) = &repo {
@@ -1102,8 +1151,8 @@ fn main() -> Result<()> {
                 } else {
                     for t in tickets {
                         println!(
-                            "  {} #{} — {} [{}]",
-                            t.source_type, t.source_id, t.title, t.state
+                            "  {} #{} — {} [{}] (id: {})",
+                            t.source_type, t.source_id, t.title, t.state, t.id
                         );
                     }
                 }
@@ -1250,13 +1299,13 @@ fn main() -> Result<()> {
                 let repo_mgr = RepoManager::new(&conn, &config);
                 let r = repo_mgr.get_by_slug(&repo)?;
 
-                let agent_mgr = AgentManager::new(&conn);
+                let wf_mgr = WorkflowManager::new(&conn);
                 let runs = if let Some(wt_slug) = worktree {
                     let wt_mgr = WorktreeManager::new(&conn, &config);
                     let wt = wt_mgr.get_by_slug(&r.id, &wt_slug)?;
-                    agent_mgr.list_for_worktree(&wt.id)?
+                    wf_mgr.list_workflow_runs(&wt.id)?
                 } else {
-                    agent_mgr.list_for_repo(&r.id)?
+                    wf_mgr.list_workflow_runs_by_repo_id(&r.id, 100, 0)?
                 };
 
                 if runs.is_empty() {
@@ -1270,7 +1319,7 @@ fn main() -> Result<()> {
                         println!(
                             "  {:<10}  {:<40}  {:<20}  {}",
                             &run.id[..8.min(run.id.len())],
-                            truncate_str(&run.prompt, 40),
+                            truncate_str(&run.workflow_name, 40),
                             run.status,
                             &run.started_at[..16.min(run.started_at.len())],
                         );
