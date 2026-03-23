@@ -1851,9 +1851,14 @@ impl<'a> AgentManager<'a> {
     ///
     /// Returns the number of orphaned runs that were reaped.
     pub fn reap_orphaned_runs(&self) -> Result<usize> {
+        // Exclude agent runs that are parents of workflow runs — these are
+        // bookkeeping records with no tmux window, not real agent sessions.
         let active_runs: Vec<AgentRun> = query_collect(
             self.conn,
-            &format!("{AGENT_RUN_SELECT} WHERE status IN ('running', 'waiting_for_feedback')"),
+            &format!(
+                "{AGENT_RUN_SELECT} WHERE status IN ('running', 'waiting_for_feedback') \
+                 AND id NOT IN (SELECT parent_run_id FROM workflow_runs)"
+            ),
             [],
             row_to_agent_run,
         )?;
@@ -1917,6 +1922,30 @@ pub fn build_startup_context(
 
     // For ephemeral runs (no worktree), skip worktree-specific context
     let Some(wt_id) = worktree_id else {
+        // Try to inject ticket context via workflow_runs for ticket-targeted runs.
+        // Path: agent_runs (current_run_id) → workflow_run_steps.child_run_id
+        //       → workflow_runs.ticket_id → tickets
+        let ticket_info: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT t.source_id, t.title, COALESCE(t.body, '') \
+                 FROM tickets t \
+                 JOIN workflow_runs wr ON wr.ticket_id = t.id \
+                 JOIN workflow_run_steps wrs ON wrs.workflow_run_id = wr.id \
+                 WHERE wrs.child_run_id = ?1 \
+                 LIMIT 1",
+                params![current_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        if let Some((source_id, title, body)) = ticket_info {
+            if body.is_empty() {
+                sections.push(format!("**Ticket:** #{source_id} — {title}"));
+            } else {
+                sections.push(format!("**Ticket:** #{source_id} — {title}\n\n{body}"));
+            }
+        }
+
         // Still include commits + feedback protocol below
         let commits = Command::new("git")
             .args(["log", "--oneline", "-10"])
@@ -1955,18 +1984,22 @@ pub fn build_startup_context(
     }
 
     // 2. Linked ticket
-    let ticket_info: Option<(String, String)> = conn
+    let ticket_info: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT t.source_id, t.title FROM tickets t \
+            "SELECT t.source_id, t.title, COALESCE(t.body, '') FROM tickets t \
              JOIN worktrees w ON w.ticket_id = t.id \
              WHERE w.id = ?1",
             params![wt_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok();
 
-    if let Some((source_id, title)) = ticket_info {
-        sections.push(format!("**Ticket:** #{source_id} — {title}"));
+    if let Some((source_id, title, body)) = ticket_info {
+        if body.is_empty() {
+            sections.push(format!("**Ticket:** #{source_id} — {title}"));
+        } else {
+            sections.push(format!("**Ticket:** #{source_id} — {title}\n\n{body}"));
+        }
     }
 
     // 3. Prior runs (excluding the current run being started)
@@ -3195,13 +3228,13 @@ mod tests {
     }
 
     #[test]
-    fn test_startup_context_includes_ticket() {
+    fn test_startup_context_includes_ticket_with_body() {
         let conn = setup_db();
 
-        // Insert a ticket and link it to worktree w1
+        // Insert a ticket with a body and link it to worktree w1
         conn.execute(
             "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, url, synced_at, raw_json) \
-             VALUES ('t1', 'r1', 'github', '42', 'Fix payment bug', 'Description', 'open', '[]', '', '2024-01-01T00:00:00Z', '{}')",
+             VALUES ('t1', 'r1', 'github', '42', 'Fix payment bug', 'The payment flow crashes on retry', 'open', '[]', '', '2024-01-01T00:00:00Z', '{}')",
             [],
         ).unwrap();
         conn.execute("UPDATE worktrees SET ticket_id = 't1' WHERE id = 'w1'", [])
@@ -3212,6 +3245,67 @@ mod tests {
 
         let ctx = build_startup_context(&conn, Some("w1"), &current.id, "/tmp");
         assert!(ctx.contains("**Ticket:** #42 — Fix payment bug"));
+        assert!(ctx.contains("The payment flow crashes on retry"));
+    }
+
+    #[test]
+    fn test_startup_context_ticket_empty_body_omits_body() {
+        let conn = setup_db();
+
+        // Insert a ticket with an empty body
+        conn.execute(
+            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, url, synced_at, raw_json) \
+             VALUES ('t1', 'r1', 'github', '99', 'Add logging', '', 'open', '[]', '', '2024-01-01T00:00:00Z', '{}')",
+            [],
+        ).unwrap();
+        conn.execute("UPDATE worktrees SET ticket_id = 't1' WHERE id = 'w1'", [])
+            .unwrap();
+
+        let mgr = AgentManager::new(&conn);
+        let current = mgr.create_run(Some("w1"), "Add it", None, None).unwrap();
+
+        let ctx = build_startup_context(&conn, Some("w1"), &current.id, "/tmp");
+        assert!(ctx.contains("**Ticket:** #99 — Add logging"));
+        // Body is empty so the ticket section should go straight to the next section
+        assert!(ctx.contains("**Ticket:** #99 — Add logging\n\n**"));
+    }
+
+    #[test]
+    fn test_startup_context_ephemeral_run_includes_ticket_from_workflow() {
+        let conn = setup_db();
+
+        // Insert a ticket
+        conn.execute(
+            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, url, synced_at, raw_json) \
+             VALUES ('t1', 'r1', 'github', '55', 'Deploy pipeline', 'Set up CI/CD for staging', 'open', '[]', '', '2024-01-01T00:00:00Z', '{}')",
+            [],
+        ).unwrap();
+
+        // Create a parent agent run (the orchestrator run) attached to worktree w1
+        let mgr = AgentManager::new(&conn);
+        let parent = mgr.create_run(Some("w1"), "orchestrate", None, None).unwrap();
+
+        // Create a workflow run targeting the ticket (ticket-targeted, ephemeral)
+        conn.execute(
+            "INSERT INTO workflow_runs (id, workflow_name, worktree_id, parent_run_id, ticket_id, status, started_at) \
+             VALUES ('wf1', 'deploy', 'w1', ?1, 't1', 'running', '2024-01-01T00:00:00Z')",
+            params![parent.id],
+        ).unwrap();
+
+        // Create a child agent run (the ephemeral step run, no worktree)
+        let child = mgr.create_run(None, "deploy step", None, None).unwrap();
+
+        // Link the child run to the workflow step
+        conn.execute(
+            "INSERT INTO workflow_run_steps (id, workflow_run_id, step_name, role, position, child_run_id, status) \
+             VALUES ('ws1', 'wf1', 'deploy-step', 'actor', 0, ?1, 'running')",
+            params![child.id],
+        ).unwrap();
+
+        // Ephemeral: worktree_id = None
+        let ctx = build_startup_context(&conn, None, &child.id, "/tmp");
+        assert!(ctx.contains("**Ticket:** #55 — Deploy pipeline"));
+        assert!(ctx.contains("Set up CI/CD for staging"));
     }
 
     #[test]
