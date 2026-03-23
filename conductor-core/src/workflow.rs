@@ -1916,6 +1916,15 @@ fn build_context_prompt(
     let vars = build_variable_map(state);
     let mut prompt = String::new();
 
+    // Task reinforcement: ensure the agent follows its own procedure rather
+    // than just reading files and reporting status.
+    prompt.push_str(
+        "You are executing as a step in a conductor workflow. \
+         Follow the complete procedure defined in your agent definition — \
+         execute all required actions (CLI commands, file writes, etc.), \
+         do not stop at reading and reporting.\n\n",
+    );
+
     if agent_def.can_commit && state.exec_config.dry_run {
         prompt.push_str("DO NOT commit or push any changes. This is a dry run.\n\n");
     }
