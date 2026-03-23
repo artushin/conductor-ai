@@ -467,7 +467,7 @@ impl Default for WorkflowExecConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(5),
-            step_timeout: Duration::from_secs(30 * 60),
+            step_timeout: Duration::from_secs(7 * 24 * 60 * 60),
             fail_fast: true,
             dry_run: false,
             shutdown: None,
@@ -807,7 +807,8 @@ impl<'a> WorkflowManager<'a> {
         structured_output: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let is_starting = status == WorkflowStepStatus::Running;
+        let is_starting =
+            status == WorkflowStepStatus::Running || status == WorkflowStepStatus::Waiting;
         let is_terminal = matches!(
             status,
             WorkflowStepStatus::Completed
@@ -1900,6 +1901,59 @@ fn build_agent_prompt(
     prompt
 }
 
+/// Build a slim context-only prompt for use with `--agent`.
+///
+/// When the agent definition is loaded natively by Claude via `--agent`, we
+/// only need to pass conductor context: workflow variables, dry-run flag,
+/// prompt snippets, and output instructions.  The agent body itself is NOT
+/// included — Claude loads it from the plugin dir.
+fn build_context_prompt(
+    state: &ExecutionState<'_>,
+    agent_def: &agent_config::AgentDef,
+    schema: Option<&schema_config::OutputSchema>,
+    snippet_text: &str,
+) -> String {
+    let vars = build_variable_map(state);
+    let mut prompt = String::new();
+
+    if agent_def.can_commit && state.exec_config.dry_run {
+        prompt.push_str("DO NOT commit or push any changes. This is a dry run.\n\n");
+    }
+
+    // Provide workflow variable values so the agent can reference them
+    let mut has_vars = false;
+    for (k, v) in &vars {
+        if !v.is_empty() {
+            if !has_vars {
+                prompt.push_str("## Conductor Workflow Context\n\n");
+                has_vars = true;
+            }
+            prompt.push_str(&format!("- **{}**: {}\n", k, v));
+        }
+    }
+    if has_vars {
+        prompt.push('\n');
+    }
+
+    // Append prompt snippets (already concatenated by caller)
+    if !snippet_text.is_empty() {
+        let substituted = substitute_variables(snippet_text, &vars);
+        prompt.push_str(&substituted);
+        prompt.push_str("\n\n");
+    }
+
+    // Append output instructions
+    match schema {
+        Some(s) => {
+            prompt.push_str(&schema_config::generate_prompt_instructions(s));
+        }
+        None => {
+            prompt.push_str(CONDUCTOR_OUTPUT_INSTRUCTION);
+        }
+    }
+    prompt
+}
+
 // ---------------------------------------------------------------------------
 // Execution state
 // ---------------------------------------------------------------------------
@@ -2921,7 +2975,19 @@ fn execute_call_with_schema(
         Some(&state.workflow_name),
     )?;
 
-    let prompt = build_agent_prompt(state, &agent_def, schema.as_ref(), &snippet_text);
+    // Build prompt: when --agent is used, only include conductor context
+    // (variables, output instructions), not the full agent body.
+    let use_native_agent = !node.plugin_dirs.is_empty();
+    let prompt = if use_native_agent {
+        build_context_prompt(state, &agent_def, schema.as_ref(), &snippet_text)
+    } else {
+        build_agent_prompt(state, &agent_def, schema.as_ref(), &snippet_text)
+    };
+    let native_agent_name = if use_native_agent {
+        Some(agent_label)
+    } else {
+        None
+    };
     let step_model = agent_def.model.as_deref().or(state.model.as_deref());
 
     // Per-call plugin_dirs: appended to repo-level dirs
@@ -2985,11 +3051,12 @@ fn execute_call_with_schema(
         )?;
 
         tracing::info!(
-            "Step '{}' (attempt {}/{}): spawning in '{}'",
+            "Step '{}' (attempt {}/{}): spawning in '{}'{}",
             agent_label,
             attempt + 1,
             max_attempts,
             child_window,
+            if native_agent_name.is_some() { " [native --agent]" } else { "" },
         );
 
         // Spawn in tmux
@@ -3001,6 +3068,7 @@ fn execute_call_with_schema(
             &child_window,
             effective_bot_name,
             effective_plugin_dirs,
+            native_agent_name,
         ) {
             tracing::warn!("Failed to spawn child: {e}");
             let _ = state
@@ -3865,7 +3933,18 @@ fn execute_parallel(
             Some(&state.workflow_name),
         )?;
 
-        let prompt = build_agent_prompt(state, &agent_def, effective_schema, &snippet_text);
+        // Use --agent when per-call plugin_dirs are specified
+        let use_native_agent = node.call_plugin_dirs.contains_key(&i);
+        let prompt = if use_native_agent {
+            build_context_prompt(state, &agent_def, effective_schema, &snippet_text)
+        } else {
+            build_agent_prompt(state, &agent_def, effective_schema, &snippet_text)
+        };
+        let native_agent_name: Option<&str> = if use_native_agent {
+            Some(agent_label)
+        } else {
+            None
+        };
         let step_model = agent_def.model.as_deref().or(state.model.as_deref());
         let step_id = state.wf_mgr.insert_step(
             &state.workflow_run_id,
@@ -3914,6 +3993,7 @@ fn execute_parallel(
             &window_name,
             state.default_bot_name.as_deref(),
             effective_plugin_dirs,
+            native_agent_name,
         ) {
             tracing::warn!("Failed to spawn parallel agent '{agent_label}': {e}");
             let _ = state

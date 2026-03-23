@@ -157,6 +157,7 @@ pub fn orchestrate_run(
             &child_window,
             None,
             &[],
+            None, // orchestrator uses inline prompts, not --agent
         );
 
         if let Err(e) = spawn_result {

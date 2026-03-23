@@ -119,6 +119,9 @@ enum AgentCommands {
         /// Additional --plugin-dir arguments to pass to the Claude session
         #[arg(long)]
         plugin_dir: Vec<String>,
+        /// Agent name to pass to Claude via --agent (loaded from plugin dirs, not inlined)
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Orchestrate child agents: spawn a child run for each plan step
     Orchestrate {
@@ -134,8 +137,8 @@ enum AgentCommands {
         /// Stop on first child failure
         #[arg(long)]
         fail_fast: bool,
-        /// Child run timeout in seconds (default: 1800 = 30 min)
-        #[arg(long, default_value = "1800")]
+        /// Child run timeout in seconds (default: 604800 = 1 week)
+        #[arg(long, default_value = "604800")]
         child_timeout_secs: u64,
     },
     /// Create a new GitHub issue (called by agents during a run)
@@ -207,8 +210,8 @@ enum WorkflowCommands {
         /// Continue past step failures
         #[arg(long)]
         no_fail_fast: bool,
-        /// Step timeout in seconds (default: 1800 = 30 min)
-        #[arg(long, default_value = "1800")]
+        /// Step timeout in seconds (default: 604800 = 1 week)
+        #[arg(long, default_value = "604800")]
         step_timeout_secs: u64,
         /// Input variables (key=value pairs)
         #[arg(long = "input", value_name = "KEY=VALUE")]
@@ -819,7 +822,7 @@ fn main() -> Result<()> {
                                         model,
                                     )?;
                                     run_agent(
-                                        &conn, &run.id, &wt.path, &prompt, None, model, None, &[],
+                                        &conn, &run.id, &wt.path, &prompt, None, model, None, &[], None,
                                     )?;
                                 }
                                 Err(e) => {
@@ -903,24 +906,27 @@ fn main() -> Result<()> {
                     model,
                     bot_name,
                     plugin_dir,
+                    agent,
                 } => {
                     let resolved_prompt = match (prompt, prompt_file) {
-                        (Some(p), _) => p,
-                        (None, Some(path)) => std::fs::read_to_string(&path)
-                            .with_context(|| format!("Failed to read prompt file: {path}"))?,
-                        (None, None) => {
-                            anyhow::bail!("Either --prompt or --prompt-file is required")
-                        }
+                        (Some(p), _) => Some(p),
+                        (None, Some(path)) => Some(std::fs::read_to_string(&path)
+                            .with_context(|| format!("Failed to read prompt file: {path}"))?),
+                        (None, None) => None,
                     };
+                    if resolved_prompt.is_none() && agent.is_none() {
+                        anyhow::bail!("Either --prompt/--prompt-file or --agent is required");
+                    }
                     run_agent(
                         &conn,
                         &run_id,
                         &worktree_path,
-                        &resolved_prompt,
+                        resolved_prompt.as_deref().unwrap_or(""),
                         resume.as_deref(),
                         model.as_deref(),
                         bot_name.as_deref(),
                         &plugin_dir,
+                        agent.as_deref(),
                     )?;
                 }
                 AgentCommands::Orchestrate {
@@ -2122,6 +2128,7 @@ fn run_agent(
     model: Option<&str>,
     bot_name: Option<&str>,
     plugin_dirs: &[String],
+    agent_name: Option<&str>,
 ) -> Result<()> {
     let mgr = AgentManager::new(conn);
 
@@ -2258,6 +2265,10 @@ fn run_agent(
             if let Some(ref sid) = resume_session_id {
                 cmd.arg("--resume").arg(sid);
             }
+        }
+        // Pass --agent to let Claude load the agent natively from plugin dirs
+        if let Some(ref name) = agent_name {
+            cmd.arg("--agent").arg(name);
         }
         cmd.arg("--output-format")
             .arg("stream-json")

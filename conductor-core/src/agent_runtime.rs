@@ -175,6 +175,11 @@ pub fn poll_child_completion(
 }
 
 /// Spawn a child agent in a new tmux window.
+///
+/// When `agent_name` is provided, the agent definition is loaded natively by
+/// Claude via `--agent <name>` from the plugin dirs instead of being inlined
+/// in `--prompt`.  The `prompt` then only carries conductor context (variable
+/// values, output instructions, etc.), keeping the tmux command small.
 pub fn spawn_child_tmux(
     run_id: &str,
     worktree_path: &str,
@@ -183,6 +188,7 @@ pub fn spawn_child_tmux(
     window_name: &str,
     bot_name: Option<&str>,
     plugin_dirs: &[String],
+    agent_name: Option<&str>,
 ) -> std::result::Result<(), String> {
     let mut args = vec![
         "agent".to_string(),
@@ -191,9 +197,20 @@ pub fn spawn_child_tmux(
         run_id.to_string(),
         "--worktree-path".to_string(),
         worktree_path.to_string(),
-        "--prompt".to_string(),
-        prompt.to_string(),
     ];
+
+    // When an agent name is provided, pass it via --agent so Claude loads it
+    // from plugin dirs natively.  The prompt (if non-empty) carries only
+    // conductor context — variable values, output schema, etc.
+    if let Some(name) = agent_name {
+        args.push("--agent".to_string());
+        args.push(name.to_string());
+    }
+
+    if !prompt.is_empty() {
+        args.push("--prompt".to_string());
+        args.push(prompt.to_string());
+    }
 
     if let Some(m) = model {
         args.push("--model".to_string());
