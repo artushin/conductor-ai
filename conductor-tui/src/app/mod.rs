@@ -980,6 +980,19 @@ impl App {
             Action::WorktreeCreateFailed { message } => {
                 self.state.modal = Modal::Error { message };
             }
+            Action::AgentLaunchComplete { result }
+            | Action::OrchestrateLaunchComplete { result } => {
+                self.state.modal = Modal::None;
+                match result {
+                    Ok(msg) => {
+                        self.state.status_message = Some(msg);
+                        self.refresh_data();
+                    }
+                    Err(e) => {
+                        self.state.modal = Modal::Error { message: e };
+                    }
+                }
+            }
             Action::RepoAgentLaunched { result } => {
                 self.state.modal = Modal::None;
                 match result {
