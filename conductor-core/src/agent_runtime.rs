@@ -232,6 +232,7 @@ pub fn build_agent_args(
     resume_session_id: Option<&str>,
     model: Option<&str>,
     bot_name: Option<&str>,
+    extra_plugin_dirs: &[String],
 ) -> std::result::Result<Vec<Cow<'static, str>>, String> {
     build_agent_args_with_mode(
         run_id,
@@ -241,6 +242,7 @@ pub fn build_agent_args(
         model,
         bot_name,
         None,
+        extra_plugin_dirs,
     )
 }
 
@@ -257,6 +259,7 @@ pub fn build_agent_args_with_mode(
     model: Option<&str>,
     bot_name: Option<&str>,
     permission_mode: Option<&crate::config::AgentPermissionMode>,
+    extra_plugin_dirs: &[String],
 ) -> std::result::Result<Vec<Cow<'static, str>>, String> {
     // tmux has a hard limit on command-line length (~2 KB depending on version).
     // For prompts that exceed a safe threshold, write to a file and pass
@@ -315,6 +318,11 @@ pub fn build_agent_args_with_mode(
         args.push(Cow::Borrowed(pattern));
     }
 
+    for dir in extra_plugin_dirs {
+        args.push(Cow::Borrowed("--plugin-dir"));
+        args.push(Cow::Owned(dir.clone()));
+    }
+
     Ok(args)
 }
 
@@ -362,8 +370,17 @@ pub fn spawn_child_tmux(
     model: Option<&str>,
     window_name: &str,
     bot_name: Option<&str>,
+    extra_plugin_dirs: &[String],
 ) -> std::result::Result<(), String> {
-    let args = build_agent_args(run_id, worktree_path, prompt, None, model, bot_name)?;
+    let args = build_agent_args(
+        run_id,
+        worktree_path,
+        prompt,
+        None,
+        model,
+        bot_name,
+        extra_plugin_dirs,
+    )?;
     spawn_tmux_window(&args, window_name)
 }
 
@@ -434,7 +451,7 @@ mod tests {
     fn build_agent_args_short_prompt_uses_inline() {
         let prompt = "short prompt";
         assert!(prompt.len() <= 512);
-        let args = super::build_agent_args("run-1", "/tmp/wt", prompt, None, None, None).unwrap();
+        let args = super::build_agent_args("run-1", "/tmp/wt", prompt, None, None, None, &[]).unwrap();
         assert_inline_prompt(&args, prompt);
     }
 
@@ -446,7 +463,7 @@ mod tests {
         let run_id = "run-long-99";
 
         let prompt = "x".repeat(513);
-        let args = super::build_agent_args(run_id, worktree, &prompt, None, None, None).unwrap();
+        let args = super::build_agent_args(run_id, worktree, &prompt, None, None, None, &[]).unwrap();
 
         let expected_path = format!("{worktree}/.conductor-prompt-{run_id}.txt");
         assert_file_prompt(&args, &prompt, &expected_path);
@@ -460,7 +477,7 @@ mod tests {
     fn build_agent_args_file_write_error_propagates() {
         let worktree = "/nonexistent/path/that/does/not/exist";
         let prompt = "x".repeat(513);
-        let result = super::build_agent_args("run-err-01", worktree, &prompt, None, None, None);
+        let result = super::build_agent_args("run-err-01", worktree, &prompt, None, None, None, &[]);
         assert!(result.is_err(), "expected Err when write fails");
         let msg = result.unwrap_err();
         assert!(
@@ -476,7 +493,7 @@ mod tests {
         let prompt = "x".repeat(512);
         assert_eq!(prompt.len(), 512);
         let args =
-            super::build_agent_args("run-boundary", "/tmp/wt", &prompt, None, None, None).unwrap();
+            super::build_agent_args("run-boundary", "/tmp/wt", &prompt, None, None, None, &[]).unwrap();
         assert_inline_prompt(&args, &prompt);
     }
 
@@ -484,7 +501,7 @@ mod tests {
     fn build_agent_args_with_resume_sets_flag() {
         let prompt = "short prompt";
         let args =
-            super::build_agent_args("run-1", "/tmp/wt", prompt, Some("sess-abc"), None, None)
+            super::build_agent_args("run-1", "/tmp/wt", prompt, Some("sess-abc"), None, None, &[])
                 .unwrap();
         let resume_idx = args
             .iter()
@@ -532,6 +549,7 @@ mod tests {
             None,
             None,
             Some(&AgentPermissionMode::SkipPermissions),
+            &[],
         )
         .unwrap();
         assert!(
@@ -551,6 +569,7 @@ mod tests {
             None,
             None,
             Some(&AgentPermissionMode::AutoMode),
+            &[],
         )
         .unwrap();
         assert!(
@@ -570,6 +589,7 @@ mod tests {
             None,
             None,
             Some(&AgentPermissionMode::Plan),
+            &[],
         )
         .unwrap();
         let idx = args
@@ -604,6 +624,7 @@ mod tests {
                 None,
                 None,
                 Some(mode),
+                &[],
             )
             .unwrap();
             assert!(
@@ -617,7 +638,7 @@ mod tests {
     #[test]
     fn build_agent_args_with_mode_none() {
         let args =
-            super::build_agent_args_with_mode("run-1", "/tmp/wt", "prompt", None, None, None, None)
+            super::build_agent_args_with_mode("run-1", "/tmp/wt", "prompt", None, None, None, None, &[])
                 .unwrap();
         assert!(
             !args.iter().any(|a| a == "--dangerously-skip-permissions"
@@ -637,6 +658,7 @@ mod tests {
             Some("claude-sonnet-4-6"),
             None,
             None,
+            &[],
         )
         .unwrap();
         let idx = args
@@ -656,6 +678,7 @@ mod tests {
             None,
             Some("my-bot"),
             None,
+            &[],
         )
         .unwrap();
         let idx = args
@@ -676,6 +699,7 @@ mod tests {
             Some("claude-opus-4-6"),
             Some("bot-x"),
             Some(&AgentPermissionMode::Plan),
+            &[],
         )
         .unwrap();
 

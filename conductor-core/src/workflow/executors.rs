@@ -174,6 +174,7 @@ fn execute_call_with_schema(
             step_model,
             &child_window,
             effective_bot_name,
+            &state.extra_plugin_dirs,
         ) {
             tracing::warn!("Failed to spawn child: {e}");
             let _ = state
@@ -597,6 +598,7 @@ pub(super) fn execute_call_workflow(
             run_id_notify: None,
             triggered_by_hook: state.triggered_by_hook,
             conductor_bin_dir: state.conductor_bin_dir.clone(),
+            extra_plugin_dirs: state.extra_plugin_dirs.clone(),
         };
 
         match super::engine::execute_workflow(&child_input) {
@@ -1090,6 +1092,7 @@ pub(super) fn execute_parallel(
             step_model,
             &window_name,
             state.default_bot_name.as_deref(),
+            &state.extra_plugin_dirs,
         ) {
             tracing::warn!("Failed to spawn parallel agent '{agent_label}': {e}");
             let _ = state
@@ -2338,6 +2341,7 @@ mod tests {
             feature_id: None,
             triggered_by_hook: false,
             conductor_bin_dir: None,
+            extra_plugin_dirs: vec![],
         }
     }
 

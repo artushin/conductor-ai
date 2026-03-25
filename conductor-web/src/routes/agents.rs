@@ -160,6 +160,7 @@ pub async fn start_agent(
         body.resume_session_id.as_deref(),
         model.as_deref(),
         None,
+        &[],
     )
     .map_err(|e| {
         let _ = agent_mgr.update_run_failed(&run.id, &e);
@@ -758,6 +759,7 @@ pub async fn start_repo_agent(
         model.as_deref(),
         None,
         Some(&plan_mode),
+        &[],
     )
     .map_err(|e| {
         let _ = agent_mgr.update_run_failed(&run.id, &e);

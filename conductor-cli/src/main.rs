@@ -138,6 +138,9 @@ enum AgentCommands {
         /// Override the permission mode for this run (e.g. "plan" for read-only repo agents).
         #[arg(long)]
         permission_mode: Option<String>,
+        /// Additional plugin directories to pass to the Claude CLI
+        #[arg(long = "plugin-dir")]
+        plugin_dirs: Vec<String>,
     },
     /// Orchestrate child agents: spawn a child run for each plan step
     Orchestrate {
@@ -240,6 +243,9 @@ enum WorkflowCommands {
         /// Run the workflow in the background: print the run ID and exit immediately
         #[arg(long)]
         background: bool,
+        /// Additional plugin directories to pass to agent sessions (appended to repo-level plugin_dirs)
+        #[arg(long = "plugin-dir")]
+        plugin_dirs: Vec<String>,
     },
     /// Show details of a workflow run
     #[command(name = "run-show", alias = "show")]
@@ -913,7 +919,7 @@ fn main() -> Result<()> {
                                         model,
                                     )?;
                                     run_agent(
-                                        &conn, &run.id, &wt.path, &prompt, None, model, None, None,
+                                        &conn, &run.id, &wt.path, &prompt, None, model, None, None, &[],
                                     )?;
                                 }
                                 Err(e) => {
@@ -1009,6 +1015,7 @@ fn main() -> Result<()> {
                     model,
                     bot_name,
                     permission_mode,
+                    plugin_dirs,
                 } => {
                     let resolved_prompt = match (prompt, prompt_file) {
                         (Some(p), _) => p,
@@ -1033,6 +1040,7 @@ fn main() -> Result<()> {
                         model.as_deref(),
                         bot_name.as_deref(),
                         perm_mode.as_ref(),
+                        &plugin_dirs,
                     )?;
                 }
                 AgentCommands::Orchestrate {
@@ -1530,6 +1538,7 @@ fn main() -> Result<()> {
                 inputs,
                 feature,
                 background,
+                plugin_dirs,
             } => {
                 // Parse input key=value pairs (shared by both paths)
                 let mut input_map = std::collections::HashMap::new();
@@ -1638,6 +1647,7 @@ fn main() -> Result<()> {
                             triggered_by_hook: false,
                             conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
                             ),
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1693,6 +1703,7 @@ fn main() -> Result<()> {
                             triggered_by_hook: false,
                             conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
                             ),
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1748,6 +1759,7 @@ fn main() -> Result<()> {
                             triggered_by_hook: false,
                             conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
                             ),
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1798,6 +1810,7 @@ fn main() -> Result<()> {
                             triggered_by_hook: false,
                             conductor_bin_dir:
                                 conductor_core::workflow::resolve_conductor_bin_dir(),
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         };
                         let run_id = background::fork_and_run_workflow(params)?;
                         println!("{}", run_id);
@@ -1838,6 +1851,7 @@ fn main() -> Result<()> {
                             triggered_by_hook: false,
                             conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
                             ),
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -2331,6 +2345,7 @@ fn generate_plan(
 /// Uses `--output-format json` (single JSON result) since the tmux terminal IS the display.
 /// Claude's interactive output goes directly to the terminal; we only parse the final JSON result.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_agent(
     conn: &rusqlite::Connection,
     run_id: &str,
@@ -2340,6 +2355,7 @@ fn run_agent(
     model: Option<&str>,
     bot_name: Option<&str>,
     permission_mode_override: Option<&conductor_core::config::AgentPermissionMode>,
+    extra_plugin_dirs: &[String],
 ) -> Result<()> {
     let mgr = AgentManager::new(conn);
 
@@ -2533,6 +2549,10 @@ fn run_agent(
 
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
+        }
+
+        for dir in extra_plugin_dirs {
+            cmd.arg("--plugin-dir").arg(dir);
         }
 
         // ── open log file (create on turn 0, append on feedback resume turns) ─

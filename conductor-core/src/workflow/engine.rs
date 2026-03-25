@@ -98,6 +98,8 @@ pub(super) struct ExecutionState<'a> {
     /// Directory containing the conductor binary, injected into script step PATH.
     /// Resolved by the caller (binary crate) so the library doesn't call `current_exe()`.
     pub conductor_bin_dir: Option<std::path::PathBuf>,
+    /// Additional plugin directories to pass to agent sessions.
+    pub extra_plugin_dirs: Vec<String>,
 }
 
 /// Resolve a schema by name using the standard search order.
@@ -413,6 +415,7 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         feature_id: input.feature_id.map(String::from),
         triggered_by_hook: input.triggered_by_hook,
         conductor_bin_dir: input.conductor_bin_dir.clone(),
+        extra_plugin_dirs: input.extra_plugin_dirs.clone(),
     };
 
     run_workflow_engine(&mut state, workflow)
@@ -604,6 +607,7 @@ fn evaluate_hooks(
             run_id_notify: None,
             triggered_by_hook: true,
             conductor_bin_dir: state.conductor_bin_dir.clone(),
+            extra_plugin_dirs: state.extra_plugin_dirs.clone(),
         };
 
         match execute_workflow(&hook_input) {
@@ -649,6 +653,7 @@ pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<Wo
         run_id_notify: params.run_id_notify.clone(),
         triggered_by_hook: params.triggered_by_hook,
         conductor_bin_dir: params.conductor_bin_dir.clone(),
+        extra_plugin_dirs: params.extra_plugin_dirs.clone(),
     };
 
     execute_workflow(&input)
@@ -921,6 +926,7 @@ pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult
         feature_id: wf_run.feature_id.clone(),
         triggered_by_hook: wf_run.is_triggered_by_hook(),
         conductor_bin_dir: input.conductor_bin_dir.clone(),
+        extra_plugin_dirs: vec![],
     };
 
     run_workflow_engine(&mut state, &workflow)
