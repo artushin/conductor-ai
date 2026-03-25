@@ -638,8 +638,27 @@ impl App {
                 if value.is_empty() {
                     return;
                 }
+                // Convert user input based on feedback type (select → option value)
+                let resolved_value = if let Some(ref fb) = self.state.data.pending_feedback {
+                    use conductor_core::agent::normalize_feedback_response;
+                    match normalize_feedback_response(
+                        &fb.feedback_type,
+                        fb.options.as_deref(),
+                        &value,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.state.modal = Modal::Error {
+                                message: format!("Failed to encode feedback response: {e}"),
+                            };
+                            return;
+                        }
+                    }
+                } else {
+                    value.clone()
+                };
                 let mgr = AgentManager::new(&self.conn);
-                match mgr.submit_feedback(&feedback_id, &value) {
+                match mgr.submit_feedback(&feedback_id, &resolved_value) {
                     Ok(_) => {
                         self.state.status_message =
                             Some("Feedback submitted — agent resumed".to_string());
