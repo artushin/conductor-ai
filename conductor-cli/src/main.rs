@@ -559,6 +559,23 @@ enum TicketCommands {
         /// Priority
         #[arg(long)]
         priority: Option<String>,
+        /// Workflow name override (bypasses routing heuristics)
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Agent map JSON (pre-resolved agent assignments)
+        #[arg(long)]
+        agent_map: Option<String>,
+    },
+    /// Update a ticket's workflow or agent_map routing fields
+    Update {
+        /// Ticket ID (ULID from `conductor tickets list`)
+        id: String,
+        /// Set workflow name (empty string clears)
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Set agent map JSON (empty string clears)
+        #[arg(long)]
+        agent_map: Option<String>,
     },
 }
 
@@ -1292,6 +1309,8 @@ fn main() -> Result<()> {
                 labels,
                 assignee,
                 priority,
+                workflow,
+                agent_map,
             } => {
                 let repo_obj = RepoManager::new(&conn, &config).get_by_slug(&repo)?;
 
@@ -1318,10 +1337,35 @@ fn main() -> Result<()> {
 
                 let syncer = TicketSyncer::new(&conn);
                 syncer.upsert_tickets(&repo_obj.id, &[ticket_input])?;
+
+                // Apply routing fields if provided
+                if workflow.is_some() || agent_map.is_some() {
+                    // Look up the ticket by source_id to get the ULID
+                    let ticket = syncer.get_by_source_id(&repo_obj.id, &source_id)?;
+                    syncer.update_ticket_routing(
+                        &ticket.id,
+                        workflow.as_deref(),
+                        agent_map.as_deref(),
+                    )?;
+                }
+
                 println!(
                     "Upserted ticket {}#{} into {}.",
                     source_type, source_id, repo
                 );
+            }
+            TicketCommands::Update {
+                id,
+                workflow,
+                agent_map,
+            } => {
+                let syncer = TicketSyncer::new(&conn);
+                syncer.update_ticket_routing(
+                    &id,
+                    workflow.as_deref(),
+                    agent_map.as_deref(),
+                )?;
+                println!("Updated ticket {id}.");
             }
             TicketCommands::Stats { repo } => {
                 let repo_mgr = RepoManager::new(&conn, &config);

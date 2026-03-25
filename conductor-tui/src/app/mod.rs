@@ -2581,6 +2581,8 @@ workflow my-wf {
                 url: "https://github.com/x/y/issues/123".into(),
                 synced_at: "2024-01-01T00:00:00Z".into(),
                 raw_json: "{}".into(),
+                workflow: None,
+                agent_map: None,
             }),
         };
         assert_eq!(
@@ -2667,6 +2669,8 @@ workflow my-wf {
             url: "https://github.com/x/y/issues/42".into(),
             synced_at: "2024-01-01T00:00:00Z".into(),
             raw_json: "{}".into(),
+            workflow: None,
+            agent_map: None,
         }];
         app.state.detail_ticket_index = 0;
         assert_eq!(

@@ -919,6 +919,16 @@ pub fn run(conn: &Connection) -> Result<()> {
         bump_version(conn, 51)?;
     }
 
+    if version < 52 {
+        conn.execute_batch(include_str!("migrations/052_ticket_workflow.sql"))?;
+        bump_version(conn, 52)?;
+    }
+
+    if version < 53 {
+        conn.execute_batch(include_str!("migrations/053_ticket_agent_map.sql"))?;
+        bump_version(conn, 53)?;
+    }
+
     Ok(())
 }
 
