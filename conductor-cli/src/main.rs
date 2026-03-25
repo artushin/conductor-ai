@@ -936,7 +936,15 @@ fn main() -> Result<()> {
                                         model,
                                     )?;
                                     run_agent(
-                                        &conn, &run.id, &wt.path, &prompt, None, model, None, None, &[],
+                                        &conn,
+                                        &run.id,
+                                        &wt.path,
+                                        &prompt,
+                                        None,
+                                        model,
+                                        None,
+                                        None,
+                                        &[],
                                     )?;
                                 }
                                 Err(e) => {
@@ -1360,11 +1368,7 @@ fn main() -> Result<()> {
                 agent_map,
             } => {
                 let syncer = TicketSyncer::new(&conn);
-                syncer.update_ticket_routing(
-                    &id,
-                    workflow.as_deref(),
-                    agent_map.as_deref(),
-                )?;
+                syncer.update_ticket_routing(&id, workflow.as_deref(), agent_map.as_deref())?;
                 println!("Updated ticket {id}.");
             }
             TicketCommands::Stats { repo } => {
@@ -1852,8 +1856,8 @@ fn main() -> Result<()> {
                             feature_id,
                             run_id_notify: None,
                             triggered_by_hook: false,
-                            conductor_bin_dir:
-                                conductor_core::workflow::resolve_conductor_bin_dir(),
+                            conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(
+                            ),
                             extra_plugin_dirs: plugin_dirs.clone(),
                         };
                         let run_id = background::fork_and_run_workflow(params)?;
@@ -1862,9 +1866,7 @@ fn main() -> Result<()> {
                     }
                     #[cfg(not(unix))]
                     if background {
-                        anyhow::bail!(
-                            "--background is only supported on Unix systems"
-                        );
+                        anyhow::bail!("--background is only supported on Unix systems");
                     }
 
                     println!(

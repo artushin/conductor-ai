@@ -451,7 +451,8 @@ mod tests {
     fn build_agent_args_short_prompt_uses_inline() {
         let prompt = "short prompt";
         assert!(prompt.len() <= 512);
-        let args = super::build_agent_args("run-1", "/tmp/wt", prompt, None, None, None, &[]).unwrap();
+        let args =
+            super::build_agent_args("run-1", "/tmp/wt", prompt, None, None, None, &[]).unwrap();
         assert_inline_prompt(&args, prompt);
     }
 
@@ -463,7 +464,8 @@ mod tests {
         let run_id = "run-long-99";
 
         let prompt = "x".repeat(513);
-        let args = super::build_agent_args(run_id, worktree, &prompt, None, None, None, &[]).unwrap();
+        let args =
+            super::build_agent_args(run_id, worktree, &prompt, None, None, None, &[]).unwrap();
 
         let expected_path = format!("{worktree}/.conductor-prompt-{run_id}.txt");
         assert_file_prompt(&args, &prompt, &expected_path);
@@ -477,7 +479,8 @@ mod tests {
     fn build_agent_args_file_write_error_propagates() {
         let worktree = "/nonexistent/path/that/does/not/exist";
         let prompt = "x".repeat(513);
-        let result = super::build_agent_args("run-err-01", worktree, &prompt, None, None, None, &[]);
+        let result =
+            super::build_agent_args("run-err-01", worktree, &prompt, None, None, None, &[]);
         assert!(result.is_err(), "expected Err when write fails");
         let msg = result.unwrap_err();
         assert!(
@@ -493,16 +496,24 @@ mod tests {
         let prompt = "x".repeat(512);
         assert_eq!(prompt.len(), 512);
         let args =
-            super::build_agent_args("run-boundary", "/tmp/wt", &prompt, None, None, None, &[]).unwrap();
+            super::build_agent_args("run-boundary", "/tmp/wt", &prompt, None, None, None, &[])
+                .unwrap();
         assert_inline_prompt(&args, &prompt);
     }
 
     #[test]
     fn build_agent_args_with_resume_sets_flag() {
         let prompt = "short prompt";
-        let args =
-            super::build_agent_args("run-1", "/tmp/wt", prompt, Some("sess-abc"), None, None, &[])
-                .unwrap();
+        let args = super::build_agent_args(
+            "run-1",
+            "/tmp/wt",
+            prompt,
+            Some("sess-abc"),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         let resume_idx = args
             .iter()
             .position(|a| a == "--resume")
@@ -637,9 +648,17 @@ mod tests {
 
     #[test]
     fn build_agent_args_with_mode_none() {
-        let args =
-            super::build_agent_args_with_mode("run-1", "/tmp/wt", "prompt", None, None, None, None, &[])
-                .unwrap();
+        let args = super::build_agent_args_with_mode(
+            "run-1",
+            "/tmp/wt",
+            "prompt",
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         assert!(
             !args.iter().any(|a| a == "--dangerously-skip-permissions"
                 || a == "--enable-auto-mode"

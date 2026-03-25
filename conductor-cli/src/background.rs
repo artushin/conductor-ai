@@ -34,10 +34,7 @@ pub fn fork_and_run_workflow(params: WorkflowExecStandalone) -> Result<String> {
     // return value before using them.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if rc != 0 {
-        anyhow::bail!(
-            "pipe() failed: {}",
-            std::io::Error::last_os_error()
-        );
+        anyhow::bail!("pipe() failed: {}", std::io::Error::last_os_error());
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
@@ -54,10 +51,7 @@ pub fn fork_and_run_workflow(params: WorkflowExecStandalone) -> Result<String> {
                 libc::close(read_fd);
                 libc::close(write_fd);
             }
-            anyhow::bail!(
-                "fork() failed: {}",
-                std::io::Error::last_os_error()
-            );
+            anyhow::bail!("fork() failed: {}", std::io::Error::last_os_error());
         }
         0 => {
             // ---------- CHILD PROCESS ----------
@@ -95,10 +89,7 @@ pub fn fork_and_run_workflow(params: WorkflowExecStandalone) -> Result<String> {
             }
 
             if let Some(err_msg) = line.strip_prefix("ERROR:") {
-                anyhow::bail!(
-                    "Background workflow failed to start: {}",
-                    err_msg.trim()
-                );
+                anyhow::bail!("Background workflow failed to start: {}", err_msg.trim());
             }
 
             Ok(line)
@@ -145,8 +136,7 @@ fn child_main(mut params: WorkflowExecStandalone, read_fd: i32, write_fd: i32) -
     // own DB connection.
     let exec_handle = std::thread::spawn(move || {
         if let Err(e) = execute_workflow_standalone(&params) {
-            *error_slot_bg.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(e.to_string());
+            *error_slot_bg.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
             // Wake the main thread so it can surface the error.
             notify_pair_bg.1.notify_one();
         }
@@ -156,17 +146,13 @@ fn child_main(mut params: WorkflowExecStandalone, read_fd: i32, write_fd: i32) -
     let (lock, cvar) = notify_pair.as_ref();
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let (guard, _timed_out) = cvar
-        .wait_timeout_while(
-            guard,
-            std::time::Duration::from_secs(30),
-            |v| {
-                v.is_none()
-                    && error_slot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_none()
-            },
-        )
+        .wait_timeout_while(guard, std::time::Duration::from_secs(30), |v| {
+            v.is_none()
+                && error_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none()
+        })
         .unwrap_or_else(|e| e.into_inner());
 
     // Build the message to send through the pipe.
@@ -190,7 +176,11 @@ fn child_main(mut params: WorkflowExecStandalone, read_fd: i32, write_fd: i32) -
     // async-signal-safe, though at this point we are well past the fork danger zone.
     let msg_bytes = message.as_bytes();
     unsafe {
-        libc::write(write_fd, msg_bytes.as_ptr() as *const libc::c_void, msg_bytes.len());
+        libc::write(
+            write_fd,
+            msg_bytes.as_ptr() as *const libc::c_void,
+            msg_bytes.len(),
+        );
         libc::close(write_fd);
     }
 
@@ -216,10 +206,7 @@ fn redirect_stdio_to_devnull() {
     // SAFETY: We open /dev/null (always available on Unix) and dup2 it onto the
     // standard file descriptors. This is standard Unix daemonization practice.
     unsafe {
-        let devnull = libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_RDWR,
-        );
+        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
         if devnull < 0 {
             return; // Best effort -- don't crash the workflow over this.
         }
