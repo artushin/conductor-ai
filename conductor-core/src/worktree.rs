@@ -771,6 +771,116 @@ impl<'a> WorktreeManager<'a> {
 
         Ok(count)
     }
+
+    /// Scan all active worktrees for merged PRs and clean them up.
+    ///
+    /// For each active worktree whose PR has been merged:
+    /// 1. Mark status as `merged` with `completed_at`
+    /// 2. Remove local git artifacts (worktree dir + local branch)
+    /// 3. Delete the remote branch (best-effort)
+    /// 4. Auto-close orphaned features
+    ///
+    /// When `repo_slug` is `Some`, only worktrees for that repo are checked.
+    /// Returns the number of worktrees cleaned up.
+    pub fn cleanup_merged_worktrees(&self, repo_slug: Option<&str>) -> Result<usize> {
+        self.cleanup_merged_worktrees_with_merge_check(
+            repo_slug,
+            crate::github::merged_branches_for_repo,
+        )
+    }
+
+    pub(crate) fn cleanup_merged_worktrees_with_merge_check(
+        &self,
+        repo_slug: Option<&str>,
+        merge_check: impl Fn(&str, &[String]) -> std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let base_query =
+            "SELECT w.id, w.branch, w.path, r.local_path, r.remote_url, w.repo_id, w.base_branch
+                 FROM worktrees w
+                 JOIN repos r ON r.id = w.repo_id
+                 WHERE w.status = 'active'";
+        let query = match repo_slug {
+            Some(_) => format!("{base_query} AND r.slug = ?1"),
+            None => base_query.to_string(),
+        };
+
+        let mapper = |row: &rusqlite::Row| -> rusqlite::Result<[String; 7]> {
+            Ok([
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            ])
+        };
+        let rows: Vec<[String; 7]> = match repo_slug {
+            Some(slug) => query_collect(self.conn, &query, params![slug], mapper)?,
+            None => query_collect(self.conn, &query, [], mapper)?,
+        };
+
+        // Group branches by remote_url and batch-check merged status per repo.
+        let mut branches_by_remote: std::collections::HashMap<&str, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            branches_by_remote
+                .entry(row[4].as_str())
+                .or_default()
+                .push(row[1].clone());
+        }
+        let mut merged_branches: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for (remote_url, branches) in &branches_by_remote {
+            merged_branches.extend(merge_check(remote_url, branches));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut cleaned = 0usize;
+
+        for row in &rows {
+            let [wt_id, branch, wt_path, repo_path, _remote_url, repo_id, base_branch] = row;
+            if !merged_branches.contains(branch) {
+                continue;
+            }
+
+            tracing::info!(
+                worktree = %wt_id,
+                branch = %branch,
+                "merged PR detected — cleaning up worktree"
+            );
+
+            // Mark as merged
+            self.conn.execute(
+                "UPDATE worktrees SET status = 'merged', completed_at = ?1 WHERE id = ?2",
+                params![now, wt_id],
+            )?;
+
+            // Remove local git artifacts
+            remove_git_artifacts(repo_path, wt_path, branch);
+
+            // Delete remote branch (best-effort)
+            delete_remote_branch(repo_path, branch);
+
+            // Run git worktree prune
+            let _ = git_in(repo_path).args(["worktree", "prune"]).output();
+
+            // Auto-close orphaned features
+            let fm = crate::feature::FeatureManager::new(self.conn, self.config);
+            let base = if base_branch.is_empty() {
+                None
+            } else {
+                Some(base_branch.as_str())
+            };
+            if let Err(e) = fm.auto_close_after_worktree_delete(repo_id, base) {
+                tracing::warn!(error = %e, "failed to auto-close orphaned feature during cleanup");
+            }
+
+            cleaned += 1;
+        }
+
+        Ok(cleaned)
+    }
 }
 
 fn map_worktree_row(row: &rusqlite::Row) -> rusqlite::Result<Worktree> {
@@ -972,6 +1082,35 @@ fn remove_git_artifacts(repo_path: &str, worktree_path: &str, branch: &str) {
             );
         }
         Ok(_) => {}
+    }
+}
+
+/// Delete a remote branch via `git push origin --delete <branch>`.
+/// Best-effort: failures are logged but not propagated.
+fn delete_remote_branch(repo_path: &str, branch: &str) {
+    match git_in(repo_path)
+        .args(["push", "origin", "--delete", "--", branch])
+        .output()
+    {
+        Ok(o) if !o.status.success() => {
+            tracing::warn!(
+                repo = repo_path,
+                branch = branch,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "git push origin --delete failed (remote branch may already be gone)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo = repo_path,
+                branch = branch,
+                error = %e,
+                "failed to run git push origin --delete"
+            );
+        }
+        Ok(_) => {
+            tracing::info!(repo = repo_path, branch = branch, "deleted remote branch");
+        }
     }
 }
 
@@ -2317,5 +2456,172 @@ mod tests {
             status, "closed",
             "feature should be auto-closed after last worktree deleted and branch gone"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_merged_worktrees tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cleanup_merged_worktrees_marks_merged() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+
+        // w1 from setup_db is active with branch "feat/test"
+        let mgr = WorktreeManager::new(&conn, &config);
+        // Simulate merged PR: merge_check returns all branches as merged
+        let count = mgr
+            .cleanup_merged_worktrees_with_merge_check(None, |_, branches| {
+                branches.iter().cloned().collect()
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let status: String = conn
+            .query_row("SELECT status FROM worktrees WHERE id = 'w1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "merged");
+
+        let completed_at: Option<String> = conn
+            .query_row(
+                "SELECT completed_at FROM worktrees WHERE id = 'w1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(completed_at.is_some(), "completed_at should be set");
+    }
+
+    #[test]
+    fn test_cleanup_merged_worktrees_skips_unmerged() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        // merge_check returns empty — no cleanup
+        let count = mgr
+            .cleanup_merged_worktrees_with_merge_check(None, |_, _| {
+                std::collections::HashSet::new()
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let status: String = conn
+            .query_row("SELECT status FROM worktrees WHERE id = 'w1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn test_cleanup_merged_worktrees_skips_already_merged() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+
+        // Mark w1 as already merged
+        conn.execute(
+            "UPDATE worktrees SET status = 'merged', completed_at = '2024-06-01T00:00:00Z' WHERE id = 'w1'",
+            [],
+        ).unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        // merge_check returns all branches, but w1 is already merged so should be skipped
+        let count = mgr
+            .cleanup_merged_worktrees_with_merge_check(None, |_, branches| {
+                branches.iter().cloned().collect()
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_cleanup_merged_worktrees_multiple_repos() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+
+        // Add a second repo with an active worktree
+        conn.execute(
+            "INSERT INTO repos (id, slug, local_path, remote_url, workspace_dir, created_at) \
+             VALUES ('r2', 'other-repo', '/tmp/repo2', 'https://github.com/test/other.git', '/tmp/ws2', '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('w2', 'r2', 'feat-other', 'feat/other', '/tmp/ws2/feat-other', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        // Both worktrees have merged PRs
+        let count = mgr
+            .cleanup_merged_worktrees_with_merge_check(None, |_, branches| {
+                branches.iter().cloned().collect()
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Both should be merged
+        let s1: String = conn
+            .query_row("SELECT status FROM worktrees WHERE id = 'w1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let s2: String = conn
+            .query_row("SELECT status FROM worktrees WHERE id = 'w2'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(s1, "merged");
+        assert_eq!(s2, "merged");
+    }
+
+    #[test]
+    fn test_cleanup_merged_worktrees_filters_by_repo() {
+        let conn = crate::test_helpers::setup_db();
+        let config = Config::default();
+
+        // Add a second repo with an active worktree
+        conn.execute(
+            "INSERT INTO repos (id, slug, local_path, remote_url, workspace_dir, created_at) \
+             VALUES ('r2', 'other-repo', '/tmp/repo2', 'https://github.com/test/other.git', '/tmp/ws2', '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (id, repo_id, slug, branch, path, status, created_at) \
+             VALUES ('w2', 'r2', 'feat-other', 'feat/other', '/tmp/ws2/feat-other', 'active', '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        let mgr = WorktreeManager::new(&conn, &config);
+        // Only clean up "other-repo"
+        let count = mgr
+            .cleanup_merged_worktrees_with_merge_check(Some("other-repo"), |_, branches| {
+                branches.iter().cloned().collect()
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // w1 should still be active, w2 should be merged
+        let s1: String = conn
+            .query_row("SELECT status FROM worktrees WHERE id = 'w1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let s2: String = conn
+            .query_row("SELECT status FROM worktrees WHERE id = 'w2'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(s1, "active");
+        assert_eq!(s2, "merged");
+    }
+
+    #[test]
+    fn test_delete_remote_branch_best_effort() {
+        // delete_remote_branch on a nonexistent repo/branch should not panic
+        delete_remote_branch("/nonexistent/repo/path", "feat/no-such-branch");
     }
 }
