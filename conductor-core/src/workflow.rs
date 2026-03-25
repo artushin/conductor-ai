@@ -1921,23 +1921,49 @@ fn build_context_prompt(
     prompt.push_str(
         "You are executing as a step in a conductor workflow. \
          Follow the complete procedure defined in your agent definition — \
-         execute all required actions (CLI commands, file writes, etc.), \
-         do not stop at reading and reporting.\n\n",
+         starting from its stated first action, then proceeding through \
+         each step in order. Do not skip ahead based on prior context.\n\n",
     );
 
     if agent_def.can_commit && state.exec_config.dry_run {
         prompt.push_str("DO NOT commit or push any changes. This is a dry run.\n\n");
     }
 
-    // Provide workflow variable values so the agent can reference them
+    // When fsm_path is set, the agent is an FSM runner. Its mandatory first
+    // action is to read the FSM definition file BEFORE anything else. We
+    // emit this as a direct, resolved instruction here in the user message
+    // so the model does not need to cross-reference the system prompt
+    // placeholder with the variable table below. This mirrors what
+    // build_agent_prompt() achieves via substitute_variables().
+    if let Some(fsm_path) = vars.get("fsm_path").filter(|v| !v.is_empty()) {
+        prompt.push_str(&format!(
+            "## Mandatory First Action\n\n\
+             BEFORE reading any other files, examining prior context, or \
+             exploring the codebase, you MUST read the FSM definition file \
+             at `{fsm_path}` (resolve via plugin_dirs — typically at \
+             `/usr/local/bsg/fsm-engine/{fsm_path}`). This is NON-NEGOTIABLE. \
+             Parse all state definitions, then proceed through the FSM \
+             execution protocol.\n\n",
+        ));
+    }
+
+    // Provide workflow variable values so the agent can reference them.
+    // Use `{{variable}}` syntax so the model connects these to template
+    // placeholders in its agent definition (which is loaded separately
+    // via --agent and cannot be substituted by conductor).
     let mut has_vars = false;
     for (k, v) in &vars {
         if !v.is_empty() {
             if !has_vars {
-                prompt.push_str("## Conductor Workflow Context\n\n");
+                prompt.push_str(
+                    "## Conductor Workflow Context\n\n\
+                     Your agent definition may reference these as `{{variable}}` \
+                     template placeholders. Substitute the values below wherever \
+                     you see them.\n\n",
+                );
                 has_vars = true;
             }
-            prompt.push_str(&format!("- **{}**: {}\n", k, v));
+            prompt.push_str(&format!("- `{{{{{}}}}}` = `{}`\n", k, v));
         }
     }
     if has_vars {
@@ -2040,6 +2066,8 @@ struct ExecutionState<'a> {
     default_bot_name: Option<String>,
     /// Plugin directories to pass to child agent sessions (DECISION-004).
     plugin_dirs: Vec<String>,
+    /// CLI-injected plugin directories to propagate to sub-workflows.
+    extra_plugin_dirs: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2100,6 +2128,9 @@ pub struct WorkflowExecInput<'a> {
     /// block efficiently instead of spinning.
     pub run_id_notify:
         Option<std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>>,
+    /// Additional plugin directories injected via CLI `--plugin-dir` flags.
+    /// Appended to repo-level plugin_dirs in ExecutionState construction.
+    pub extra_plugin_dirs: Vec<String>,
 }
 
 /// Execute a workflow definition against a worktree.
@@ -2269,8 +2300,17 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
         block_with: Vec::new(),
         resume_ctx: None,
         default_bot_name: input.default_bot_name.clone(),
-        plugin_dirs: crate::repo::get_plugin_dirs_for_repo(conn, input.repo_id)
-            .unwrap_or_default(),
+        plugin_dirs: {
+            let mut dirs = crate::repo::get_plugin_dirs_for_repo(conn, input.repo_id)
+                .unwrap_or_default();
+            for d in &input.extra_plugin_dirs {
+                if !dirs.contains(d) {
+                    dirs.push(d.clone());
+                }
+            }
+            dirs
+        },
+        extra_plugin_dirs: input.extra_plugin_dirs.clone(),
     };
 
     run_workflow_engine(&mut state, workflow)
@@ -2388,6 +2428,8 @@ pub struct WorkflowExecStandalone {
     /// created (before any steps execute). See [`WorkflowExecInput::run_id_notify`].
     pub run_id_notify:
         Option<std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>>,
+    /// Additional plugin directories injected via CLI `--plugin-dir` flags.
+    pub extra_plugin_dirs: Vec<String>,
 }
 
 /// Execute a workflow in a self-contained manner: opens its own database
@@ -2414,6 +2456,7 @@ pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<Wo
         target_label: params.target_label.as_deref(),
         default_bot_name: None,
         run_id_notify: params.run_id_notify.clone(),
+        extra_plugin_dirs: params.extra_plugin_dirs.clone(),
     };
 
     execute_workflow(&input)
@@ -2698,6 +2741,7 @@ pub fn resume_workflow(input: &WorkflowResumeInput<'_>) -> Result<WorkflowResult
         default_bot_name: wf_run.default_bot_name.clone(),
         plugin_dirs: crate::repo::get_plugin_dirs_for_repo(conn, wf_run.repo_id.as_deref())
             .unwrap_or_default(),
+        extra_plugin_dirs: vec![],
     };
 
     run_workflow_engine(&mut state, &workflow)
@@ -3356,6 +3400,7 @@ fn execute_call_workflow(
                 .clone()
                 .or_else(|| state.default_bot_name.clone()),
             run_id_notify: None,
+            extra_plugin_dirs: state.extra_plugin_dirs.clone(),
         };
 
         match execute_workflow(&child_input) {
@@ -5369,6 +5414,7 @@ mod tests {
             resume_ctx: None,
             default_bot_name: None,
             plugin_dirs: Vec::new(),
+            extra_plugin_dirs: Vec::new(),
         };
         (state, run_id)
     }
@@ -6437,6 +6483,7 @@ And here is my actual output:
             resume_ctx: None,
             default_bot_name: None,
             plugin_dirs: Vec::new(),
+            extra_plugin_dirs: Vec::new(),
         }
     }
 
@@ -6851,6 +6898,7 @@ And here is my actual output:
             resume_ctx: None,
             default_bot_name: None,
             plugin_dirs: Vec::new(),
+            extra_plugin_dirs: Vec::new(),
         }
     }
 
@@ -7208,6 +7256,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let err = execute_workflow(&input).unwrap_err();
         assert!(
@@ -7251,6 +7300,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         // Guard should pass; empty workflow completes successfully.
         let result = execute_workflow(&input);
@@ -7296,6 +7346,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result = execute_workflow(&input);
         assert!(
@@ -7335,6 +7386,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: Some(std::sync::Arc::clone(&slot)),
+            extra_plugin_dirs: vec![],
         };
 
         execute_workflow(&input).expect("workflow should complete");
@@ -9099,6 +9151,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result1 = execute_workflow(&input1);
         assert!(
@@ -9129,6 +9182,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result2 = execute_workflow(&input2);
         assert!(
@@ -9418,6 +9472,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -9467,6 +9522,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -9520,6 +9576,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -9560,6 +9617,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         assert!(
             execute_workflow(&input).is_err(),
@@ -9591,6 +9649,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         assert!(
             execute_workflow(&input).is_err(),
@@ -9660,6 +9719,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result = execute_workflow(&input).unwrap();
 
@@ -9713,6 +9773,7 @@ And here is my actual output:
             target_label: None,
             default_bot_name: None,
             run_id_notify: None,
+            extra_plugin_dirs: vec![],
         };
         let result = execute_workflow(&input).unwrap();
 

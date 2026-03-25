@@ -1,3 +1,9 @@
+---
+title: Getting Started with the Conductor CLI
+type: how-to
+layer: 2
+---
+
 # Getting Started with the Conductor CLI
 
 This guide is for teams that want to use `conductor` as a standalone command-line tool — running workflows, managing worktrees, and interacting with agents — without the TUI or web UI running.
@@ -185,3 +191,10 @@ Re-running `conductor statusline install` upgrades the script automatically.
 - **Continue on failure:** Use `--no-fail-fast` to run remaining steps even if one fails.
 - **Multiple inputs:** `--input` can be repeated: `--input ticket_id=123 --input skip_tests=true`
 - **Agent logs:** Agent output streams live to the tmux window. Attach with `tmux attach` to watch in real time.
+
+## Related Documents
+
+- [CLI Commands Reference](../reference/cli-commands.md) -- complete command reference
+- [How to Write a Workflow](write-workflow.md) -- authoring `.wf` files
+- [How to Register and Manage Repos](manage-repos.md) -- repo management details
+- [How to Use Worktrees](use-worktrees.md) -- worktree lifecycle

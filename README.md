@@ -1,117 +1,95 @@
 # Conductor
 
-A local-first orchestration tool for managing multiple git repos, worktrees, tickets, and AI agent runs — all backed by SQLite.
+A local-first orchestration tool for managing multiple git repos, worktrees, tickets, and AI agent runs. Multi-step workflows are defined in a custom `.wf` DSL and executed by a workflow engine that spawns Claude agents in tmux windows. All state is stored in a single SQLite database.
 
-## Prerequisites
+## Quick Start
+
+### Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
-- [Node.js](https://nodejs.org/) (for the web UI frontend)
-- [GitHub CLI (`gh`)](https://cli.github.com/) — installed and authenticated (for GitHub issue sync)
-- [tmux](https://github.com/tmux/tmux) (for AI agent sessions)
-- `ANTHROPIC_API_KEY` — set in your shell environment (get a key at https://console.anthropic.com)
+- [GitHub CLI (`gh`)](https://cli.github.com/) -- installed and authenticated
+- [tmux](https://github.com/tmux/tmux) -- for agent sessions
+- `ANTHROPIC_API_KEY` set in your shell
+
+### Build and Install
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."  # add to ~/.zshrc or ~/.bashrc
+./build.sh                            # Full build (frontend + all crates)
+cargo install --path conductor-cli    # Install CLI
+cargo install --path conductor-tui    # Install TUI
+cargo install --path conductor-web    # Install web UI (requires ./build.sh first)
 ```
 
-## Build
-
-The recommended way to build everything (frontend + all Rust crates):
+### First Commands
 
 ```bash
-./build.sh
+conductor repo register https://github.com/acme/my-app
+conductor repo set-plugin-dirs my-app /usr/local/bsg/agent-architecture/planner
+conductor worktree create my-app feat-my-feature
+conductor workflow run ticket-to-pr my-app feat-my-feature --input ticket_id=42
 ```
 
-This installs the web frontend dependencies, builds the React bundle, then runs `cargo build --workspace`. Run it after pulling `main` or setting up a new worktree.
+## Features
 
-Individual commands for day-to-day development:
+- **Repo management** -- register repos, configure plugin directories, sync tickets from GitHub/Jira
+- **Worktree lifecycle** -- create, push, PR, delete with ticket linking and branch naming conventions
+- **Workflow engine** -- custom `.wf` DSL with sequential calls, parallel blocks, conditionals, loops, gates, and sub-workflow composition
+- **AI agent execution** -- spawn Claude agents in tmux windows with structured output, retries, and schema validation
+- **MCP server** -- 22 tools + 9 resource categories for Claude Code integration via `conductor mcp serve`
+- **Multiple interfaces** -- CLI, terminal UI (ratatui), and web UI (axum + React)
 
-```bash
-cargo build                                              # Build all crates (without frontend)
-cargo build --release                                    # Release build
-cargo test                                               # Run all tests
-cargo clippy --workspace --all-targets -- -D warnings    # Lint (CI enforces -D warnings)
-cargo fmt --all                                          # Auto-format
-```
+## Crate Architecture
 
-## Install
+| Crate | Binary | Purpose |
+|-------|--------|---------|
+| conductor-core | (library) | All domain logic (~32K LoC): workflow engine, agent management, repos, worktrees, tickets, DB |
+| conductor-cli | `conductor` | CLI (clap subcommands) + MCP server (stdio transport) |
+| conductor-tui | `conductor-tui` | Terminal UI (ratatui + crossterm) |
+| conductor-web | `conductor-web` | Web UI (axum + embedded React frontend) |
+| conductor-service | `conductor-service` | Daemon: Unix socket JSON-RPC, PE watcher (early stage) |
 
-After running `./build.sh`, install the binaries to `~/.cargo/bin`:
+All binaries depend on conductor-core. No binary-to-binary dependencies. Data lives in `~/.conductor/` -- a single SQLite database and per-repo worktree directories.
 
-```bash
-cargo install --path conductor-cli
-cargo install --path conductor-tui
-cargo install --path conductor-web   # requires frontend already built by ./build.sh
-```
+For design decisions and trade-offs, see [docs/architecture/crate-structure.md](docs/architecture/crate-structure.md).
 
-During development you can skip the install step and use `cargo run --bin <name>` instead (see examples below).
+## Documentation
 
-## Usage
-
-### CLI
-
-```bash
-# After install
-conductor repo add <remote-url>           # Register a repo
-conductor repo list                       # List registered repos
-conductor worktree create <repo> <name>   # Create a worktree
-conductor tickets sync <repo>             # Sync tickets from GitHub/Jira
-
-# Without installing
-cargo run --bin conductor -- repo list
-```
-
-### TUI
-
-Interactive terminal UI for browsing repos, worktrees, and tickets. Supports launching Claude agent sessions in tmux.
-
-```bash
-conductor-tui                        # After install
-cargo run --bin conductor-tui        # Without installing
-```
-
-### Web UI
-
-Opens a local web server with a React-based dashboard.
-
-```bash
-conductor-web                        # After install
-cargo run --bin conductor-web        # Without installing
-```
+| Section | Contents |
+|---------|----------|
+| [docs/architecture/](docs/architecture/) | Crate structure, workflow engine, structured output, agent execution |
+| [docs/reference/](docs/reference/) | Workflow DSL syntax, MCP tools, CLI commands, DB schema, output schemas, configuration |
+| [docs/how-to/](docs/how-to/) | Write workflows, manage repos, use worktrees |
+| [docs/README.md](docs/README.md) | Full documentation index with quick navigation |
 
 ## Workflows
 
-Conductor includes a workflow engine that orchestrates multi-step AI agent pipelines. Workflows are defined in `.wf` files using a minimal custom DSL.
+Workflows orchestrate multi-step AI agent pipelines in `.wf` files:
 
 ```bash
-conductor workflow list                              # list available workflows
-conductor workflow show <name>                       # ASCII step graph
-conductor workflow validate <name>                   # check agents, inputs, cycles, snippets
-conductor workflow run <name> [--input k=v] [--dry-run]
-conductor workflow cancel <run-id>
-conductor workflow runs [--worktree id]              # run history
-conductor workflow run-show <run-id>                 # per-step detail
-conductor workflow gate-approve  <run-id>
-conductor workflow gate-reject   <run-id>
-conductor workflow gate-feedback <run-id> "<text>"
+conductor workflow list                                  # Available workflows
+conductor workflow validate <name> <repo> <worktree>     # Validate before running
+conductor workflow run <name> <repo> <wt> [--dry-run]    # Execute a workflow
+conductor workflow run-show <run-id>                     # Step-by-step detail
 ```
 
-Workflow files live in `.conductor/workflows/<name>.wf`. Agent prompts live in `.conductor/agents/<name>.md`. The DSL supports sequential steps, `parallel` blocks, `if`/`unless`/`while`/`do-while` control flow, `gate` steps for human or automated approvals, `always` cleanup blocks, and `call workflow` for shallow composition.
+For syntax reference, see [docs/reference/workflow-dsl.md](docs/reference/workflow-dsl.md). For a step-by-step authoring guide, see [docs/how-to/write-workflow.md](docs/how-to/write-workflow.md).
 
-For full details on the DSL grammar, constructs, structured output, and design tradeoffs, see [docs/workflow/engine.md](docs/workflow/engine.md).
+## MCP Server
 
-## Architecture
+```bash
+conductor mcp serve    # Start MCP server (stdio transport for Claude Code)
+```
 
-Four crates in a Cargo workspace:
+Exposes 22 tools covering repos, worktrees, tickets, workflows, runs, gates, and agents. See [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
 
-| Crate | Role |
-|---|---|
-| **conductor-core** | Library with all domain logic (repos, worktrees, tickets, agents, DB) |
-| **conductor-cli** | Thin CLI binary using clap |
-| **conductor-tui** | Terminal UI using ratatui + crossterm |
-| **conductor-web** | Web UI using axum + React (Vite + Tailwind, embedded via `rust_embed`) |
+## Related Repositories
 
-Data lives in `~/.conductor/` — a single SQLite database and per-repo worktree directories. No daemon or background process; the CLI and TUI link directly against `conductor-core`.
+| Repo | Purpose | Relationship |
+|------|---------|-------------|
+| [agent-architecture](/usr/local/bsg/agent-architecture/) | 31 shared agent definitions | Loaded via `--plugin-dir` |
+| [fsm-engine](/usr/local/bsg/fsm-engine/) | Workflow templates + FSM definitions | Owns `.wf` templates |
+| [pattern-extractor](/usr/local/bsg/pattern-extractor/) | EDLC pattern pipeline | PE commands invoked by workflows |
+| [vantage](/usr/local/bsg/vantage/) | Go SDLC coordination | Primary consumer of conductor |
 
 ## License
 

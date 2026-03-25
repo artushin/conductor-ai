@@ -1,3 +1,9 @@
+---
+title: TUI Themes Reference
+type: reference
+layer: 3
+---
+
 # Themes
 
 Conductor TUI supports built-in named themes and custom themes dropped into `~/.conductor/themes/`.
@@ -83,7 +89,7 @@ palette:
 
 Hex values have no `#` prefix. The `name:` field is used as the display label in the picker; the filename stem is used as a fallback if `name:` is absent.
 
-### Base16 → semantic role mapping
+### Base16 semantic role mapping
 
 | Base16 slot | Semantic roles |
 |-------------|---------------|

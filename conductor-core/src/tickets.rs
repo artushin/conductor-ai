@@ -25,6 +25,11 @@ pub struct Ticket {
     pub url: String,
     pub synced_at: String,
     pub raw_json: String,
+    /// Optional workflow name. When set, this workflow is used directly instead
+    /// of relying on routing heuristics.
+    pub workflow: Option<String>,
+    /// Optional agent map JSON. Pre-resolved agent assignments for FSM states.
+    pub agent_map: Option<String>,
 }
 
 /// A normalized ticket from any source, ready to be upserted into the database.
@@ -66,6 +71,10 @@ pub struct TicketUpdate {
     pub priority: Option<String>,
     pub labels: Option<Vec<String>>,
     pub assignee: Option<String>,
+    /// Set the workflow field. An empty string `""` clears the field to NULL.
+    pub workflow: Option<String>,
+    /// Set the agent_map field. An empty string `""` clears the field to NULL.
+    pub agent_map: Option<String>,
 }
 
 /// Filter options for [`TicketSyncer::list_filtered`].
@@ -211,11 +220,11 @@ impl<'a> TicketSyncer<'a> {
     pub fn list(&self, repo_id: Option<&str>) -> Result<Vec<Ticket>> {
         let query = match repo_id {
             Some(_) => {
-                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json
+                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
                  FROM tickets WHERE repo_id = ?1 ORDER BY synced_at DESC"
             }
             None => {
-                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json
+                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
                  FROM tickets ORDER BY synced_at DESC"
             }
         };
@@ -241,7 +250,7 @@ impl<'a> TicketSyncer<'a> {
         filter: &TicketFilter,
     ) -> Result<Vec<Ticket>> {
         let select = "SELECT t.id, t.repo_id, t.source_type, t.source_id, t.title, t.body, \
-                      t.state, t.labels, t.assignee, t.priority, t.url, t.synced_at, t.raw_json \
+                      t.state, t.labels, t.assignee, t.priority, t.url, t.synced_at, t.raw_json, t.workflow, t.agent_map \
                       FROM tickets t";
 
         let mut conditions: Vec<String> = Vec::new();
@@ -310,7 +319,7 @@ impl<'a> TicketSyncer<'a> {
     pub fn get_by_source_id(&self, repo_id: &str, source_id: &str) -> Result<Ticket> {
         self.conn
             .query_row(
-                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json
+                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
                  FROM tickets WHERE repo_id = ?1 AND source_id = ?2",
                 params![repo_id, source_id],
                 map_ticket_row,
@@ -323,11 +332,38 @@ impl<'a> TicketSyncer<'a> {
             })
     }
 
+    /// Fetch a single ticket by ULID or source_id (fallback).
+    ///
+    /// Tries the `id` column first; if not found, tries `source_id`.
+    /// Unlike `get_by_source_id`, this does not require a `repo_id`.
+    pub fn get_ticket(&self, id_or_source: &str) -> Result<Ticket> {
+        // Try ULID lookup first
+        match self.get_by_id(id_or_source) {
+            Ok(t) => return Ok(t),
+            Err(ConductorError::TicketNotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        // Fallback: source_id lookup (across all repos)
+        self.conn
+            .query_row(
+                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
+                 FROM tickets WHERE source_id = ?1",
+                params![id_or_source],
+                map_ticket_row,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
+                    id: id_or_source.to_string(),
+                },
+                _ => ConductorError::Database(e),
+            })
+    }
+
     /// Fetch a single ticket by its internal (ULID) ID.
     pub fn get_by_id(&self, ticket_id: &str) -> Result<Ticket> {
         self.conn
             .query_row(
-                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json
+                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
                  FROM tickets WHERE id = ?1",
                 params![ticket_id],
                 map_ticket_row,
@@ -509,6 +545,8 @@ impl<'a> TicketSyncer<'a> {
         body: &str,
         priority: Option<&str>,
         labels: &[String],
+        workflow: Option<&str>,
+        agent_map: Option<&str>,
     ) -> Result<Ticket> {
         let id = ulid::Ulid::new().to_string();
         let source_id = ulid::Ulid::new().to_string();
@@ -516,9 +554,9 @@ impl<'a> TicketSyncer<'a> {
         let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json)
-             VALUES (?1, ?2, 'local', ?3, ?4, ?5, 'open', ?6, NULL, ?7, '', ?8, '{}')",
-            params![id, repo_id, source_id, title, body, labels_json, priority, now],
+            "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map)
+             VALUES (?1, ?2, 'local', ?3, ?4, ?5, 'open', ?6, NULL, ?7, '', ?8, '{}', ?9, ?10)",
+            params![id, repo_id, source_id, title, body, labels_json, priority, now, workflow, agent_map],
         )?;
 
         self.get_by_id(&id)
@@ -558,6 +596,26 @@ impl<'a> TicketSyncer<'a> {
         if let Some(ref assignee) = updates.assignee {
             set_clauses.push("assignee = ?".to_string());
             param_values.push(Box::new(assignee.clone()));
+        }
+        if let Some(ref workflow) = updates.workflow {
+            set_clauses.push("workflow = ?".to_string());
+            // An empty string clears the field to NULL.
+            let val: Option<String> = if workflow.is_empty() {
+                None
+            } else {
+                Some(workflow.clone())
+            };
+            param_values.push(Box::new(val));
+        }
+        if let Some(ref agent_map) = updates.agent_map {
+            set_clauses.push("agent_map = ?".to_string());
+            // An empty string clears the field to NULL.
+            let val: Option<String> = if agent_map.is_empty() {
+                None
+            } else {
+                Some(agent_map.clone())
+            };
+            param_values.push(Box::new(val));
         }
 
         if set_clauses.is_empty() {
@@ -634,6 +692,8 @@ fn map_ticket_row(row: &rusqlite::Row) -> rusqlite::Result<Ticket> {
         url: row.get(10)?,
         synced_at: row.get(11)?,
         raw_json: row.get(12)?,
+        workflow: row.get(13)?,
+        agent_map: row.get(14)?,
     })
 }
 
@@ -1380,6 +1440,8 @@ mod tests {
             url: "https://github.com/org/repo/issues/42".to_string(),
             synced_at: "2026-01-01T00:00:00Z".to_string(),
             raw_json: "{}".to_string(),
+            workflow: None,
+            agent_map: None,
         };
 
         let prompt = build_agent_prompt(&ticket);
@@ -1406,6 +1468,8 @@ mod tests {
             url: String::new(),
             synced_at: "2026-01-01T00:00:00Z".to_string(),
             raw_json: "{}".to_string(),
+            workflow: None,
+            agent_map: None,
         };
 
         let prompt = build_agent_prompt(&ticket);
@@ -1838,7 +1902,7 @@ mod tests {
 
         let labels = vec!["bug".to_string(), "urgent".to_string()];
         let ticket = syncer
-            .create_ticket("r1", "New local ticket", "Some body text", Some("high"), &labels)
+            .create_ticket("r1", "New local ticket", "Some body text", Some("high"), &labels, None, None)
             .unwrap();
 
         assert_eq!(ticket.repo_id, "r1");
@@ -1867,7 +1931,7 @@ mod tests {
         let syncer = TicketSyncer::new(&conn);
 
         let ticket = syncer
-            .create_ticket("r1", "Original title", "Original body", None, &[])
+            .create_ticket("r1", "Original title", "Original body", None, &[], None, None)
             .unwrap();
 
         let updated = syncer
@@ -1880,6 +1944,8 @@ mod tests {
                     priority: None,
                     labels: None,
                     assignee: None,
+                    workflow: None,
+                    agent_map: None,
                 },
             )
             .unwrap();
@@ -1903,6 +1969,8 @@ mod tests {
                 priority: None,
                 labels: None,
                 assignee: None,
+                workflow: None,
+                agent_map: None,
             },
         );
 
@@ -1919,7 +1987,7 @@ mod tests {
         let syncer = TicketSyncer::new(&conn);
 
         let ticket = syncer
-            .create_ticket("r1", "No labels ticket", "body", None, &[])
+            .create_ticket("r1", "No labels ticket", "body", None, &[], None, None)
             .unwrap();
 
         assert_eq!(ticket.labels, "[]");
@@ -1933,7 +2001,7 @@ mod tests {
         let syncer = TicketSyncer::new(&conn);
 
         let ticket = syncer
-            .create_ticket("r1", "Original", "Original body", None, &[])
+            .create_ticket("r1", "Original", "Original body", None, &[], None, None)
             .unwrap();
 
         let updated = syncer
@@ -1946,6 +2014,8 @@ mod tests {
                     priority: Some("critical".to_string()),
                     labels: None,
                     assignee: None,
+                    workflow: None,
+                    agent_map: None,
                 },
             )
             .unwrap();
@@ -1962,7 +2032,7 @@ mod tests {
         let syncer = TicketSyncer::new(&conn);
 
         let ticket = syncer
-            .create_ticket("r1", "Stay the same", "body", Some("low"), &[])
+            .create_ticket("r1", "Stay the same", "body", Some("low"), &[], None, None)
             .unwrap();
 
         let result = syncer
@@ -1975,6 +2045,8 @@ mod tests {
                     priority: None,
                     labels: None,
                     assignee: None,
+                    workflow: None,
+                    agent_map: None,
                 },
             )
             .unwrap();
@@ -1995,7 +2067,7 @@ mod tests {
             "won't fix".to_string(),
         ];
         let ticket = syncer
-            .create_ticket("r1", "Special labels", "", None, &labels)
+            .create_ticket("r1", "Special labels", "", None, &labels, None, None)
             .unwrap();
 
         let parsed: Vec<String> = serde_json::from_str(&ticket.labels).unwrap();
@@ -2008,7 +2080,7 @@ mod tests {
         let syncer = TicketSyncer::new(&conn);
 
         let ticket = syncer
-            .create_ticket("r1", "Label test", "", None, &["old".to_string()])
+            .create_ticket("r1", "Label test", "", None, &["old".to_string()], None, None)
             .unwrap();
 
         let updated = syncer
@@ -2021,6 +2093,8 @@ mod tests {
                     priority: None,
                     labels: Some(vec!["new-label".to_string(), "another".to_string()]),
                     assignee: None,
+                    workflow: None,
+                    agent_map: None,
                 },
             )
             .unwrap();

@@ -1,3 +1,9 @@
+---
+title: BSG Ecosystem Integration
+type: how-to
+layer: 2
+---
+
 # BSG Ecosystem Integration
 
 How conductor-ai integrates with the BSG multi-repo ecosystem.
@@ -70,9 +76,9 @@ conductor repo set-plugin-dirs <slug> \
   /usr/local/bsg/fsm-engine
 ```
 
-### Per-step (overrides repo-level for specific calls)
+### Per-step (extends repo-level for specific calls)
 
-Individual workflow steps can override the repo-level plugin_dirs. This is used
+Individual workflow steps can extend the repo-level plugin_dirs. This is used
 by the BSG workflows to inject pattern-extractor only for PE-invoking steps:
 
 ```
@@ -88,19 +94,19 @@ call review-architecture {
 }
 ```
 
-Per-step `plugin_dirs` **replaces** repo-level for that call only. See
-[workflow engine docs](workflow/engine.md#per-step-plugin-directories) for details.
+Per-step `plugin_dirs` are **appended** to repo-level for that call only. See
+[workflow engine docs](architecture/workflow-engine.md) for details.
 
 ## Related Repositories
 
 | Repo | Relationship | Path |
 |------|-------------|------|
-| agent-architecture | Shared agents loaded via --plugin-dir | [../../agent-architecture/](../../agent-architecture/) |
-| fsm-engine | .wf workflows executed natively | [../../fsm-engine/](../../fsm-engine/) |
-| pattern-extractor | PE commands invoked by agents | [../../pattern-extractor/](../../pattern-extractor/) |
-| vantage | Managed repo consuming all plugins | [../../vantage/](../../vantage/) |
+| agent-architecture | Shared agents loaded via --plugin-dir | [/usr/local/bsg/agent-architecture/](/usr/local/bsg/agent-architecture/) |
+| fsm-engine | .wf workflows executed natively | [/usr/local/bsg/fsm-engine/](/usr/local/bsg/fsm-engine/) |
+| pattern-extractor | PE commands invoked by agents | [/usr/local/bsg/pattern-extractor/](/usr/local/bsg/pattern-extractor/) |
+| vantage | Managed repo consuming all plugins | [/usr/local/bsg/vantage/](/usr/local/bsg/vantage/) |
 
 ## References
 
-- [BSG ecosystem overview](../../README.md) — root ecosystem documentation
-- [Implementation analysis](../../pattern-extractor/analysis/bsg-system-evaluation/) — architectural decisions and gap analysis
+- [BSG ecosystem overview](/usr/local/bsg/README.md) -- root ecosystem documentation
+- [Implementation analysis](/usr/local/bsg/pattern-extractor/analysis/bsg-system-evaluation/) -- architectural decisions and gap analysis

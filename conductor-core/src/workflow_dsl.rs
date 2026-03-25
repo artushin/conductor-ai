@@ -192,8 +192,8 @@ pub struct CallNode {
     pub with: Vec<String>,
     /// Named GitHub App bot identity to use for this call (matches `[github.apps.<name>]`).
     pub bot_name: Option<String>,
-    /// Per-call plugin directory overrides. When non-empty, replaces the repo-level plugin_dirs
-    /// for this call only. Passed as `--plugin-dir` args to the Claude session.
+    /// Per-call plugin directories appended to the repo-level plugin_dirs for this call only.
+    /// Passed as `--plugin-dir` args to the Claude session.
     #[serde(default)]
     pub plugin_dirs: Vec<String>,
 }
@@ -280,8 +280,7 @@ pub struct ParallelNode {
     /// Per-call prompt snippet additions, keyed by index in `calls`.
     #[serde(default)]
     pub call_with: HashMap<usize, Vec<String>>,
-    /// Per-call plugin directory overrides, keyed by index in `calls`.
-    /// When present, replaces repo-level plugin_dirs for that call only.
+    /// Per-call plugin directories appended to repo-level plugin_dirs, keyed by index in `calls`.
     #[serde(default)]
     pub call_plugin_dirs: HashMap<usize, Vec<String>>,
 }

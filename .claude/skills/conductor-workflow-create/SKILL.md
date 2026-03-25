@@ -93,6 +93,14 @@ workflow <name> {
 }
 ```
 
+**Documentation bookend pattern** (apply to FSM wrappers):
+- Before the main `do/while` loop: `call doc-librarian { plugin_dirs = ["/usr/local/bsg/agent-architecture/doc-librarian"] }`
+- Inside `fsm-runner`'s `plugin_dirs`: add `"/usr/local/bsg/agent-architecture/doc-librarian"` (optional re-invocation during FSM execution)
+- After the `do/while` loop (before any terminal step like `close-ticket`): `call doc-writer { plugin_dirs = ["/usr/local/bsg/agent-architecture/doc-writer"] }`
+- Do NOT add bookends to skill wrappers or gated skills (they are atomic and too short to benefit).
+- Composition workflows that call sub-workflows with existing bookends also skip bookends — the sub-workflow bookends suffice.
+- `doc-librarian` and `doc-writer` are loaded from agent-architecture via `plugin_dirs` — they do NOT need agent stubs in `.conductor/agents/`.
+
 **Choosing constructs:**
 - Sequential agent call: `call <agent-name>`
 - Conditional: `if <step>.<marker> { ... }` or `unless <step>.<marker> { ... }`

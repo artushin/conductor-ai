@@ -476,7 +476,7 @@ pub struct OrchestrateRequest {
 }
 
 fn default_child_timeout_secs() -> u64 {
-    1800
+    604800
 }
 
 /// Start an orchestrated agent run: generate a plan, then spawn child agents

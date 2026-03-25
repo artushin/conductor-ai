@@ -1,3 +1,12 @@
+---
+title: "Conductor: Vision and Original Design (Archived)"
+type: reference
+layer: 3
+archived: true
+original_path: docs/VISION.md
+archived_at: 2026-03-23
+---
+
 # Conductor: Vision & Original Design
 
 This document captures the founding motivation and original design for
@@ -5,9 +14,9 @@ Conductor. It is preserved as-is to explain *why* the project exists and the
 reasoning behind early architectural decisions. For current implementation
 details, see:
 
-- [docs/workflow/engine.md](./workflow/engine.md) — workflow engine design
-- [docs/workflow/agent-path-resolution.md](./workflow/agent-path-resolution.md) — agent resolution
-- [docs/ROADMAP.md](./ROADMAP.md) — current priorities
+- [docs/architecture/crate-structure.md](../architecture/crate-structure.md) -- crate architecture
+- [docs/workflow/agent-path-resolution.md](../workflow/agent-path-resolution.md) -- agent resolution
+- [docs/roadmap.md](../roadmap.md) -- current priorities
 
 **Date:** 2026-02-20
 
@@ -316,7 +325,7 @@ Conductor                                          session: 2h 14m
 |------------|-----------------|
 | `key` | `source_id` |
 | `summary` | `title` |
-| `description` (ADF → markdown) | `body` |
+| `description` (ADF -> markdown) | `body` |
 | `status.name` | `state` (mapped to open/in_progress/closed) |
 | `priority.name` | `priority` |
 | `assignee.displayName` | `assignee` |
@@ -390,7 +399,7 @@ worktree_prefix_fix = "fix-"
 ### Phase 3: Jira integration
 
 - Jira REST API client in `conductor-core`
-- Ticket normalization (Jira → Conductor ticket model)
+- Ticket normalization (Jira -> Conductor ticket model)
 - ADF-to-markdown conversion for Jira descriptions
 - Per-repo source configuration
 
@@ -400,7 +409,7 @@ worktree_prefix_fix = "fix-"
 
 - Session management (start, end, postmortem)
 - Worktree-to-ticket linking as context for AI agents
-- Event hooks for triggering AI workflows (e.g., "ticket assigned → create worktree → plan")
+- Event hooks for triggering AI workflows (e.g., "ticket assigned -> create worktree -> plan")
 - CLAUDE.md generation per worktree from ticket context
 
 **Goal:** The AI orchestration layer from orchestra-conductor, generalized for any repo.

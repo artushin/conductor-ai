@@ -1,3 +1,9 @@
+---
+title: "RFC 005: Codebase Diagram Workflows"
+type: reference
+layer: 3
+---
+
 # RFC 005: Codebase Diagram Workflows
 
 **Status:** Draft / Exploring

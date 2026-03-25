@@ -1667,6 +1667,7 @@ fn tool_run_workflow(db_path: &Path, args: &serde_json::Map<String, Value>) -> C
         inputs,
         target_label: Some(target_label),
         run_id_notify: Some(Arc::clone(&notify_pair)),
+        extra_plugin_dirs: vec![],
     };
 
     // Slot receives the error message if execute_workflow_standalone fails before

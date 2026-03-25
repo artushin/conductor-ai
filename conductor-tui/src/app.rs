@@ -5582,6 +5582,7 @@ impl App {
                 inputs,
                 target_label: Some(target_label),
                 run_id_notify: None,
+                extra_plugin_dirs: vec![],
             };
 
             let result = execute_workflow_standalone(&params);
@@ -5629,6 +5630,7 @@ impl App {
                 inputs: std::collections::HashMap::new(),
                 target_label: Some(target_label),
                 run_id_notify: None,
+                extra_plugin_dirs: vec![],
             };
 
             let result = execute_workflow_standalone(&params);
@@ -5673,6 +5675,7 @@ impl App {
                 inputs: std::collections::HashMap::new(),
                 target_label: Some(repo_name),
                 run_id_notify: None,
+                extra_plugin_dirs: vec![],
             };
 
             let result = execute_workflow_standalone(&params);
@@ -5717,6 +5720,7 @@ impl App {
                 inputs,
                 target_label: Some(target_label),
                 run_id_notify: None,
+                extra_plugin_dirs: vec![],
             };
 
             let result = execute_workflow_standalone(&params);

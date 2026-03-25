@@ -1,3 +1,9 @@
+---
+title: Agent Path Resolution in Workflows
+type: explanation
+layer: 2
+---
+
 # Agent Path Resolution in Workflows
 
 ## Overview
@@ -84,7 +90,7 @@ agents still take precedence.
 3. **The file must exist** at resolution time. A missing file is an error, not a
    fallback trigger.
 4. **Frontmatter is parsed identically** to short-name agents — same `role`,
-   `can_commit`, `model` fields.
+   `can_commit`, `model` fields. Note: conductor's `AgentFrontmatter` struct only parses `role`, `can_commit`, and `model`. Other YAML fields (`name`, `description`, `color`, `skills`) are silently ignored by conductor -- they are consumed by Claude Code's plugin system only.
 5. **The agent name** is derived from the file stem (e.g.,
    `"lib/agents/my-lint.md"` produces agent name `my-lint`).
 6. **Path traversal** (`../`) is allowed but constrained — the resolved path
@@ -223,7 +229,7 @@ parallel {
 2. **Add `.claude/agents/` fallback**: Insert as priority 3 in the existing
    search order for `AgentRef::Name`.
 3. **Path safety**: Canonicalize the resolved path and verify it starts with
-   the repo root.
+   the repo root. **Note**: Symlink behavior is asymmetric -- `.wf` workflow file symlinks to external paths work (no canonicalize check is applied to workflow files), but agent and prompt symlinks to external paths fail because the canonicalize + `starts_with` repo root check resolves the symlink target.
 
 ### Workflow execution (`workflow.rs`)
 

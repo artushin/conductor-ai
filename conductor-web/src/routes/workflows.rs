@@ -194,6 +194,7 @@ pub async fn run_workflow(
                 target_label: Some(&wt_target_label),
                 default_bot_name: None,
                 run_id_notify: None,
+                extra_plugin_dirs: vec![],
             };
 
             execute_workflow(&input)

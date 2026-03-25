@@ -20,11 +20,13 @@ use conductor_core::repo::{derive_local_path, derive_slug_from_url, RepoManager}
 use conductor_core::tickets::{build_agent_prompt, TicketInput, TicketSyncer, TicketUpdate};
 use conductor_core::workflow::{
     collect_agent_names, detect_workflow_cycles, validate_workflow_semantics, WorkflowExecConfig,
-    WorkflowManager,
+    WorkflowExecStandalone, WorkflowManager,
 };
 use conductor_core::workflow_config;
 use conductor_core::worktree::WorktreeManager;
 
+#[cfg(unix)]
+mod background;
 mod mcp;
 mod statusline;
 
@@ -216,6 +218,12 @@ enum WorkflowCommands {
         /// Input variables (key=value pairs)
         #[arg(long = "input", value_name = "KEY=VALUE")]
         inputs: Vec<String>,
+        /// Run the workflow in the background: print the run ID and exit immediately
+        #[arg(long)]
+        background: bool,
+        /// Additional plugin directories to pass to agent sessions (appended to repo-level plugin_dirs)
+        #[arg(long = "plugin-dir")]
+        plugin_dirs: Vec<String>,
     },
     /// Show details of a workflow run
     #[command(name = "run-show", alias = "show")]
@@ -509,6 +517,12 @@ enum TicketCommands {
         /// Labels (can be specified multiple times)
         #[arg(long)]
         label: Vec<String>,
+        /// Workflow to execute (bypasses routing heuristics)
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Agent map JSON (pre-resolved agent assignments for FSM states)
+        #[arg(long)]
+        agent_map: Option<String>,
     },
     /// Update an existing ticket
     Update {
@@ -526,6 +540,12 @@ enum TicketCommands {
         /// New priority
         #[arg(long)]
         priority: Option<String>,
+        /// Workflow to execute (empty string clears)
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Agent map JSON (empty string clears)
+        #[arg(long)]
+        agent_map: Option<String>,
     },
 }
 
@@ -544,6 +564,36 @@ fn check_prerequisites() {
         eprintln!("conductor: missing prerequisites:\n{}", missing.join("\n"));
         eprintln!("Some commands may not work until these are resolved.\n");
     }
+}
+
+/// Fork a background process to run a workflow and print the run ID.
+///
+/// Returns `Ok(true)` if the workflow was dispatched in the background (caller
+/// should skip normal execution). Returns `Ok(false)` if `background` is false
+/// (caller proceeds with foreground execution).
+#[cfg(unix)]
+fn run_background_workflow(
+    background: bool,
+    params: WorkflowExecStandalone,
+) -> Result<bool> {
+    if !background {
+        return Ok(false);
+    }
+    let run_id = background::fork_and_run_workflow(params)?;
+    println!("{}", run_id);
+    Ok(true)
+}
+
+/// Non-Unix stub: --background is only supported on Unix.
+#[cfg(not(unix))]
+fn run_background_workflow(
+    background: bool,
+    _params: WorkflowExecStandalone,
+) -> Result<bool> {
+    if background {
+        anyhow::bail!("The --background flag is only supported on Unix systems");
+    }
+    Ok(false)
 }
 
 fn report_workflow_result(result: conductor_core::workflow::WorkflowResult) {
@@ -1132,6 +1182,12 @@ fn main() -> Result<()> {
                     if let Some(ref a) = t.assignee {
                         println!("Assignee:    {}", a);
                     }
+                    if let Some(ref w) = t.workflow {
+                        println!("Workflow:    {}", w);
+                    }
+                    if let Some(ref am) = t.agent_map {
+                        println!("Agent Map:   {}", am);
+                    }
                     println!("Repo:        {}", repo_slug);
                     if !t.url.is_empty() {
                         println!("URL:         {}", t.url);
@@ -1236,13 +1292,22 @@ fn main() -> Result<()> {
                 body,
                 priority,
                 label,
+                workflow,
+                agent_map,
             } => {
                 let repo_mgr = RepoManager::new(&conn, &config);
                 let r = repo_mgr.get_by_slug(&repo)?;
 
                 let syncer = TicketSyncer::new(&conn);
-                let ticket =
-                    syncer.create_ticket(&r.id, &title, &body, priority.as_deref(), &label)?;
+                let ticket = syncer.create_ticket(
+                    &r.id,
+                    &title,
+                    &body,
+                    priority.as_deref(),
+                    &label,
+                    workflow.as_deref(),
+                    agent_map.as_deref(),
+                )?;
                 println!("Created ticket {} — {}", ticket.id, ticket.title);
             }
             TicketCommands::Update {
@@ -1251,10 +1316,18 @@ fn main() -> Result<()> {
                 body,
                 state,
                 priority,
+                workflow,
+                agent_map,
             } => {
-                if title.is_none() && body.is_none() && state.is_none() && priority.is_none() {
+                if title.is_none()
+                    && body.is_none()
+                    && state.is_none()
+                    && priority.is_none()
+                    && workflow.is_none()
+                    && agent_map.is_none()
+                {
                     anyhow::bail!(
-                        "No update fields provided. Use --title, --body, --state, or --priority."
+                        "No update fields provided. Use --title, --body, --state, --priority, --workflow, or --agent-map."
                     );
                 }
 
@@ -1294,6 +1367,8 @@ fn main() -> Result<()> {
                     priority,
                     labels: None,
                     assignee: None,
+                    workflow,
+                    agent_map,
                 };
 
                 let updated = syncer.update_ticket(&resolved_id, updates)?;
@@ -1392,6 +1467,8 @@ fn main() -> Result<()> {
                 no_fail_fast,
                 step_timeout_secs,
                 inputs,
+                background,
+                plugin_dirs,
             } => {
                 // Parse input key=value pairs (shared by both paths)
                 let mut input_map = std::collections::HashMap::new();
@@ -1413,9 +1490,17 @@ fn main() -> Result<()> {
                 if dry_run {
                     println!("DRY RUN: Actor steps will show intended changes without committing.");
                 }
+                if !plugin_dirs.is_empty() {
+                    println!("CLI plugin_dirs: {:?}", plugin_dirs);
+                }
 
                 if let Some(pr_url) = pr {
                     // Ephemeral PR run
+                    if background {
+                        anyhow::bail!(
+                            "The --pr flag is incompatible with --background"
+                        );
+                    }
                     let pr_ref = conductor_core::workflow_ephemeral::parse_pr_ref(&pr_url)?;
 
                     println!(
@@ -1461,6 +1546,27 @@ fn main() -> Result<()> {
                         &mut input_map,
                     )?;
 
+                    if run_background_workflow(
+                        background,
+                        WorkflowExecStandalone {
+                            config: config.clone(),
+                            workflow: workflow.clone(),
+                            worktree_id: None,
+                            working_dir: r.local_path.clone(),
+                            repo_path: r.local_path.clone(),
+                            ticket_id: None,
+                            repo_id: Some(r.id.clone()),
+                            model: model.clone(),
+                            exec_config: exec_config.clone(),
+                            inputs: input_map.clone(),
+                            target_label: Some(r.slug.clone()),
+                            run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
+                        },
+                    )? {
+                        return Ok(());
+                    }
+
                     let node_count = workflow.total_nodes();
                     println!(
                         "Running workflow '{}' ({} nodes) on repo '{}'...",
@@ -1485,6 +1591,7 @@ fn main() -> Result<()> {
                             target_label: Some(r.slug.as_str()),
                             default_bot_name: None,
                             run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1511,6 +1618,27 @@ fn main() -> Result<()> {
                         &mut input_map,
                     )?;
 
+                    if run_background_workflow(
+                        background,
+                        WorkflowExecStandalone {
+                            config: config.clone(),
+                            workflow: workflow.clone(),
+                            worktree_id: ctx.worktree_id.clone(),
+                            working_dir: ctx.working_dir.clone(),
+                            repo_path: ctx.repo_path.clone(),
+                            ticket_id: None,
+                            repo_id: ctx.repo_id.clone(),
+                            model: model.clone(),
+                            exec_config: exec_config.clone(),
+                            inputs: input_map.clone(),
+                            target_label: Some(run_id.clone()),
+                            run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
+                        },
+                    )? {
+                        return Ok(());
+                    }
+
                     let node_count = workflow.total_nodes();
                     println!(
                         "Running workflow '{}' ({} nodes) on workflow run {}...",
@@ -1535,6 +1663,7 @@ fn main() -> Result<()> {
                             target_label: Some(run_id.as_str()),
                             default_bot_name: None,
                             run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1559,6 +1688,27 @@ fn main() -> Result<()> {
                         &workflow,
                         &mut input_map,
                     )?;
+
+                    if run_background_workflow(
+                        background,
+                        WorkflowExecStandalone {
+                            config: config.clone(),
+                            workflow: workflow.clone(),
+                            worktree_id: None,
+                            working_dir: repo.local_path.clone(),
+                            repo_path: repo.local_path.clone(),
+                            ticket_id: Some(ticket_id.clone()),
+                            repo_id: Some(ticket.repo_id.clone()),
+                            model: model.clone(),
+                            exec_config: exec_config.clone(),
+                            inputs: input_map.clone(),
+                            target_label: Some(repo.slug.clone()),
+                            run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
+                        },
+                    )? {
+                        return Ok(());
+                    }
 
                     println!(
                         "Running workflow '{}' ({} nodes) on ticket {}...",
@@ -1585,6 +1735,7 @@ fn main() -> Result<()> {
                             target_label: Some(repo.slug.as_str()),
                             default_bot_name: None,
                             run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),
@@ -1613,13 +1764,35 @@ fn main() -> Result<()> {
                         &mut input_map,
                     )?;
 
+                    let wt_label = format!("{repo_slug}/{worktree_slug}");
+
+                    if run_background_workflow(
+                        background,
+                        WorkflowExecStandalone {
+                            config: config.clone(),
+                            workflow: workflow.clone(),
+                            worktree_id: Some(wt.id.clone()),
+                            working_dir: wt.path.clone(),
+                            repo_path: r.local_path.clone(),
+                            ticket_id: None,
+                            repo_id: None,
+                            model: model.clone(),
+                            exec_config: exec_config.clone(),
+                            inputs: input_map.clone(),
+                            target_label: Some(wt_label.clone()),
+                            run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
+                        },
+                    )? {
+                        return Ok(());
+                    }
+
                     let node_count = workflow.total_nodes();
                     println!(
                         "Running workflow '{}' ({} nodes) on {}/{}...",
                         workflow.name, node_count, repo_slug, worktree_slug
                     );
 
-                    let wt_label = format!("{repo_slug}/{worktree_slug}");
                     match conductor_core::workflow::execute_workflow(
                         &conductor_core::workflow::WorkflowExecInput {
                             conn: &conn,
@@ -1638,6 +1811,7 @@ fn main() -> Result<()> {
                             target_label: Some(&wt_label),
                             default_bot_name: None,
                             run_id_notify: None,
+                            extra_plugin_dirs: plugin_dirs.clone(),
                         },
                     ) {
                         Ok(result) => report_workflow_result(result),

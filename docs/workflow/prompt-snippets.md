@@ -1,3 +1,9 @@
+---
+title: Prompt Snippets
+type: explanation
+layer: 2
+---
+
 # Prompt Snippets
 
 ## Overview

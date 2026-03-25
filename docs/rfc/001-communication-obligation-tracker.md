@@ -1,3 +1,9 @@
+---
+title: "RFC 001: Communication Obligation Tracker"
+type: reference
+layer: 3
+---
+
 # RFC 001: Communication Obligation Tracker
 
 **Status:** Draft

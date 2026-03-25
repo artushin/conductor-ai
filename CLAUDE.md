@@ -1,139 +1,122 @@
-# CLAUDE.md
+# Conductor-AI
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Multi-repo orchestration tool: manages git repos, worktrees, tickets, AI agent runs, and multi-step workflows -- all backed by SQLite. Five Rust crates in a Cargo workspace.
 
-## Build & Test Commands
+## Documentation Access -- Librarian-First (Mandatory)
+
+NEVER read `docs/` files directly via the Read tool when the doc-librarian agent is available. ALWAYS use the doc-librarian to gather documentation context:
+
+- **Session start**: Invoke the doc-librarian (`subagent_type: "doc-librarian:doc-librarian"`) to assemble context relevant to the user's first prompt BEFORE doing any work
+- **Subsequent prompts**: If there is any chance that unread documentation has more detail, invoke the doc-librarian again to dig deeper rather than reading docs directly
+- **Why**: The doc-librarian navigates progressive disclosure layers (L1 summaries -> L2 domain -> L3 surgical) and knows which documents are relevant. Direct reads bypass this topology, loading unnecessary content and missing related documents
+- **Fallback**: Direct reads are permitted ONLY when the doc-librarian agent is not loaded in the current session
+- **Conductor workflow exemption**: If `CONDUCTOR_RUN_ID` is set in the environment, skip doc-librarian/doc-writer -- the workflow handles documentation context via dedicated bookend steps. Focus on your assigned task; direct `docs/` reads are permitted for precise facts
+
+## Build and Test
 
 ```bash
 cargo build                    # Build all crates
 cargo build --release          # Release build
 cargo test                     # Run all tests
-cargo test --lib github        # Run specific module tests (e.g., github)
 cargo test -p conductor-core   # Test a single crate
 cargo clippy -- -D warnings    # Lint (CI enforces -D warnings)
-cargo fmt --all                # Auto-format
+cargo fmt --all                # Format
 cargo fmt --all --check        # Check formatting (CI gate)
-cargo build --bin conductor     # Build CLI only
-cargo build --bin conductor-tui # Build TUI only
-cargo build --bin conductor-web # Build web UI (requires frontend built first)
 
-# Web frontend (must be built before cargo build --bin conductor-web)
+# Web frontend (required before building conductor-web)
 cd conductor-web/frontend && bun install && bun run build
+
+# Full build (frontend + all crates)
+./build.sh
 ```
 
-No Makefile/justfile — use `cargo` directly.
+Pre-commit hook: `git config core.hooksPath .githooks`
 
-# One-time dev setup: enable pre-commit hook that runs cargo fmt --all --check
-git config core.hooksPath .githooks
+## Crate Architecture
 
-## Architecture
+| Crate | Binary | Purpose |
+|-------|--------|---------|
+| conductor-core | (library) | All domain logic: workflow engine, agent management, repo/worktree, tickets, DB |
+| conductor-cli | `conductor` | CLI (clap) + MCP server (stdio transport) |
+| conductor-tui | `conductor-tui` | Terminal UI (ratatui + crossterm) |
+| conductor-web | `conductor-web` | Web UI (axum + embedded React frontend) |
+| conductor-service | `conductor-service` | Daemon: Unix socket JSON-RPC, PE watcher (early stage) |
 
-**Conductor** is a multi-repo orchestration tool: manages git repos, worktrees, tickets, and AI agent runs locally with SQLite.
+All binaries depend on conductor-core. No binary-to-binary dependencies. For the full module map and design trade-offs, see [docs/architecture/crate-structure.md](docs/architecture/crate-structure.md).
 
-### Workspace Layout
+## Key Commands
 
-Four crates in a Cargo workspace:
-
-- **conductor-core** — Library crate with all domain logic. Everything lives here.
-- **conductor-cli** — Thin binary wrapping core with clap subcommands.
-- **conductor-tui** — TUI binary using ratatui + crossterm.
-- **conductor-web** — Web UI binary using axum + React (Vite + Tailwind frontend embedded via `rust_embed`).
-
-### Library-First (v1)
-
-No daemon, no IPC, no async runtime. CLI and TUI import `conductor-core` directly. SQLite WAL mode handles concurrency. Designed for future daemon extraction in v2 (all domain structs already derive `Serialize`/`Deserialize`).
-
-### Manager Pattern
-
-Domain logic is organized into manager structs that take `&Connection` + `&Config`:
-- `RepoManager` — CRUD for registered repos
-- `WorktreeManager` — Git worktree lifecycle (branch, create worktree, auto-install JS deps)
-- `TicketSyncer` — Upsert/list tickets, link to worktrees
-- `IssueSourceManager` — Configure per-repo issue sources (GitHub, Jira)
-- `AgentManager` — Launch/stop Claude agents in tmux, track runs and events
-
-### Error Handling
-
-- `conductor-core`: Custom `ConductorError` enum via `thiserror`, with `Result<T>` type alias
-- Binaries: `anyhow::Result` for one-shot error reporting
-
-### Git & External Tools
-
-All git operations and GitHub sync use `std::process::Command` (synchronous subprocess calls):
-- Worktree ops: `git branch`, `git worktree add/remove`
-- GitHub sync: `gh issue list` (requires `gh` CLI installed and authed)
-
-### Database
-
-SQLite at `~/.conductor/conductor.db` with WAL mode, foreign keys on, 5s busy timeout. Schema managed via versioned migrations in `conductor-core/src/db/migrations/`. Tables: `repos`, `repo_issue_sources`, `worktrees`, `tickets`, `agent_runs`, `workflow_runs`, `workflow_run_steps`, `_conductor_meta`.
-
-### Data Directory
-
-```
-~/.conductor/
-├── conductor.db
-├── config.toml
-└── workspaces/<repo-slug>/<worktree-slug>/
+```bash
+conductor repo register <url>                         # Register a repo
+conductor repo set-plugin-dirs <slug> <dirs...>       # Set agent plugin dirs
+conductor worktree create <repo> <name>               # Create a worktree
+conductor tickets sync [<repo>]                       # Sync tickets
+conductor tickets create <repo> --title "..." [--workflow <name>]  # Create ticket with optional workflow override
+conductor tickets update <id> [--workflow <name>]     # Update ticket (set explicit workflow)
+conductor workflow run <name> <repo> <wt> [--dry-run] [--background]  # Run a workflow
+conductor workflow validate <name> <repo> <wt>        # Validate a workflow
+conductor mcp serve                                   # Start MCP server
 ```
 
-## CI & Branch Rules
+**`--background` flag**: `conductor workflow run --background` forks a detached child process via `fork`/`setsid`, prints the run ID to stdout, and exits immediately. The child drives the workflow to completion independently. Use this when the spawning process should not block on workflow execution.
 
-GitHub Actions runs on PRs to `main` (`.github/workflows/ci.yml`):
-- **Format** — `cargo fmt --all --check`
-- **Clippy** — `cargo clippy --workspace --all-targets -- -D warnings`
-- **Test** — `cargo test --workspace`
+**`--workflow` flag on tickets**: `conductor tickets create --workflow <name>` and `conductor tickets update --workflow <name>` set an explicit workflow override on the ticket. When set, dispatch uses this workflow directly instead of routing heuristics.
 
-Branch ruleset on `main`: PRs required, linear history (squash/rebase only), `Clippy` + `Test` must pass. Tag ruleset: `v*` tags cannot be deleted or overwritten.
+Full CLI reference: [docs/reference/cli-commands.md](docs/reference/cli-commands.md)
 
-## Project Context
+## MCP Server
 
-- **Vision & motivation:** [docs/VISION.md](docs/VISION.md)
-- **Current priorities:** [docs/ROADMAP.md](docs/ROADMAP.md)
-- **Workflow engine design:** [docs/workflow/engine.md](docs/workflow/engine.md)
+22 tools + 9 resource categories exposed via `conductor mcp serve` (stdio transport for Claude Code). Covers repos, worktrees, tickets, workflows, runs, gates, and agent management.
 
-## TUI Threading Rule
+Full reference: [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md)
 
-**Never call blocking operations on the TUI main thread.** The TUI renders on a single thread — any synchronous blocking call (git, network, file I/O, subprocess) freezes the UI completely.
+## Workflow Engine
 
-**What counts as blocking:** anything in `conductor-core` that calls `std::process::Command` (all git ops, `gh` CLI, dep installs), large file reads (agent logs), or slow DB queries.
+Custom `.wf` DSL parsed by a hand-written recursive descent parser. Supports `call`, `parallel`, `if`/`unless`/`while`/`do-while`, `gate`, `always`, and `call workflow` for shallow composition. Agents emit structured output via `CONDUCTOR_OUTPUT` blocks.
 
-**The required pattern:**
+- DSL syntax: [docs/reference/workflow-dsl.md](docs/reference/workflow-dsl.md)
+- Engine architecture: [docs/architecture/workflow-engine.md](docs/architecture/workflow-engine.md)
+- Output schemas: [docs/reference/output-schemas.md](docs/reference/output-schemas.md)
+- Writing workflows: [docs/how-to/write-workflow.md](docs/how-to/write-workflow.md)
 
-```rust
-// 1. Capture data needed by the thread
-let tx = self.bg_tx.clone();
-let repo_slug = repo_slug.clone();
+## Database
 
-// 2. Show a non-dismissable progress modal
-self.state.modal = Modal::Progress { message: "Pushing branch…".into() };
+SQLite at `~/.conductor/conductor.db`. WAL mode, foreign keys on, 5s busy timeout. 13 tables, 37 versioned migrations. IDs are ULIDs; timestamps are ISO 8601 strings.
 
-// 3. Do the work off-thread
-std::thread::spawn(move || {
-    let db = open_database(&db_path()).unwrap();
-    let config = Config::load().unwrap();
-    let result = WorktreeManager::new(&db, &config).push(&repo_slug, &wt_slug);
-    let _ = tx.send(Action::PushComplete { result: result.map_err(|e| e.to_string()) });
-});
+Full schema: [docs/reference/database-schema.md](docs/reference/database-schema.md)
 
-// 4. Handle the result action back on the main thread
-Action::PushComplete { result } => {
-    self.state.modal = Modal::None;
-    match result {
-        Ok(msg) => self.state.status_message = Some(msg),
-        Err(e)  => self.state.modal = Modal::Error { message: e },
-    }
-}
-```
+## CI
 
-Reference implementations already using this pattern correctly:
-- `has_merged_pr()` check before worktree delete (`app.rs` ~line 2827)
-- Workflow execution and resume (`app.rs` ~lines 4893, 1705)
-- PR fetch background task (`background.rs`)
+GitHub Actions on PRs to `main`: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. Branch ruleset: PRs required, linear history, Clippy + Test must pass.
 
-## Key Conventions
+## Key Constraints
 
-- All record IDs are ULIDs (sortable, collision-resistant)
-- All timestamps are ISO 8601 strings
-- Worktree branch naming auto-detects `feat-`/`fix-` prefix and normalizes to `feat/`/`fix/` branches
-- JS dep auto-install detects package manager via lockfile: bun > pnpm > yarn > npm
-- Ticket upserts use `ON CONFLICT DO UPDATE` on `(repo_id, source_type, source_id)` for idempotency
+- **conductor-ai is reference only** -- NEVER source agents, schemas, or prompts from `conductor-ai/.conductor/`. Canonical sources: [agent-architecture](https://github.com/devinrosen/agent-architecture) (agents), [fsm-engine](/usr/local/bsg/fsm-engine/) (workflows, schemas, prompts), target repo (repo-local agents)
+- **TUI threading rule** -- Never call blocking operations on the TUI main thread. Pattern: capture data, show progress modal, `std::thread::spawn`, handle result action. See [docs/architecture/crate-structure.md](docs/architecture/crate-structure.md) for details
+- **Manager pattern** -- Domain logic uses manager structs taking `&Connection` + `&Config`. Managers never own the connection
+- **No daemon in v1** -- CLI and TUI import conductor-core directly. SQLite WAL handles concurrency
+
+## Documentation
+
+For a compressed context summary, load [docs/context/CONTEXT_SUMMARY.md](docs/context/CONTEXT_SUMMARY.md).
+
+| Section | Documents |
+|---------|-----------|
+| Architecture | [crate-structure](docs/architecture/crate-structure.md), [workflow-engine](docs/architecture/workflow-engine.md), [structured-output](docs/architecture/structured-output.md), [agent-execution](docs/architecture/agent-execution.md) |
+| Reference | [workflow-dsl](docs/reference/workflow-dsl.md), [database-schema](docs/reference/database-schema.md), [mcp-tools](docs/reference/mcp-tools.md), [cli-commands](docs/reference/cli-commands.md), [output-schemas](docs/reference/output-schemas.md), [configuration](docs/reference/configuration.md) |
+| How-To | [write-workflow](docs/how-to/write-workflow.md), [manage-repos](docs/how-to/manage-repos.md), [use-worktrees](docs/how-to/use-worktrees.md) |
+| Integration | [BSG_INTEGRATION](docs/BSG_INTEGRATION.md) |
+| Full index | [docs/README.md](docs/README.md) |
+
+## Claude Code Skills
+
+7 skills in `.claude/skills/`: cli-coverage, conductor-workflow-create, conductor-workflow-init, conductor-workflow-update, conductor-workflow-validate, rebase-and-fix-review, tui-keys.
+
+## Related Repos
+
+| Repo | Relationship |
+|------|-------------|
+| [agent-architecture](/usr/local/bsg/agent-architecture/) | 31 shared agents loaded via `--plugin-dir` |
+| [fsm-engine](/usr/local/bsg/fsm-engine/) | .wf workflow templates + FSM definitions |
+| [pattern-extractor](/usr/local/bsg/pattern-extractor/) | PE commands invoked by PE agents |
+| [vantage](/usr/local/bsg/vantage/) | Primary consumer: SDLC coordination |

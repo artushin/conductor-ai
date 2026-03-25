@@ -1,3 +1,9 @@
+---
+title: "RFC 003: --path Flag for conductor workflow run"
+type: reference
+layer: 3
+---
+
 # RFC 003: `--path` Flag for `conductor workflow run`
 
 **Status:** Draft / Exploring
@@ -108,7 +114,7 @@ The core engine (`workflow.rs`) requires no changes — it already supports `wor
 
 ## Related
 
-- `docs/getting-started-cli.md` — CLI guide that motivates this RFC
+- [Getting Started with the CLI](../how-to/getting-started-cli.md) -- CLI guide that motivates this RFC
 - `conductor workflow validate --path` — existing precedent in `conductor-cli/src/main.rs`
 - `workflow_ephemeral.rs` — `--pr` implementation, the direct analogue
 - RFC 002 — workflow targets expansion

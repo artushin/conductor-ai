@@ -1,3 +1,9 @@
+---
+title: "RFC 002: Workflow Targets Beyond Worktrees"
+type: reference
+layer: 3
+---
+
 # RFC 002: Workflow Targets Beyond Worktrees
 
 **Status:** Draft / Exploring
@@ -83,5 +89,5 @@ This maps naturally onto the existing `inputs` field — the target type just de
 ## Related
 
 - Issue #515 — TUI keybinding cleanup (removes `s` → SyncTickets, which could become a repo workflow)
-- `docs/workflow/engine.md` — workflow engine design
-- `docs/ROADMAP.md` — current priorities
+- [Workflow Engine Architecture](../architecture/workflow-engine.md) -- workflow engine design
+- [Roadmap](../roadmap.md) -- current priorities

@@ -1,3 +1,9 @@
+---
+title: "RFC 004: Conductor as a Native Claude Code Experience"
+type: reference
+layer: 3
+---
+
 # RFC 004: Conductor as a Native Claude Code Experience
 
 **Status:** Draft / Exploring
@@ -256,4 +262,4 @@ Phase 1 can ship without any MCP work. Phase 2 is the highest-leverage investmen
 - Issue #599 — status line implementation (Phase 1)
 - Issue #600 — status line in plugin (Phase 1)
 - RFC 003 — `--path` flag on `workflow run` (unlocks Phase 1 skills for unregistered repos)
-- `docs/getting-started-cli.md` — entry point for teams adopting conductor CLI
+- [Getting Started with the CLI](../how-to/getting-started-cli.md) -- entry point for teams adopting conductor CLI

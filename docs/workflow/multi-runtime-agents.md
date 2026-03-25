@@ -1,3 +1,9 @@
+---
+title: Multi-Runtime Agents
+type: explanation
+layer: 2
+---
+
 # Multi-Runtime Agents
 
 *Draft — capturing the idea for future exploration.*
@@ -130,8 +136,8 @@ that it got structured output back.
 
 ## Prerequisites
 
-- Headless subprocess execution path (see `docs/claude-agent-integration.md`
-  research on subprocess vs tmux) — needed before `shell` runtime makes sense
+- Headless subprocess execution path (see [agent execution architecture](../architecture/agent-execution.md)
+  research on subprocess vs tmux) -- needed before `shell` runtime makes sense
 - Stable `CONDUCTOR_OUTPUT` contract that non-Claude tools can target
 
 ---

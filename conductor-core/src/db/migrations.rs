@@ -639,6 +639,28 @@ pub fn run(conn: &Connection) -> Result<()> {
         bump_version(conn, 37)?;
     }
 
+    // Migration 038: add optional workflow column to tickets.
+    let has_ticket_workflow: bool = conn
+        .prepare("SELECT workflow FROM tickets LIMIT 0")
+        .is_ok();
+    if !has_ticket_workflow {
+        conn.execute_batch(include_str!("migrations/038_ticket_workflow.sql"))?;
+    }
+    if version < 38 {
+        bump_version(conn, 38)?;
+    }
+
+    // Migration 039: add agent_map column to tickets for programmatic agent selection.
+    let has_agent_map: bool = conn
+        .prepare("SELECT agent_map FROM tickets LIMIT 0")
+        .is_ok();
+    if !has_agent_map {
+        conn.execute_batch(include_str!("migrations/039_ticket_agent_map.sql"))?;
+    }
+    if version < 39 {
+        bump_version(conn, 39)?;
+    }
+
     Ok(())
 }
 
