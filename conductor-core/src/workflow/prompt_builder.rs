@@ -83,8 +83,38 @@ pub(super) fn build_agent_prompt(
     let vars = build_variable_map(state);
     let mut prompt = substitute_variables(&agent_def.prompt, &vars);
 
+    // Task reinforcement directive
+    prompt = format!(
+        "Your task below is your ONLY priority. Complete it fully before considering anything else.\n\n{prompt}"
+    );
+
     if agent_def.can_commit && state.exec_config.dry_run {
         prompt = format!("DO NOT commit or push any changes. This is a dry run.\n\n{prompt}");
+    }
+
+    // FSM mandatory first action: when an FSM path is provided, tell the
+    // agent to read it before doing anything else.
+    if let Some(fsm_path) = state.inputs.get("fsm_path") {
+        if !fsm_path.is_empty() {
+            prompt = format!(
+                "{prompt}\n\n## Mandatory First Action\n\n\
+                 Before doing ANYTHING else, read the FSM definition file at:\n\
+                 `{fsm_path}`\n\n\
+                 This file defines the state machine that governs your behavior in this workflow. \
+                 You MUST read and understand it before proceeding with any other work."
+            );
+        }
+    }
+
+    // Template variables section
+    if !state.inputs.is_empty() {
+        prompt.push_str("\n\n## Template Variables\n\n");
+        prompt.push_str(
+            "The following template placeholders are available and have been substituted in this prompt:\n\n",
+        );
+        for (key, value) in &state.inputs {
+            prompt.push_str(&format!("- `{{{{{key}}}}}` = `{value}`\n"));
+        }
     }
 
     // Append prompt snippets (already concatenated by caller)
