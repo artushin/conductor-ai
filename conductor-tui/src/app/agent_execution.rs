@@ -200,7 +200,11 @@ impl App {
         let Some(fb) = self.require_pending_feedback() else {
             return;
         };
+        self.open_feedback_modal(&fb, "Agent Feedback");
+    }
 
+    /// Open the feedback modal for a given request, with a configurable title prefix.
+    fn open_feedback_modal(&mut self, fb: &FeedbackRequest, title_prefix: &str) {
         use conductor_core::agent::FeedbackType;
 
         let format_opts = |opts: &[conductor_core::agent::FeedbackOption]| -> String {
@@ -224,12 +228,11 @@ impl App {
             FeedbackType::Text => "Type your feedback response...".to_string(),
         };
 
-        // Open a text area modal for the user to type their response
         let mut textarea = tui_textarea::TextArea::default();
         textarea.set_placeholder_text(&placeholder);
 
         self.state.modal = Modal::AgentPrompt {
-            title: format!("Agent Feedback: {}", &fb.prompt),
+            title: format!("{title_prefix}: {}", &fb.prompt),
             prompt: fb.prompt.clone(),
             textarea: Box::new(textarea),
             on_submit: InputAction::FeedbackResponse {
@@ -624,6 +627,210 @@ impl App {
                 self.state.modal = Modal::Error { message: e };
             }
         }
+    }
+
+    pub(super) fn handle_prompt_repo_agent(&mut self) {
+        let repo = self
+            .state
+            .selected_repo_id
+            .as_ref()
+            .and_then(|id| self.state.data.repos.iter().find(|r| &r.id == id))
+            .cloned();
+
+        let Some(repo) = repo else {
+            self.state.status_message = Some("No repo selected".to_string());
+            return;
+        };
+
+        let lines = vec![String::new()];
+        let mut textarea = tui_textarea::TextArea::new(lines);
+        textarea.set_cursor_line_style(ratatui::style::Style::default());
+        textarea.set_placeholder_text("Ask the repo agent a question (read-only)...");
+
+        self.state.modal = Modal::AgentPrompt {
+            title: "Repo Agent (read-only)".to_string(),
+            prompt: "Enter prompt for Claude:".to_string(),
+            textarea: Box::new(textarea),
+            on_submit: InputAction::RepoAgentPrompt {
+                repo_id: repo.id.clone(),
+                repo_path: repo.local_path.clone(),
+                repo_slug: repo.slug.clone(),
+            },
+        };
+    }
+
+    pub(super) fn start_repo_agent_tmux(
+        &mut self,
+        prompt: String,
+        repo_id: String,
+        repo_path: String,
+        repo_slug: String,
+    ) {
+        let Some(ref tx) = self.bg_tx else { return };
+        let tx = tx.clone();
+
+        self.state.modal = Modal::Progress {
+            message: "Launching repo agent…".into(),
+        };
+
+        std::thread::spawn(move || {
+            let result = (|| -> std::result::Result<String, String> {
+                let db = conductor_core::config::db_path();
+                let conn = conductor_core::db::open_database(&db).map_err(|e| e.to_string())?;
+                let mgr = AgentManager::new(&conn);
+
+                let run_id_preview = conductor_core::new_id();
+                let window_name = conductor_core::agent_runtime::repo_agent_window_name(
+                    &repo_slug,
+                    &run_id_preview,
+                );
+
+                let run = mgr
+                    .create_repo_run(&repo_id, &prompt, Some(&window_name), None)
+                    .map_err(|e| format!("Failed to create repo agent run: {e}"))?;
+
+                let plan_mode = conductor_core::config::AgentPermissionMode::Plan;
+                let args = conductor_core::agent_runtime::build_agent_args_with_mode(
+                    &run.id,
+                    &repo_path,
+                    &prompt,
+                    None,
+                    None,
+                    None,
+                    Some(&plan_mode),
+                )
+                .inspect_err(|e| {
+                    let _ = mgr.update_run_failed(&run.id, e);
+                })?;
+
+                conductor_core::agent_runtime::spawn_tmux_window(&args, &window_name).inspect_err(
+                    |e| {
+                        let _ = mgr.update_run_failed(&run.id, e);
+                    },
+                )?;
+
+                Ok(format!("Repo agent launched in tmux window: {window_name}"))
+            })();
+
+            let _ = tx.send(Action::RepoAgentLaunched { result });
+        });
+    }
+
+    /// Returns true if the current context is the repo agent pane in RepoDetail.
+    pub(super) fn is_repo_agent_context(&self) -> bool {
+        self.state.view == crate::state::View::RepoDetail
+            && self.state.repo_detail_focus == crate::state::RepoDetailFocus::RepoAgent
+    }
+
+    /// Stop the running repo-scoped agent for the currently selected repo.
+    /// Runs blocking subprocess calls on a background thread per the TUI threading rule.
+    pub(super) fn handle_stop_repo_agent(&mut self) {
+        let run = self
+            .state
+            .selected_repo_id
+            .as_ref()
+            .and_then(|id| self.state.data.latest_repo_agent_runs.get(id))
+            .cloned();
+
+        let Some(run) = run else { return };
+        if !run.is_active() {
+            return;
+        }
+
+        let Some(ref tx) = self.bg_tx else { return };
+        let tx = tx.clone();
+        let run_id = run.id.clone();
+        let tmux_window = run.tmux_window.clone();
+
+        self.state.modal = crate::state::Modal::Progress {
+            message: "Stopping repo agent…".into(),
+        };
+
+        std::thread::spawn(move || {
+            use std::process::Command;
+
+            let db = conductor_core::config::db_path();
+            let conn = match conductor_core::db::open_database(&db) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Action::RepoAgentStopComplete {
+                        result: Err(format!("Failed to open database: {e}")),
+                    });
+                    return;
+                }
+            };
+            let mgr = AgentManager::new(&conn);
+
+            if let Some(ref window) = tmux_window {
+                mgr.capture_agent_log(&run_id, window);
+                let _ = Command::new("tmux")
+                    .args(["kill-window", "-t", &format!(":{window}")])
+                    .output();
+            }
+
+            let result = mgr
+                .update_run_cancelled(&run_id)
+                .map(|()| "Repo agent cancelled".to_string())
+                .map_err(|e| format!("Failed to cancel repo agent: {e}"));
+
+            let _ = tx.send(Action::RepoAgentStopComplete { result });
+        });
+    }
+
+    /// Submit feedback for the repo-scoped agent.
+    pub(super) fn handle_submit_repo_feedback(&mut self) {
+        let Some(fb) = self.state.data.pending_repo_feedback.clone() else {
+            self.state.status_message = Some("No pending feedback request".to_string());
+            return;
+        };
+        self.open_feedback_modal(&fb, "Repo Agent Feedback");
+    }
+
+    /// Dismiss feedback for the repo-scoped agent.
+    pub(super) fn handle_dismiss_repo_feedback(&mut self) {
+        let Some(fb) = self.state.data.pending_repo_feedback.clone() else {
+            self.state.status_message = Some("No pending feedback request".to_string());
+            return;
+        };
+
+        let mgr = AgentManager::new(&self.conn);
+        match mgr.dismiss_feedback(&fb.id) {
+            Ok(()) => {
+                self.state.status_message =
+                    Some("Feedback dismissed — repo agent resumed".to_string());
+                self.state.data.pending_repo_feedback = None;
+                self.refresh_data();
+                self.reload_repo_agent_events();
+            }
+            Err(e) => {
+                self.state.status_message = Some(format!("Failed to dismiss feedback: {e}"));
+            }
+        }
+    }
+
+    /// Expand a repo agent event detail modal.
+    pub(super) fn handle_expand_repo_agent_event(&mut self) {
+        let idx = self
+            .state
+            .repo_agent_list_state
+            .borrow()
+            .selected()
+            .unwrap_or(0);
+        let Some(ev) = self.state.data.repo_agent_event_at_visual_index(idx) else {
+            return;
+        };
+
+        let title = format!("[{}] {}", ev.kind, ev.started_at);
+        let body = ev.summary.clone();
+        let line_count = body.lines().count();
+
+        self.state.modal = Modal::EventDetail {
+            title,
+            body,
+            line_count,
+            scroll_offset: 0,
+            horizontal_offset: 0,
+        };
     }
 }
 

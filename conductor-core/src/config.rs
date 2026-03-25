@@ -21,6 +21,8 @@ pub enum AgentPermissionMode {
     AutoMode,
     /// Use `--dangerously-skip-permissions` (legacy fallback).
     SkipPermissions,
+    /// Use `--permission-mode plan` (read-only mode for repo-scoped agents).
+    Plan,
 }
 
 impl AgentPermissionMode {
@@ -29,6 +31,15 @@ impl AgentPermissionMode {
         match self {
             Self::AutoMode => "--enable-auto-mode",
             Self::SkipPermissions => "--dangerously-skip-permissions",
+            Self::Plan => "--permission-mode",
+        }
+    }
+
+    /// Returns the optional value argument that follows the flag (e.g. "plan" for `--permission-mode plan`).
+    pub fn cli_flag_value(&self) -> Option<&str> {
+        match self {
+            Self::Plan => Some("plan"),
+            _ => None,
         }
     }
 }
@@ -594,6 +605,18 @@ mod tests {
             AgentPermissionMode::SkipPermissions.cli_flag(),
             "--dangerously-skip-permissions"
         );
+    }
+
+    #[test]
+    fn test_agent_permission_mode_cli_flag_plan() {
+        assert_eq!(AgentPermissionMode::Plan.cli_flag(), "--permission-mode");
+    }
+
+    #[test]
+    fn test_agent_permission_mode_cli_flag_value() {
+        assert_eq!(AgentPermissionMode::AutoMode.cli_flag_value(), None);
+        assert_eq!(AgentPermissionMode::SkipPermissions.cli_flag_value(), None);
+        assert_eq!(AgentPermissionMode::Plan.cli_flag_value(), Some("plan"));
     }
 
     #[test]

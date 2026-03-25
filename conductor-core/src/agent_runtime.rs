@@ -12,6 +12,14 @@ use rusqlite::Connection;
 
 use crate::agent::{list_live_tmux_windows, AgentManager, AgentRun, AgentRunStatus};
 
+/// Build a tmux window name for a repo-scoped agent run.
+///
+/// Format: `repo-{slug}-{short_id}` where `short_id` is the first 8 chars of `run_id`.
+pub fn repo_agent_window_name(slug: &str, run_id: &str) -> String {
+    let short_id = &run_id[..8.min(run_id.len())];
+    format!("repo-{slug}-{short_id}")
+}
+
 /// Resolve the path to the `conductor` binary.
 ///
 /// Looks for a sibling `conductor` next to the current executable first,
@@ -204,15 +212,19 @@ pub fn poll_child_completion(
 }
 
 /// Maximum number of CLI arguments produced by `build_agent_args`:
-/// 2 subcommands + 4 fixed flags + 2 for prompt/prompt-file + 2 optional resume + 2 optional model + 2 optional bot_name.
-const AGENT_ARGS_CAPACITY: usize = 14;
+/// 2 subcommands + 4 fixed flags + 2 for prompt/prompt-file + 2 optional resume
+/// + 2 optional model + 2 optional bot_name + 2 optional permission-mode.
+const AGENT_ARGS_CAPACITY: usize = 16;
 
 /// Build the `conductor agent run` argument list for a child agent.
 ///
 /// If the prompt exceeds the safe tmux command-length threshold, it is written
-/// to a temp file (`<worktree_path>/.conductor-prompt-<run_id>.txt`) and
+/// to a temp file (`<working_dir>/.conductor-prompt-<run_id>.txt`) and
 /// `--prompt-file` is used instead of `--prompt`.  Returns the argument list
 /// ready to pass to [`spawn_tmux_window`].
+///
+/// `permission_mode` optionally overrides the configured permission mode
+/// (e.g. `Some(AgentPermissionMode::Plan)` for repo-scoped read-only agents).
 pub fn build_agent_args(
     run_id: &str,
     worktree_path: &str,
@@ -221,13 +233,38 @@ pub fn build_agent_args(
     model: Option<&str>,
     bot_name: Option<&str>,
 ) -> std::result::Result<Vec<Cow<'static, str>>, String> {
+    build_agent_args_with_mode(
+        run_id,
+        worktree_path,
+        prompt,
+        resume_session_id,
+        model,
+        bot_name,
+        None,
+    )
+}
+
+/// Like [`build_agent_args`] but accepts an optional permission mode override.
+///
+/// When `permission_mode` is `Some(AgentPermissionMode::Plan)`, the agent run
+/// will use `--permission-mode plan` instead of the configured default.
+#[allow(clippy::too_many_arguments)]
+pub fn build_agent_args_with_mode(
+    run_id: &str,
+    working_dir: &str,
+    prompt: &str,
+    resume_session_id: Option<&str>,
+    model: Option<&str>,
+    bot_name: Option<&str>,
+    permission_mode: Option<&crate::config::AgentPermissionMode>,
+) -> std::result::Result<Vec<Cow<'static, str>>, String> {
     // tmux has a hard limit on command-line length (~2 KB depending on version).
     // For prompts that exceed a safe threshold, write to a file and pass
     // --prompt-file instead so we never hit that limit.
     const PROMPT_FILE_THRESHOLD: usize = 512;
 
     let prompt_file_path: Option<String> = if prompt.len() > PROMPT_FILE_THRESHOLD {
-        let path = format!("{worktree_path}/.conductor-prompt-{run_id}.txt");
+        let path = format!("{working_dir}/.conductor-prompt-{run_id}.txt");
         std::fs::write(&path, prompt)
             .map_err(|e| format!("Failed to write prompt file '{path}': {e}"))?;
         Some(path)
@@ -241,7 +278,7 @@ pub fn build_agent_args(
     args.push(Cow::Borrowed("--run-id"));
     args.push(Cow::Owned(run_id.to_string()));
     args.push(Cow::Borrowed("--worktree-path"));
-    args.push(Cow::Owned(worktree_path.to_string()));
+    args.push(Cow::Owned(working_dir.to_string()));
 
     if let Some(path) = prompt_file_path {
         args.push(Cow::Borrowed("--prompt-file"));
@@ -264,6 +301,13 @@ pub fn build_agent_args(
     if let Some(b) = bot_name {
         args.push(Cow::Borrowed("--bot-name"));
         args.push(Cow::Owned(b.to_string()));
+    }
+
+    if let Some(mode) = permission_mode {
+        args.push(Cow::Owned(mode.cli_flag().to_string()));
+        if let Some(val) = mode.cli_flag_value() {
+            args.push(Cow::Owned(val.to_string()));
+        }
     }
 
     Ok(args)
@@ -321,6 +365,25 @@ pub fn spawn_child_tmux(
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+
+    #[test]
+    fn repo_agent_window_name_basic() {
+        let name = super::repo_agent_window_name("my-repo", "01ABCDEF99XYZW");
+        assert_eq!(name, "repo-my-repo-01ABCDEF");
+    }
+
+    #[test]
+    fn repo_agent_window_name_short_run_id() {
+        // run_id shorter than 8 chars — should use full run_id
+        let name = super::repo_agent_window_name("r", "abc");
+        assert_eq!(name, "repo-r-abc");
+    }
+
+    #[test]
+    fn repo_agent_window_name_exact_8_chars() {
+        let name = super::repo_agent_window_name("slug", "12345678");
+        assert_eq!(name, "repo-slug-12345678");
+    }
 
     fn assert_inline_prompt(args: &[Cow<'static, str>], prompt: &str) {
         let prompt_idx = args

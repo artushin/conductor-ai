@@ -572,6 +572,96 @@ async fn test_both_source_types_allowed() {
     assert_eq!(sources.len(), 2);
 }
 
+// ── Repo-scoped agent cross-repo isolation tests ──────────────────────
+
+/// Shared setup for cross-repo IDOR tests: spawns a server with one repo + one
+/// agent run, then returns (base_url, repo_id, run_id).
+async fn setup_repo_agent_run() -> (String, String, String) {
+    use conductor_core::agent::AgentManager;
+    use conductor_core::config::Config;
+    use conductor_core::repo::RepoManager;
+
+    let base = spawn_test_server_with_setup(|conn| {
+        let config = Config::default();
+        let repo_mgr = RepoManager::new(conn, &config);
+        let repo = repo_mgr
+            .register(
+                "repo-a",
+                "/tmp/repo-a",
+                "https://github.com/test/a.git",
+                None,
+            )
+            .unwrap();
+        let mgr = AgentManager::new(conn);
+        mgr.create_repo_run(&repo.id, "test prompt", None, None)
+            .unwrap();
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+
+    let repos: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/repos"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let repo_id = repos[0]["id"].as_str().unwrap().to_string();
+
+    let runs: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/repos/{repo_id}/agent/runs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    let run_id = runs[0]["id"].as_str().unwrap().to_string();
+
+    (base, repo_id, run_id)
+}
+
+#[tokio::test]
+async fn test_stop_repo_agent_rejects_wrong_repo_id() {
+    let (base, _repo_id, run_id) = setup_repo_agent_run().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "{base}/api/repos/nonexistent-repo/agent/{run_id}/stop"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error() || resp.status().is_server_error(),
+        "cross-repo stop should be rejected, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_repo_agent_events_rejects_wrong_repo_id() {
+    let (base, _repo_id, run_id) = setup_repo_agent_run().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "{base}/api/repos/nonexistent-repo/agent/{run_id}/events"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error() || resp.status().is_server_error(),
+        "cross-repo events should be rejected, got {}",
+        resp.status()
+    );
+}
+
 #[tokio::test]
 async fn test_sse_endpoint_returns_event_stream() {
     let base = spawn_test_server().await;

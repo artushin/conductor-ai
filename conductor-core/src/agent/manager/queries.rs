@@ -93,6 +93,34 @@ impl<'a> AgentManager<'a> {
         Ok(runs)
     }
 
+    /// List repo-scoped agent runs (where `repo_id = ? AND worktree_id IS NULL`), newest first.
+    pub fn list_repo_scoped(&self, repo_id: &str) -> Result<Vec<AgentRun>> {
+        let mut runs = query_collect(
+            self.conn,
+            &format!(
+                "{AGENT_RUN_SELECT} WHERE repo_id = ?1 AND worktree_id IS NULL \
+                 ORDER BY started_at DESC"
+            ),
+            params![repo_id],
+            row_to_agent_run,
+        )?;
+        self.populate_plans(&mut runs)?;
+        Ok(runs)
+    }
+
+    /// Returns the latest repo-scoped agent run for a repo, or `None`.
+    pub fn latest_repo_scoped(&self, repo_id: &str) -> Result<Option<AgentRun>> {
+        let result = self.conn.query_row(
+            &format!(
+                "{AGENT_RUN_SELECT} WHERE repo_id = ?1 AND worktree_id IS NULL \
+                 ORDER BY started_at DESC LIMIT 1"
+            ),
+            params![repo_id],
+            row_to_agent_run,
+        );
+        self.load_optional_run(result)
+    }
+
     /// Returns true if the worktree has any prior agent runs.
     pub fn has_runs_for_worktree(&self, worktree_id: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
@@ -165,6 +193,35 @@ impl<'a> AgentManager<'a> {
             row_to_agent_run,
         )?;
         self.runs_to_worktree_map(runs)
+    }
+
+    /// Returns the latest repo-scoped agent run for each repo, keyed by repo_id.
+    /// Only includes runs where `worktree_id IS NULL` (repo-level agents).
+    pub fn latest_repo_scoped_runs_all(&self) -> Result<HashMap<String, AgentRun>> {
+        let mut runs = query_collect(
+            self.conn,
+            &format!(
+                "SELECT {AGENT_RUN_COLS_A} \
+                 FROM agent_runs a \
+                 INNER JOIN ( \
+                     SELECT repo_id, MAX(started_at) AS max_started \
+                     FROM agent_runs \
+                     WHERE worktree_id IS NULL AND repo_id IS NOT NULL \
+                     GROUP BY repo_id \
+                 ) latest ON a.repo_id = latest.repo_id AND a.started_at = latest.max_started \
+                 WHERE a.worktree_id IS NULL"
+            ),
+            [],
+            row_to_agent_run,
+        )?;
+        self.populate_plans(&mut runs)?;
+        let mut map = HashMap::new();
+        for run in runs {
+            if let Some(ref repo_id) = run.repo_id {
+                map.insert(repo_id.clone(), run);
+            }
+        }
+        Ok(map)
     }
 
     /// Returns the latest top-level agent run for a single worktree, or `None` if none exist.
@@ -1015,5 +1072,99 @@ mod tests {
         let map_r2 = mgr.latest_runs_by_worktree_for_repo("r2").unwrap();
         assert_eq!(map_r2.len(), 1);
         assert!(map_r2.contains_key("w3"));
+    }
+
+    #[test]
+    fn test_list_repo_scoped() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        // Create a repo-scoped run (no worktree)
+        let repo_run = mgr
+            .create_repo_run("r1", "Analyse the repo", None, None)
+            .unwrap();
+
+        // Create a worktree-scoped run (should not appear)
+        let _wt_run = mgr
+            .create_run(Some("w1"), "Fix the bug", None, None)
+            .unwrap();
+
+        let runs = mgr.list_repo_scoped("r1").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, repo_run.id);
+        assert!(runs[0].worktree_id.is_none());
+    }
+
+    #[test]
+    fn test_list_repo_scoped_empty() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let runs = mgr.list_repo_scoped("r1").unwrap();
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn test_latest_repo_scoped() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let _older = mgr
+            .create_repo_run("r1", "First question", None, None)
+            .unwrap();
+        let newer = mgr
+            .create_repo_run("r1", "Second question", None, None)
+            .unwrap();
+
+        let latest = mgr.latest_repo_scoped("r1").unwrap().unwrap();
+        assert_eq!(latest.id, newer.id);
+    }
+
+    #[test]
+    fn test_latest_repo_scoped_empty() {
+        let conn = setup_db();
+        let mgr = AgentManager::new(&conn);
+
+        let result = mgr.latest_repo_scoped("r1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_latest_repo_scoped_runs_all() {
+        let conn = setup_db();
+        // Insert a second repo so we can verify cross-repo behaviour.
+        conn.execute(
+            "INSERT INTO repos (id, slug, local_path, remote_url, workspace_dir, created_at) \
+             VALUES ('r2', 'other-repo', '/tmp/other', 'https://github.com/test/other.git', '/tmp/ws2', '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        let mgr = AgentManager::new(&conn);
+
+        // No repo-scoped runs yet → empty map
+        let map = mgr.latest_repo_scoped_runs_all().unwrap();
+        assert!(map.is_empty());
+
+        // Create repo-scoped runs
+        let _r1_old = mgr.create_repo_run("r1", "Old prompt", None, None).unwrap();
+        let r1_new = mgr.create_repo_run("r1", "New prompt", None, None).unwrap();
+        let r2_only = mgr.create_repo_run("r2", "R2 prompt", None, None).unwrap();
+
+        // Also create a worktree-scoped run — should NOT appear
+        mgr.create_run(Some("w1"), "Worktree task", None, None)
+            .unwrap();
+
+        let map = mgr.latest_repo_scoped_runs_all().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("r1").unwrap().id,
+            r1_new.id,
+            "should return latest for r1"
+        );
+        assert_eq!(
+            map.get("r2").unwrap().id,
+            r2_only.id,
+            "should return the only run for r2"
+        );
     }
 }
