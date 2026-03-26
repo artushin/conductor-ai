@@ -229,8 +229,8 @@ enum WorkflowCommands {
         /// Continue past step failures
         #[arg(long)]
         no_fail_fast: bool,
-        /// Step timeout in seconds (default: 1800 = 30 min)
-        #[arg(long, default_value = "1800")]
+        /// Step timeout in seconds (default: 43200 = 12 hours)
+        #[arg(long, default_value = "43200")]
         step_timeout_secs: u64,
         /// Input variables (key=value pairs)
         #[arg(long = "input", value_name = "KEY=VALUE")]
