@@ -61,6 +61,21 @@ pub fn resolve_script_path(
             if is_absolute {
                 return Some(candidate.clone());
             }
+            // Reject path traversal attempts.
+            if run.contains("..") {
+                continue;
+            }
+            // For paths under .conductor/ (the standard script location),
+            // allow symlinks that point outside the search root. This is
+            // intentional: .conductor/scripts/ entries are commonly symlinked
+            // to external sources (e.g., fsm-engine/scripts/). We skip
+            // canonicalization to avoid rejecting these valid symlinks.
+            if run.starts_with(".conductor/") {
+                return Some(candidate.clone());
+            }
+            // For other relative paths (bare filenames in working_dir, repo,
+            // or skills), apply the strict canonicalize-based containment
+            // check to block symlink escapes.
             if path_is_within_dir(root, candidate) {
                 return Some(candidate.clone());
             }
