@@ -1969,6 +1969,7 @@ mod tests {
             output: None,
             with: vec![],
             bot_name: None,
+            plugin_dirs: vec![],
         })
     }
 

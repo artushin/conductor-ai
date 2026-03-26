@@ -86,12 +86,21 @@ fn execute_call_with_schema(
         return Ok(());
     }
 
+    // Merge per-step plugin_dirs (from .wf) with repo-level extra_plugin_dirs.
+    let mut merged_plugin_dirs = state.extra_plugin_dirs.clone();
+    for dir in &node.plugin_dirs {
+        if !merged_plugin_dirs.contains(dir) {
+            merged_plugin_dirs.push(dir.clone());
+        }
+    }
+
     // Load agent definition
     let agent_def = crate::agent_config::load_agent(
         &state.working_dir,
         &state.repo_path,
         &AgentSpec::from(&node.agent),
         Some(&state.workflow_name),
+        &merged_plugin_dirs,
     )?;
     let agent_label = node.agent.label();
     let step_key = node.agent.step_key();
@@ -165,14 +174,6 @@ fn execute_call_with_schema(
             max_attempts,
             child_window,
         );
-
-        // Merge per-step plugin_dirs (from .wf) with repo-level extra_plugin_dirs.
-        let mut merged_plugin_dirs = state.extra_plugin_dirs.clone();
-        for dir in &node.plugin_dirs {
-            if !merged_plugin_dirs.contains(dir) {
-                merged_plugin_dirs.push(dir.clone());
-            }
-        }
 
         // Spawn in tmux
         if let Err(e) = crate::agent_runtime::spawn_child_tmux(
@@ -990,6 +991,7 @@ pub(super) fn execute_parallel(
             &state.repo_path,
             &AgentSpec::from(agent_ref),
             Some(&state.workflow_name),
+            &state.extra_plugin_dirs,
         )?;
 
         // Check per-call `if` condition: skip this call unless the named prior step

@@ -167,9 +167,16 @@ pub fn load_agent(
     repo_path: &str,
     agent_spec: &AgentSpec,
     workflow_name: Option<&str>,
+    extra_plugin_dirs: &[String],
 ) -> Result<AgentDef> {
     match agent_spec {
-        AgentSpec::Name(name) => load_agent_by_name(worktree_path, repo_path, name, workflow_name),
+        AgentSpec::Name(name) => load_agent_by_name(
+            worktree_path,
+            repo_path,
+            name,
+            workflow_name,
+            extra_plugin_dirs,
+        ),
         AgentSpec::Path(rel_path) => load_agent_by_path(repo_path, rel_path),
     }
 }
@@ -189,6 +196,7 @@ fn load_agent_by_name(
     repo_path: &str,
     name: &str,
     workflow_name: Option<&str>,
+    extra_plugin_dirs: &[String],
 ) -> Result<AgentDef> {
     let filename = format!("{name}.md");
     let bases = [worktree_path, repo_path];
@@ -214,14 +222,26 @@ fn load_agent_by_name(
         return parse_agent_file(&path);
     }
 
-    Err(ConductorError::AgentConfig(format!(
-        "Agent '{name}' not found. Searched:\n\
-         {}  .conductor/agents/{filename}\n  .claude/agents/{filename}",
-        if let Some(wf) = workflow_name {
-            format!("  .conductor/workflows/{wf}/agents/{filename}\n")
-        } else {
-            String::new()
+    // 4. Extra plugin directories (lowest priority)
+    for dir in extra_plugin_dirs {
+        let path = Path::new(dir).join("agents").join(&filename);
+        if path.is_file() {
+            return parse_agent_file(&path);
         }
+    }
+
+    let mut searched = String::new();
+    if let Some(wf) = workflow_name {
+        searched.push_str(&format!("  .conductor/workflows/{wf}/agents/{filename}\n"));
+    }
+    searched.push_str(&format!("  .conductor/agents/{filename}\n"));
+    searched.push_str(&format!("  .claude/agents/{filename}"));
+    for dir in extra_plugin_dirs {
+        searched.push_str(&format!("\n  {dir}/agents/{filename}"));
+    }
+
+    Err(ConductorError::AgentConfig(format!(
+        "Agent '{name}' not found. Searched:\n{searched}"
     )))
 }
 
@@ -286,20 +306,14 @@ pub fn find_missing_agents(
     specs
         .iter()
         .filter(|spec| {
-            if load_agent(worktree_path, repo_path, spec, workflow_name).is_ok() {
-                return false;
-            }
-            // Check extra plugin dirs: {dir}/agents/{name}.md
-            if let AgentSpec::Name(name) = spec {
-                let filename = format!("{name}.md");
-                for dir in extra_plugin_dirs {
-                    let path = std::path::Path::new(dir).join("agents").join(&filename);
-                    if path.is_file() {
-                        return false;
-                    }
-                }
-            }
-            true
+            load_agent(
+                worktree_path,
+                repo_path,
+                spec,
+                workflow_name,
+                extra_plugin_dirs,
+            )
+            .is_err()
         })
         .map(|spec| spec.label().to_string())
         .collect()
@@ -444,6 +458,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("plan".to_string()),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(def.prompt, "Repo-level plan agent.");
@@ -462,6 +477,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("plan".to_string()),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(def.prompt, "Worktree-level plan agent.");
@@ -500,6 +516,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("plan".to_string()),
             Some("ticket-to-pr"),
+            &[],
         )
         .unwrap();
         assert_eq!(def.prompt, "Workflow-local plan agent.");
@@ -514,6 +531,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("nonexistent".to_string()),
             None,
+            &[],
         );
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
@@ -539,6 +557,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("review".to_string()),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(def.prompt, "Claude Code review agent.");
@@ -563,6 +582,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("review".to_string()),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(def.prompt, "Worktree Claude Code review agent.");
@@ -595,6 +615,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("review".to_string()),
             None,
+            &[],
         )
         .unwrap();
         // Worktree .claude/agents should win over repo .claude/agents
@@ -628,6 +649,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Name("review".to_string()),
             None,
+            &[],
         )
         .unwrap();
         // Conductor shared agent should win over .claude/agents/
@@ -652,6 +674,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Path(".claude/agents/code-review.md".to_string()),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(def.prompt, "Explicit path review agent.");
@@ -666,6 +689,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Path(".claude/agents/nonexistent.md".to_string()),
             None,
+            &[],
         );
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
@@ -681,6 +705,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Path("/etc/passwd".to_string()),
             None,
+            &[],
         );
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
@@ -705,6 +730,7 @@ Implement the plan written in PLAN.md.
             repo.path().to_str().unwrap(),
             &AgentSpec::Path(evil_path),
             None,
+            &[],
         );
         // Either not found (file doesn't exist at that traversal path) or traversal rejected
         assert!(result.is_err());
@@ -896,6 +922,88 @@ Implement the plan written in PLAN.md.
         assert!(names.contains(&"implement"));
         assert!(names.contains(&"lint"));
         assert!(names.contains(&"review"));
+    }
+
+    #[test]
+    fn test_load_agent_via_extra_plugin_dirs() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let plugin = TempDir::new().unwrap();
+
+        // Agent only exists in the plugin directory
+        let plugin_agents = plugin.path().join("agents");
+        fs::create_dir_all(&plugin_agents).unwrap();
+        fs::write(
+            plugin_agents.join("executor.md"),
+            "---\nrole: actor\n---\nPlugin executor agent.",
+        )
+        .unwrap();
+
+        let plugin_dirs = vec![plugin.path().to_str().unwrap().to_string()];
+        let def = load_agent(
+            worktree.path().to_str().unwrap(),
+            repo.path().to_str().unwrap(),
+            &AgentSpec::Name("executor".to_string()),
+            None,
+            &plugin_dirs,
+        )
+        .unwrap();
+        assert_eq!(def.prompt, "Plugin executor agent.");
+    }
+
+    #[test]
+    fn test_load_agent_local_takes_precedence_over_plugin_dirs() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let plugin = TempDir::new().unwrap();
+
+        // Agent exists in both .conductor/agents/ and plugin dir
+        let conductor_agents = repo.path().join(".conductor").join("agents");
+        fs::create_dir_all(&conductor_agents).unwrap();
+        fs::write(
+            conductor_agents.join("executor.md"),
+            "---\nrole: actor\n---\nLocal conductor executor.",
+        )
+        .unwrap();
+
+        let plugin_agents = plugin.path().join("agents");
+        fs::create_dir_all(&plugin_agents).unwrap();
+        fs::write(
+            plugin_agents.join("executor.md"),
+            "---\nrole: actor\n---\nPlugin executor agent.",
+        )
+        .unwrap();
+
+        let plugin_dirs = vec![plugin.path().to_str().unwrap().to_string()];
+        let def = load_agent(
+            worktree.path().to_str().unwrap(),
+            repo.path().to_str().unwrap(),
+            &AgentSpec::Name("executor".to_string()),
+            None,
+            &plugin_dirs,
+        )
+        .unwrap();
+        // Local .conductor/agents/ should win over plugin dirs
+        assert_eq!(def.prompt, "Local conductor executor.");
+    }
+
+    #[test]
+    fn test_load_agent_not_found_error_includes_plugin_dirs() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+
+        let plugin_dirs = vec!["/some/plugin/dir".to_string()];
+        let result = load_agent(
+            worktree.path().to_str().unwrap(),
+            repo.path().to_str().unwrap(),
+            &AgentSpec::Name("nonexistent".to_string()),
+            None,
+            &plugin_dirs,
+        );
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("not found"));
+        assert!(err.contains("/some/plugin/dir/agents/nonexistent.md"));
     }
 
     #[test]
