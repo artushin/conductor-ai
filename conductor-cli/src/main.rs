@@ -504,6 +504,17 @@ enum TicketCommands {
         /// Filter by repo slug
         repo: Option<String>,
     },
+    /// Get a single ticket by ID (ULID or source_id)
+    Get {
+        /// Ticket ID — internal ULID or source_id (falls back to source_id search)
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Output format: "text" (default) or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Link a ticket to a worktree
     Link {
         /// Ticket source ID (e.g., GitHub issue number)
@@ -1256,9 +1267,60 @@ fn main() -> Result<()> {
                 } else {
                     for t in tickets {
                         println!(
-                            "  {} #{} — {} [{}]",
-                            t.source_type, t.source_id, t.title, t.state
+                            "  {} #{} \u{2014} {} [{}] (id: {})",
+                            t.source_type, t.source_id, t.title, t.state, t.id
                         );
+                    }
+                }
+            }
+            TicketCommands::Get { id, json, format } => {
+                let syncer = TicketSyncer::new(&conn);
+                let use_json = json || format == "json";
+
+                // Strip leading '#' for source_id fallback (e.g. "#42" -> "42")
+                let bare_id = id.strip_prefix('#').unwrap_or(&id);
+
+                // Try ULID lookup first, fall back to source_id
+                let ticket = syncer
+                    .get_by_id(bare_id)
+                    .or_else(|_| syncer.get_by_source_id_any_repo(bare_id))?;
+
+                if use_json {
+                    let mut value = serde_json::to_value(&ticket)
+                        .context("failed to serialize ticket")?;
+                    if let Some(am_str) = ticket.agent_map.as_deref() {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(am_str) {
+                            value["agent_map"] = parsed;
+                        }
+                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("ID:          {}", ticket.id);
+                    println!("Source:      {} #{}", ticket.source_type, ticket.source_id);
+                    println!("Title:       {}", ticket.title);
+                    println!("State:       {}", ticket.state);
+                    println!("Labels:      {}", ticket.labels);
+                    println!(
+                        "Assignee:    {}",
+                        ticket.assignee.as_deref().unwrap_or("\u{2014}")
+                    );
+                    println!(
+                        "Priority:    {}",
+                        ticket.priority.as_deref().unwrap_or("\u{2014}")
+                    );
+                    println!("URL:         {}", ticket.url);
+                    println!(
+                        "Workflow:    {}",
+                        ticket.workflow.as_deref().unwrap_or("\u{2014}")
+                    );
+                    println!(
+                        "Agent Map:   {}",
+                        ticket.agent_map.as_deref().unwrap_or("\u{2014}")
+                    );
+                    println!("Synced At:   {}", ticket.synced_at);
+                    if !ticket.body.is_empty() {
+                        println!();
+                        println!("{}", ticket.body);
                     }
                 }
             }

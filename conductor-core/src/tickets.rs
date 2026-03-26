@@ -351,6 +351,24 @@ impl<'a> TicketSyncer<'a> {
             })
     }
 
+    /// Fetch a single ticket by source_id across all repos.
+    /// Returns the first match. Use when the caller does not know the repo_id.
+    pub fn get_by_source_id_any_repo(&self, source_id: &str) -> Result<Ticket> {
+        self.conn
+            .query_row(
+                "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
+                 FROM tickets WHERE source_id = ?1 LIMIT 1",
+                params![source_id],
+                map_ticket_row,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
+                    id: source_id.to_string(),
+                },
+                _ => ConductorError::Database(e),
+            })
+    }
+
     /// Fetch a single ticket by its internal (ULID) ID.
     pub fn get_by_id(&self, ticket_id: &str) -> Result<Ticket> {
         self.conn
