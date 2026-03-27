@@ -32,11 +32,16 @@ pub mod agent_runtime;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod feature;
+pub(crate) mod git;
 pub mod github;
 pub mod github_app;
+pub mod hooks;
 pub mod issue_source;
 pub mod jira_acli;
 pub mod models;
+pub mod notification_manager;
+pub mod notify;
 pub mod orchestrator;
 pub mod prompt_config;
 pub mod repo;
@@ -47,7 +52,13 @@ pub mod workflow;
 pub mod workflow_config;
 pub(crate) mod workflow_dsl;
 pub mod workflow_ephemeral;
+pub mod workflow_template;
 pub mod worktree;
 
-#[cfg(test)]
+/// Generate a new ULID-based unique ID string.
+pub fn new_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;

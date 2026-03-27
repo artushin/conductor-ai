@@ -1,14 +1,14 @@
-use conductor_core::agent::AgentRunStatus;
 use conductor_core::tickets::TicketLabel;
-use conductor_core::workflow::WorkflowRunStatus;
+use conductor_core::workflow::GateType;
 use conductor_core::worktree::{Worktree, WorktreeStatus};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::state::{AppState, GlobalStatusItem, View};
+use crate::state::{AppState, View};
+use crate::theme::Theme;
 
 /// Parse a 6-digit hex color string (with or without `#`) into `Color::Rgb`.
 /// Falls back to `Color::DarkGray` on any parse error.
@@ -53,7 +53,10 @@ pub fn label_fg(bg: Color) -> Color {
 }
 
 /// Build compact fg-only label spans for a ticket row (up to 3 labels + `+N` overflow).
-pub fn ticket_label_spans_compact(labels: &[TicketLabel]) -> Vec<Span<'static>> {
+pub fn ticket_label_spans_compact(
+    labels: &[TicketLabel],
+    theme: &crate::theme::Theme,
+) -> Vec<Span<'static>> {
     if labels.is_empty() {
         return Vec::new();
     }
@@ -64,7 +67,7 @@ pub fn ticket_label_spans_compact(labels: &[TicketLabel]) -> Vec<Span<'static>> 
             .color
             .as_deref()
             .map(hex_to_color)
-            .unwrap_or(Color::DarkGray);
+            .unwrap_or(theme.label_secondary);
         spans.push(Span::raw("  "));
         spans.push(Span::styled(lbl.label.clone(), Style::default().fg(color)));
         shown += 1;
@@ -73,255 +76,50 @@ pub fn ticket_label_spans_compact(labels: &[TicketLabel]) -> Vec<Span<'static>> 
     if remaining > 0 {
         spans.push(Span::styled(
             format!(" +{remaining}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.label_secondary),
         ));
     }
     spans
 }
 
-pub fn render_header(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    gs: &crate::state::GlobalStatus,
-) {
-    let total_active = gs.total_active();
-
-    if area.height >= 2 {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
-        render_header_summary(frame, rows[0], state, total_active, gs);
-        render_header_detail(
-            frame,
-            rows[1],
-            gs,
-            state.status_bar_expanded,
-            total_active,
-            &state.theme,
-        );
-    } else {
-        render_header_summary(frame, area, state, total_active, gs);
-    }
-}
-
-fn render_header_summary(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    total_active: usize,
-    gs: &crate::state::GlobalStatus,
-) {
-    let view_name = match state.view {
-        View::Dashboard => "Dashboard",
-        View::RepoDetail => "Repo Detail",
-        View::WorktreeDetail => "Worktree Detail",
-        View::Tickets => "Tickets",
-        View::Workflows => "Workflows",
-        View::WorkflowRunDetail => "Workflow Run",
-    };
-
-    let theme = &state.theme;
-    let mut spans = vec![
-        Span::styled(
-            " Conductor ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme.border_focused)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {view_name}"),
-            Style::default()
-                .fg(theme.border_focused)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-
-    if total_active > 0 {
-        spans.push(Span::raw("   "));
-
-        // Waiting items (magenta) — highest priority
-        let waiting = gs.waiting_agents + gs.waiting_workflows;
-        if waiting > 0 {
-            spans.push(Span::styled(
-                format!("⏸ {waiting} waiting"),
-                Style::default()
-                    .fg(theme.status_waiting)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            if gs.running_agents + gs.running_workflows > 0 {
-                spans.push(Span::raw("  "));
-            }
-        }
-
-        // Running items (yellow)
-        let running = gs.running_agents + gs.running_workflows;
-        if running > 0 {
-            spans.push(Span::styled(
-                format!("● {running} running"),
-                Style::default().fg(theme.status_running),
-            ));
-        }
-
-        // For 4+ items show a toggle hint
-        if total_active > 3 {
-            spans.push(Span::raw("  "));
-            let hint = if state.status_bar_expanded {
-                "!:collapse"
-            } else {
-                "!:expand"
-            };
-            spans.push(Span::styled(
-                hint,
-                Style::default().fg(theme.label_secondary),
-            ));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn render_header_detail(
-    frame: &mut Frame,
-    area: Rect,
-    gs: &crate::state::GlobalStatus,
-    expanded: bool,
-    total_active: usize,
-    theme: &crate::theme::Theme,
-) {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-
-    let limit = if total_active > 3 && expanded {
-        gs.active_items.len()
-    } else {
-        gs.active_items.len().min(3)
-    };
-
-    for (i, item) in gs.active_items.iter().take(limit).enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        match item {
-            GlobalStatusItem::Agent {
-                worktree_slug,
-                status,
-                elapsed_secs,
-            } => {
-                let (symbol, color) = match status {
-                    AgentRunStatus::WaitingForFeedback => ("⏸", theme.status_waiting),
-                    AgentRunStatus::Running => ("●", theme.status_running),
-                    _ => ("○", theme.label_secondary),
-                };
-                let label = if matches!(status, AgentRunStatus::Running) && *elapsed_secs > 0 {
-                    let elapsed_str = if *elapsed_secs < 60 {
-                        format!("{}s", elapsed_secs)
-                    } else {
-                        format!("{}m", elapsed_secs / 60)
-                    };
-                    format!("{symbol} {worktree_slug} ({elapsed_str})")
-                } else {
-                    format!("{symbol} {worktree_slug}")
-                };
-                spans.push(Span::styled(label, Style::default().fg(color)));
-            }
-            GlobalStatusItem::Workflow {
-                context_label,
-                status,
-                elapsed_secs,
-                current_step,
-                workflow_chain,
-            } => {
-                let (symbol, color) = match status {
-                    WorkflowRunStatus::Waiting => ("⏸", theme.status_waiting),
-                    WorkflowRunStatus::Running => ("⚙", theme.label_accent),
-                    _ => ("○", theme.label_secondary),
-                };
-                // For running/waiting workflows, build the full chain breadcrumb.
-                let label = if matches!(
-                    status,
-                    WorkflowRunStatus::Running | WorkflowRunStatus::Waiting
-                ) {
-                    build_workflow_breadcrumb(
-                        context_label,
-                        workflow_chain,
-                        current_step.as_deref(),
-                        0,
-                        *elapsed_secs,
-                        symbol,
-                    )
-                } else {
-                    format!("{symbol} {context_label}")
-                };
-                spans.push(Span::styled(label, Style::default().fg(color)));
-            }
-        }
-    }
-
-    // Show overflow indicator if items were truncated
-    if gs.active_items.len() > limit {
-        let overflow = gs.active_items.len() - limit;
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("+{overflow} more  !:expand"),
-            Style::default().fg(theme.label_secondary),
-        ));
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
+pub fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let msg = if let Some(f) = state.active_filter() {
         format!("/{} ", f.text)
     } else if let Some(ref msg) = state.status_message {
         msg.clone()
     } else {
-        match state.view {
-            View::Dashboard => {
-                "Tab:panel  j/k:nav  Enter:select  a:add repo  c:create  s:sync  ?:help  q:quit"
-                    .to_string()
-            }
-            View::RepoDetail => {
-                "j/k:nav  Enter:select  c:create  d:remove  S:sources  Esc:back  ?:help".to_string()
-            }
-            View::WorktreeDetail => {
-                let has_running = state
-                    .selected_worktree_id
-                    .as_ref()
-                    .and_then(|wt_id| state.data.latest_agent_runs.get(wt_id))
-                    .is_some_and(|run| run.is_active());
-                if has_running {
-                    "p:prompt  x:stop  w:workflow  Esc:back  ?:help".to_string()
-                } else {
-                    "p:prompt  O:orchestrate  w:workflow  d:delete  Esc:back  ?:help".to_string()
-                }
-            }
-            View::Tickets => "j/k:nav  /:filter  Esc:back  ?:help".to_string(),
-            View::Workflows => {
-                "Tab:panel  j/k:nav  Enter:select  r:run  Esc:back  ?:help".to_string()
-            }
-            View::WorkflowRunDetail => {
-                let has_gate = state
-                    .data
-                    .workflow_steps
-                    .iter()
-                    .any(|s| s.status.to_string() == "waiting" && s.gate_type.is_some());
-                if has_gate {
-                    "j/k:nav  Enter:detail  g:gate  w:workflow  x:cancel  Esc:back  ?:help"
-                        .to_string()
-                } else {
-                    "j/k:nav  Enter:detail  w:workflow  x:cancel  Esc:back  ?:help".to_string()
-                }
-            }
-        }
+        let view_name = match state.view {
+            View::Dashboard => "Dashboard",
+            View::RepoDetail => "Repo Detail",
+            View::WorktreeDetail => "Worktree Detail",
+            View::WorkflowRunDetail => "Workflow Run",
+            View::WorkflowDefDetail => "Workflow Definition",
+        };
+        format!("[{view_name}]  Tab:panel  [/]:column  \\:workflows  q:quit")
     };
 
-    let bar = Paragraph::new(Line::from(Span::styled(
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Notification indicator
+    if state.unread_notification_count > 0 {
+        spans.push(Span::styled(
+            format!("\u{1F514} {} ", state.unread_notification_count),
+            Style::default()
+                .fg(state.theme.label_warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " ",
+            Style::default().fg(state.theme.label_secondary),
+        ));
+    }
+
+    spans.push(Span::styled(
         msg,
         Style::default().fg(state.theme.label_secondary),
-    )));
+    ));
+
+    let bar = Paragraph::new(Line::from(spans));
     frame.render_widget(bar, area);
 }
 
@@ -330,27 +128,19 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// Both the dashboard and repo-detail worktree panes use this so the
 /// format stays consistent.  Pass `repo_prefix` to prepend the repo
 /// slug (dashboard style) and `show_branch` to append the branch name
-/// (repo-detail style).
-pub fn worktree_list_item(
-    wt: &Worktree,
-    state: &AppState,
-    repo_prefix: Option<&str>,
-    show_branch: bool,
-) -> ListItem<'static> {
-    worktree_list_item_with_prefix(wt, state, repo_prefix, show_branch, "")
-}
-
+/// (repo-detail style).  `list_prefix` is prepended as-is (used for
+/// tree-indent connectors).
 pub fn worktree_list_item_with_prefix(
     wt: &Worktree,
     state: &AppState,
     repo_prefix: Option<&str>,
     show_branch: bool,
-    list_prefix: &'static str,
+    list_prefix: &str,
 ) -> ListItem<'static> {
     let is_active = wt.is_active();
     let status_color = match wt.status {
         WorktreeStatus::Active => state.theme.status_completed,
-        WorktreeStatus::Merged => Color::Blue,
+        WorktreeStatus::Merged => state.theme.label_info,
         WorktreeStatus::Abandoned => state.theme.status_failed,
     };
     let text_style = if is_active {
@@ -362,7 +152,7 @@ pub fn worktree_list_item_with_prefix(
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     if !list_prefix.is_empty() {
-        spans.push(Span::raw(list_prefix));
+        spans.push(Span::raw(list_prefix.to_string()));
     }
 
     if let Some(prefix) = repo_prefix {
@@ -372,8 +162,105 @@ pub fn worktree_list_item_with_prefix(
         ));
     }
 
-    // In repo-detail context (show_branch=true): show branch as primary identifier.
-    // In dashboard context (show_branch=false): show slug as before.
+    // Ticket state icon + number — moved to front so it's visible before the slug.
+    // ○ = open, ● = closed, ◉ = in_progress
+    if let Some(ticket) = wt
+        .ticket_id
+        .as_ref()
+        .and_then(|tid| state.data.ticket_map.get(tid))
+    {
+        let (icon, ticket_state_color) = match ticket.state.as_str() {
+            "open" => ("○", state.theme.status_completed),
+            "closed" => ("●", state.theme.label_secondary),
+            "in_progress" => ("◉", state.theme.status_running),
+            _ => ("·", state.theme.label_primary),
+        };
+        spans.push(Span::styled(
+            format!("{} #{}  ", icon, ticket.source_id),
+            Style::default().fg(ticket_state_color),
+        ));
+    }
+
+    // Non-active status badge — also surfaced before the slug.
+    if !is_active {
+        spans.push(Span::styled(
+            format!("[{}]  ", wt.status),
+            Style::default().fg(status_color),
+        ));
+    }
+
+    // Combined status symbol + workflow name/step — surfaced before the slug.
+    // Agent takes symbol precedence over workflow; workflow name provides the label text.
+    use conductor_core::agent::AgentRunStatus;
+    use conductor_core::workflow::WorkflowRunStatus;
+    let agent_run = state.data.latest_agent_runs.get(&wt.id);
+    let wf_run = state.data.latest_workflow_runs_by_worktree.get(&wt.id);
+
+    // Symbol priority: an active workflow run (Running/Waiting) always wins so the
+    // root-level status is shown even when an agent step has already completed.
+    // Agent status wins only when no active workflow run is present.
+    let wf_active = wf_run.is_some_and(|wf| {
+        matches!(
+            wf.status,
+            WorkflowRunStatus::Running | WorkflowRunStatus::Waiting
+        )
+    });
+    let status_symbol: Option<(&'static str, ratatui::style::Color)> = if wf_active {
+        wf_run.and_then(|wf| match wf.status {
+            WorkflowRunStatus::Running => Some(("⚙", state.theme.label_accent)),
+            WorkflowRunStatus::Waiting => Some(("⏸", state.theme.status_waiting)),
+            _ => None,
+        })
+    } else if let Some(run) = agent_run {
+        Some(match run.status {
+            AgentRunStatus::Running => ("⚙", state.theme.status_running),
+            AgentRunStatus::WaitingForFeedback => ("⏸", state.theme.status_waiting),
+            AgentRunStatus::Completed => ("✓", state.theme.status_completed),
+            AgentRunStatus::Failed => ("✗", state.theme.status_failed),
+            AgentRunStatus::Cancelled => ("⊘", state.theme.status_cancelled),
+        })
+    } else {
+        wf_run.and_then(|wf| match wf.status {
+            WorkflowRunStatus::Running => Some(("⚙", state.theme.label_accent)),
+            WorkflowRunStatus::Waiting => Some(("⏸", state.theme.status_waiting)),
+            WorkflowRunStatus::Completed => Some(("✓", state.theme.label_secondary)),
+            WorkflowRunStatus::Failed => Some(("✗", state.theme.status_failed)),
+            _ => None,
+        })
+    };
+
+    // Workflow label text (no symbol): "name › step" when active, "name" otherwise.
+    let wf_label: Option<String> = wf_run.and_then(|wf| match wf.status {
+        WorkflowRunStatus::Pending | WorkflowRunStatus::Cancelled => None,
+        _ => {
+            let is_active = matches!(
+                wf.status,
+                WorkflowRunStatus::Running | WorkflowRunStatus::Waiting
+            );
+            Some(if is_active {
+                state
+                    .data
+                    .workflow_step_summaries
+                    .get(&wf.id)
+                    .map(|s| format!("{} › {}", wf.workflow_name, s.step_name))
+                    .unwrap_or_else(|| wf.workflow_name.clone())
+            } else {
+                wf.workflow_name.clone()
+            })
+        }
+    });
+
+    if let Some((symbol, color)) = status_symbol {
+        let text = match &wf_label {
+            Some(label) => format!("{symbol} {label}  "),
+            None => format!("{symbol}  "),
+        };
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+
+    // Slug or branch — trailing identifier.
+    // In repo-detail context (show_branch=true): show branch name.
+    // In dashboard context (show_branch=false): show slug.
     if show_branch {
         spans.push(Span::styled(
             wt.branch.clone(),
@@ -394,107 +281,7 @@ pub fn worktree_list_item_with_prefix(
         ));
     }
 
-    // Only show status badge for non-active worktrees ([active] is never informative).
-    if !is_active {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("[{}]", wt.status),
-            Style::default().fg(status_color),
-        ));
-    }
-
-    if let Some(ticket) = wt
-        .ticket_id
-        .as_ref()
-        .and_then(|tid| state.data.ticket_map.get(tid))
-    {
-        let ticket_state_color = match ticket.state.as_str() {
-            "open" => state.theme.status_completed,
-            "closed" => state.theme.label_secondary,
-            "in_progress" => state.theme.status_running,
-            _ => state.theme.label_primary,
-        };
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("#{} {}", ticket.source_id, ticket.state),
-            Style::default().fg(ticket_state_color),
-        ));
-    }
-
-    use conductor_core::agent::AgentRunStatus;
-    let agent_run = state.data.latest_agent_runs.get(&wt.id);
-
-    if let Some(run) = agent_run {
-        let (symbol, color) = match run.status {
-            AgentRunStatus::Running => ("● running", state.theme.status_running),
-            AgentRunStatus::WaitingForFeedback => {
-                ("⏸ waiting for feedback", state.theme.status_waiting)
-            }
-            AgentRunStatus::Completed => ("✓ completed", state.theme.status_completed),
-            AgentRunStatus::Failed => ("✗ failed", state.theme.status_failed),
-            AgentRunStatus::Cancelled => ("○ cancelled", state.theme.status_cancelled),
-        };
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(symbol, Style::default().fg(color)));
-    }
-
-    let has_active_agent = agent_run.is_some_and(|r| {
-        matches!(
-            r.status,
-            AgentRunStatus::Running | AgentRunStatus::WaitingForFeedback
-        )
-    });
-
-    if let Some(wf_run) = state.data.latest_workflow_runs_by_worktree.get(&wt.id) {
-        use conductor_core::workflow::WorkflowRunStatus;
-        let (symbol, color) = match wf_run.status {
-            WorkflowRunStatus::Running => ("⚙ running", state.theme.label_accent),
-            WorkflowRunStatus::Waiting => ("⏸ waiting", state.theme.status_waiting),
-            WorkflowRunStatus::Completed => ("✓", state.theme.label_secondary),
-            WorkflowRunStatus::Failed => ("✗ failed", state.theme.status_failed),
-            WorkflowRunStatus::Pending | WorkflowRunStatus::Cancelled => {
-                ("", state.theme.label_secondary)
-            }
-        };
-        if !symbol.is_empty() {
-            let is_wf_active = matches!(
-                wf_run.status,
-                WorkflowRunStatus::Running | WorkflowRunStatus::Waiting
-            );
-            // When both an agent and workflow are active, suppress the ⚙ symbol —
-            // the agent's ● already covers status. Build a compact "name › step" label.
-            let label = if is_wf_active && has_active_agent {
-                state
-                    .data
-                    .workflow_step_summaries
-                    .get(&wf_run.id)
-                    .map(|s| format!("{} › {}", wf_run.workflow_name, s.step_name))
-                    .unwrap_or_else(|| wf_run.workflow_name.clone())
-            } else if is_wf_active {
-                state
-                    .data
-                    .workflow_step_summaries
-                    .get(&wf_run.id)
-                    .map(|s| {
-                        build_workflow_breadcrumb(
-                            &wf_run.workflow_name,
-                            &s.workflow_chain,
-                            Some(&s.step_name),
-                            s.iteration,
-                            0,
-                            symbol,
-                        )
-                    })
-                    .unwrap_or_else(|| format!("{symbol} {}", wf_run.workflow_name))
-            } else {
-                format!("{symbol} {}", wf_run.workflow_name)
-            };
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(label, Style::default().fg(color)));
-        }
-    }
-
-    // Append token counts at end for active agent runs.
+    // Token counts at end for active agent runs.
     if let Some(run) = agent_run {
         if matches!(
             run.status,
@@ -510,123 +297,6 @@ pub fn worktree_list_item_with_prefix(
     }
 
     ListItem::new(Line::from(spans))
-}
-
-/// Build a workflow step breadcrumb label string.
-///
-/// Produces a string of the form:
-/// `"{symbol} context_label  name1 > name2 > … > {iter_prefix}step_name ({elapsed}s)"`.
-///
-/// The result is capped at `MAX_LABEL` (80) characters; leading workflow names
-/// are dropped one-by-one with a `"..."` prefix when needed, and the step name
-/// itself is truncated as a last resort.
-///
-/// - `context_label` — label prefix (worktree slug, repo slug, or `#N` ticket ref).
-/// - `workflow_chain` — ordered parent workflow names (root → immediate parent).
-///   Empty for single-level (non-nested) workflows.
-/// - `step_name` — currently-running step name; `None` if unknown (returns
-///   `"{symbol} {context_label}"`).
-/// - `iteration` — loop iteration count (0 = first pass, omit prefix when 0).
-/// - `elapsed_secs` — seconds since the current step started (0 = omit elapsed).
-/// - `symbol` — prefix symbol (e.g. `"⚙"`, `"⏸"`).
-pub fn build_workflow_breadcrumb(
-    context_label: &str,
-    workflow_chain: &[String],
-    step_name: Option<&str>,
-    iteration: i64,
-    elapsed_secs: u64,
-    symbol: &str,
-) -> String {
-    let Some(step) = step_name else {
-        return format!("{symbol} {context_label}");
-    };
-
-    const MAX_LABEL: usize = 80;
-
-    let iter_prefix = if iteration > 0 {
-        format!("(iter {}) ", iteration)
-    } else {
-        String::new()
-    };
-
-    let elapsed_suffix = if elapsed_secs > 0 {
-        let elapsed_str = if elapsed_secs < 60 {
-            format!("{}s", elapsed_secs)
-        } else {
-            format!("{}m", elapsed_secs / 60)
-        };
-        format!(" ({elapsed_str})")
-    } else {
-        String::new()
-    };
-
-    let symbol_prefix = format!("{symbol} {context_label}  ");
-
-    if !workflow_chain.is_empty() {
-        // Assemble all workflow-name parts followed by the step name.
-        // workflow_chain holds [root, …parents]; step is the final segment.
-        // Prepend context_label so the output is:
-        //   "{symbol} context_label  chain > … > step (elapsed)"
-        let all_names: Vec<&str> = workflow_chain
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once(step))
-            .collect();
-
-        let mut remaining = all_names.as_slice();
-        loop {
-            let (prefix_part, step_part) = remaining.split_at(remaining.len() - 1);
-            let step_str = format!("{iter_prefix}{}{elapsed_suffix}", step_part[0]);
-            let joined_names: Vec<&str> = prefix_part
-                .iter()
-                .copied()
-                .chain(std::iter::once(step_str.as_str()))
-                .collect();
-            let omitted = all_names.len() - remaining.len();
-            let candidate = if omitted > 0 {
-                format!("{symbol_prefix}... > {}", joined_names.join(" > "))
-            } else {
-                format!("{symbol_prefix}{}", joined_names.join(" > "))
-            };
-            if candidate.chars().count() <= MAX_LABEL || remaining.len() <= 1 {
-                if candidate.chars().count() <= MAX_LABEL {
-                    return candidate;
-                }
-                // Truncate step name.
-                let overhead = candidate.chars().count() - step_str.chars().count();
-                let available = MAX_LABEL.saturating_sub(overhead + 1);
-                let truncated: String = step_str.chars().take(available).collect();
-                let base = if omitted > 0 {
-                    format!(
-                        "{symbol_prefix}... > {}",
-                        joined_names[..joined_names.len() - 1].join(" > ")
-                    )
-                } else if joined_names.len() > 1 {
-                    format!(
-                        "{symbol_prefix}{}",
-                        joined_names[..joined_names.len() - 1].join(" > ")
-                    )
-                } else {
-                    symbol_prefix.clone()
-                };
-                let sep = if base.ends_with(' ') { "" } else { " > " };
-                return format!("{base}{sep}{truncated}…");
-            }
-            remaining = &remaining[1..];
-        }
-    } else {
-        // Single-level workflow: "{symbol} {context_label} > {iter_prefix}step_name{elapsed_suffix}"
-        let base = format!("{symbol} {context_label} > {iter_prefix}");
-        let base_chars = base.chars().count();
-        let step_with_elapsed = format!("{step}{elapsed_suffix}");
-        if base_chars + step_with_elapsed.chars().count() <= MAX_LABEL {
-            format!("{base}{step_with_elapsed}")
-        } else {
-            let available = MAX_LABEL.saturating_sub(base_chars + 1);
-            let truncated: String = step.chars().take(available).collect();
-            format!("{base}{truncated}…")
-        }
-    }
 }
 
 /// Build a single worktree-indicator dot span for a ticket row.
@@ -689,6 +359,75 @@ pub fn ticket_agent_total_spans(
     )]
 }
 
+/// Return the canonical (icon, color) pair for a gate type.
+///
+/// Used by both the pending-gates panel and the workflow run list to ensure
+/// consistent iconography across views.
+pub fn gate_type_icon(gate_type: Option<&GateType>, theme: &Theme) -> (&'static str, Color) {
+    match gate_type {
+        Some(GateType::PrChecks) => ("⏳", theme.status_waiting),
+        Some(GateType::PrApproval | GateType::HumanApproval | GateType::HumanReview) => {
+            ("👤", theme.label_warning)
+        }
+        Some(GateType::QualityGate) => ("🔍", theme.status_waiting),
+        None => ("⏸", theme.status_waiting),
+    }
+}
+
+/// Format an ISO 8601 timestamp as a compact elapsed duration string.
+///
+/// Returns strings like `"3m"`, `"1h 20m"`, `"2d 5h"`.
+/// Returns an empty string if parsing fails or the timestamp is in the future.
+pub fn format_elapsed(started_at: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(started_at).or_else(|_| {
+        // Also accept "YYYY-MM-DD HH:MM:SS" (no timezone) as UTC
+        let with_tz = format!("{started_at}Z")
+            .replace(' ', "T")
+            .replace("ZZ", "Z");
+        chrono::DateTime::parse_from_rfc3339(&with_tz)
+    });
+
+    let Ok(started) = parsed else {
+        return String::new();
+    };
+
+    let now = chrono::Utc::now();
+    let elapsed = now.signed_duration_since(started);
+    if elapsed.num_seconds() <= 0 {
+        return String::new();
+    }
+
+    format_duration_compact(elapsed)
+}
+
+/// Format a chrono Duration as a compact human-readable string.
+fn format_duration_compact(elapsed: chrono::Duration) -> String {
+    let total_secs = elapsed.num_seconds();
+    let mins = total_secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+
+    if days > 0 {
+        let remaining_hours = hours % 24;
+        if remaining_hours > 0 {
+            format!("{days}d {remaining_hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        let remaining_mins = mins % 60;
+        if remaining_mins > 0 {
+            format!("{hours}h {remaining_mins}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "<1m".to_string()
+    }
+}
+
 /// Truncate a string to at most `max` characters, appending "…" if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -696,5 +435,153 @@ pub fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_elapsed_minutes() {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(3)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "3m");
+    }
+
+    #[test]
+    fn format_elapsed_hours_and_minutes() {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(80)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "1h 20m");
+    }
+
+    #[test]
+    fn format_elapsed_days_and_hours() {
+        let ts = (chrono::Utc::now() - chrono::Duration::hours(53)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "2d 5h");
+    }
+
+    #[test]
+    fn format_elapsed_less_than_one_minute() {
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "<1m");
+    }
+
+    #[test]
+    fn format_elapsed_future_timestamp_returns_empty() {
+        let ts = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(format_elapsed(&ts), "");
+    }
+
+    #[test]
+    fn format_elapsed_invalid_input_returns_empty() {
+        assert_eq!(format_elapsed("not-a-date"), "");
+        assert_eq!(format_elapsed(""), "");
+    }
+
+    #[test]
+    fn format_elapsed_fractional_seconds() {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert_eq!(format_elapsed(&ts), "5m");
+    }
+
+    #[test]
+    fn format_elapsed_with_timezone_offset() {
+        // Use a fixed offset timestamp that is ~2 hours ago
+        let now = chrono::Utc::now();
+        let two_hours_ago = now - chrono::Duration::hours(2);
+        let offset = chrono::FixedOffset::east_opt(5 * 3600).unwrap();
+        let with_offset = two_hours_ago.with_timezone(&offset).to_rfc3339();
+        assert_eq!(format_elapsed(&with_offset), "2h");
+    }
+
+    // ── fmt_tokens_k ────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_tokens_k_below_1000() {
+        assert_eq!(fmt_tokens_k(0), "0");
+        assert_eq!(fmt_tokens_k(999), "999");
+    }
+
+    #[test]
+    fn fmt_tokens_k_at_1000() {
+        assert_eq!(fmt_tokens_k(1000), "1.0k");
+    }
+
+    #[test]
+    fn fmt_tokens_k_large() {
+        assert_eq!(fmt_tokens_k(12500), "12.5k");
+        assert_eq!(fmt_tokens_k(100000), "100.0k");
+    }
+
+    // ── hex_to_color ────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_to_color_six_digit() {
+        assert_eq!(hex_to_color("#ff0000"), Color::Rgb(255, 0, 0));
+        assert_eq!(hex_to_color("00ff00"), Color::Rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn hex_to_color_three_digit_shorthand() {
+        assert_eq!(hex_to_color("#f00"), Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn hex_to_color_invalid_fallback() {
+        // Empty and wrong-length strings return DarkGray
+        assert_eq!(hex_to_color(""), Color::DarkGray);
+        assert_eq!(hex_to_color("12345"), Color::DarkGray);
+        assert_eq!(hex_to_color("1"), Color::DarkGray);
+    }
+
+    // ── label_fg ────────────────────────────────────────────────────────
+
+    #[test]
+    fn label_fg_dark_bg_returns_white() {
+        assert_eq!(label_fg(Color::Rgb(0, 0, 0)), Color::White);
+    }
+
+    #[test]
+    fn label_fg_light_bg_returns_black() {
+        assert_eq!(label_fg(Color::Rgb(255, 255, 255)), Color::Black);
+    }
+
+    #[test]
+    fn label_fg_non_rgb_returns_white() {
+        assert_eq!(label_fg(Color::Blue), Color::White);
+    }
+
+    // ── truncate ────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        let result = truncate("hello world this is long", 10);
+        assert!(result.ends_with("..."));
+        assert!(result.chars().count() <= 10);
+    }
+
+    // ── format_duration_compact ─────────────────────────────────────────
+
+    #[test]
+    fn format_duration_exact_hours() {
+        let d = chrono::Duration::hours(3);
+        assert_eq!(format_duration_compact(d), "3h");
+    }
+
+    #[test]
+    fn format_duration_exact_days() {
+        let d = chrono::Duration::days(2);
+        assert_eq!(format_duration_compact(d), "2d");
     }
 }

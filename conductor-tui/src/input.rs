@@ -1,7 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action::Action;
-use crate::state::{AppState, Modal, View, WorktreeDetailFocus};
+use crate::state::{
+    AppState, ColumnFocus, Modal, View, WorkflowRunDetailFocus, WorktreeDetailFocus,
+};
 
 /// Map a key event to an action based on the current app state.
 /// Priority: Modal > Filter > Normal keybindings.
@@ -58,6 +60,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 KeyCode::Tab => Action::FormNextField,
                 KeyCode::BackTab => Action::FormPrevField,
                 KeyCode::Backspace => Action::FormBackspace,
+                KeyCode::Char(' ') => Action::FormToggle,
                 KeyCode::Char(c) => Action::FormChar(c),
                 _ => Action::None,
             };
@@ -85,8 +88,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 KeyCode::Char('h') | KeyCode::Left => Action::ScrollLeft,
                 KeyCode::Char('l') | KeyCode::Right => Action::ScrollRight,
                 KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
-                KeyCode::Char('g') if state.pending_g => Action::GoToTop,
-                KeyCode::Char('g') => Action::PendingG,
+                KeyCode::Char('g') => Action::GoToTop,
                 KeyCode::Home => Action::GoToTop,
                 _ => Action::None,
             };
@@ -108,6 +110,8 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
                 KeyCode::Enter => Action::InputSubmit,
                 KeyCode::Backspace => Action::InputBackspace,
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
                 _ => Action::None,
             };
         }
@@ -128,9 +132,16 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                     let new_idx = (selected + 1) % len;
                     return Action::ThemePreview(new_idx);
                 }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    return Action::ThemePreview(0);
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    let new_idx = len.saturating_sub(1);
+                    return Action::ThemePreview(new_idx);
+                }
                 KeyCode::Enter => return Action::InputSubmit,
                 KeyCode::Esc => return Action::DismissModal,
-                _ => {}
+                _ => return Action::None,
             }
         }
         Modal::IssueSourceManager { .. } => {
@@ -140,6 +151,8 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
                 KeyCode::Char('a') => Action::IssueSourceAdd,
                 KeyCode::Char('d') => Action::IssueSourceDelete,
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
                 _ => Action::None,
             };
         }
@@ -160,8 +173,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Action::HalfPageUp
                 }
-                KeyCode::Char('g') if state.pending_g => Action::GoToTop,
-                KeyCode::Char('g') => Action::PendingG,
+                KeyCode::Char('g') => Action::GoToTop,
                 KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
                 KeyCode::Home => Action::GoToTop,
                 KeyCode::Enter => {
@@ -185,8 +197,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Action::HalfPageUp
                 }
-                KeyCode::Char('g') if state.pending_g => Action::GoToTop,
-                KeyCode::Char('g') => Action::PendingG,
+                KeyCode::Char('g') => Action::GoToTop,
                 KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
                 KeyCode::Home => Action::GoToTop,
                 KeyCode::Char(' ') => Action::GithubDiscoverToggle,
@@ -197,16 +208,37 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 _ => Action::None,
             };
         }
-        Modal::PostCreatePicker { ref items, .. } => {
+        Modal::BranchPicker { ref items, .. } => {
             return match key.code {
                 KeyCode::Esc => Action::DismissModal,
                 KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
                 KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
-                KeyCode::Enter => Action::SelectPostCreateChoice(usize::MAX),
+                KeyCode::Enter => Action::SelectBranch(None),
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     let n = c.to_digit(10).unwrap() as usize;
                     if n >= 1 && n <= items.len() {
-                        Action::SelectPostCreateChoice(n - 1)
+                        Action::SelectBranch(Some(n - 1))
+                    } else {
+                        Action::None
+                    }
+                }
+                _ => Action::None,
+            };
+        }
+        Modal::BaseBranchPicker { ref items, .. } => {
+            return match key.code {
+                KeyCode::Esc => Action::DismissModal,
+                KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
+                KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
+                KeyCode::Enter => Action::SelectBaseBranch(None),
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let n = c.to_digit(10).unwrap() as usize;
+                    if n >= 1 && n <= items.len() {
+                        Action::SelectBaseBranch(Some(n - 1))
                     } else {
                         Action::None
                     }
@@ -224,18 +256,50 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 _ => Action::None,
             };
         }
-        Modal::PrWorkflowPicker { .. } | Modal::WorkflowPicker { .. } => {
+        Modal::TemplatePicker { ref items, .. } => {
             return match key.code {
                 KeyCode::Esc => Action::DismissModal,
                 KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
                 KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
                 KeyCode::Enter => Action::InputSubmit,
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let n = c.to_digit(10).unwrap() as usize;
+                    if n >= 1 && n <= items.len() {
+                        // Jump to the selected item
+                        Action::SelectListItem(n - 1)
+                    } else {
+                        Action::None
+                    }
+                }
+                _ => Action::None,
+            };
+        }
+        Modal::WorkflowPicker { .. } => {
+            return match key.code {
+                KeyCode::Esc => Action::DismissModal,
+                KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
+                KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
+                KeyCode::Enter => Action::InputSubmit,
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
                 _ => Action::None,
             };
         }
         Modal::Progress { .. } => {
             // Non-dismissable: swallow all keys while operation is in progress.
             return Action::None;
+        }
+        Modal::Notifications { .. } => {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Action::DismissModal,
+                KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
+                KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
+                KeyCode::Char('g') | KeyCode::Home => Action::GoToTop,
+                KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
+                _ => Action::None,
+            };
         }
         Modal::None => {}
     }
@@ -251,12 +315,6 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         };
     }
 
-    // Vim-style scroll bindings (all views)
-    // Handle `gg` chord: pending g + g → jump to top
-    if state.pending_g && key.code == KeyCode::Char('g') {
-        return Action::GoToTop;
-    }
-
     // Ctrl+d / Ctrl+u for half-page scroll (must precede normal match to avoid
     // Ctrl+d matching 'd' → Delete)
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -267,12 +325,52 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         }
     }
 
-    // View-specific keybindings (ticket list — Dashboard Tickets pane and Tickets view)
-    let in_ticket_list = (state.view == View::Dashboard
-        && state.dashboard_focus == crate::state::DashboardFocus::Tickets)
-        || state.view == View::Tickets
-        || (state.view == View::RepoDetail
-            && state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets);
+    // Workflow column keybindings (when workflow column has focus) — must precede view-specific
+    // bindings so that workflow column keys win when the column is active.
+    if state.column_focus == ColumnFocus::Workflow {
+        match key.code {
+            KeyCode::Char('H') => return Action::ToggleCompletedRuns,
+            KeyCode::Char('r') => return Action::RunWorkflow,
+            KeyCode::Char('v')
+                if state.workflows_focus == crate::state::WorkflowsFocus::Defs
+                    && state.workflow_def_focus == crate::state::WorkflowDefFocus::List =>
+            {
+                return Action::ViewWorkflowDef;
+            }
+            KeyCode::Char('e')
+                if state.workflows_focus == crate::state::WorkflowsFocus::Defs
+                    && state.workflow_def_focus == crate::state::WorkflowDefFocus::List =>
+            {
+                return Action::EditWorkflowDef;
+            }
+            KeyCode::Char(' ') if state.workflows_focus == crate::state::WorkflowsFocus::Runs => {
+                return Action::ToggleWorkflowRunCollapse;
+            }
+            KeyCode::Char(' ')
+                if state.workflows_focus == crate::state::WorkflowsFocus::Defs
+                    && state.workflow_def_focus == crate::state::WorkflowDefFocus::List =>
+            {
+                return Action::ToggleWorkflowDefsCollapse;
+            }
+            KeyCode::Char('w') if state.workflows_focus == crate::state::WorkflowsFocus::Runs => {
+                return Action::PickWorkflow;
+            }
+            KeyCode::Char('t') if state.workflows_focus == crate::state::WorkflowsFocus::Runs => {
+                return Action::PickTemplate;
+            }
+            // Right / l: enter or exit the step tree pane when viewing defs.
+            KeyCode::Right | KeyCode::Char('l')
+                if state.workflows_focus == crate::state::WorkflowsFocus::Defs =>
+            {
+                return Action::ToggleDefStepTree;
+            }
+            _ => {}
+        }
+    }
+
+    // View-specific keybindings (ticket list — RepoDetail Tickets pane)
+    let in_ticket_list = state.view == View::RepoDetail
+        && state.repo_detail_focus == crate::state::RepoDetailFocus::Tickets;
     if in_ticket_list {
         match key.code {
             KeyCode::Char('o') => return Action::OpenTicketUrl,
@@ -283,23 +381,14 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         }
     }
 
-    // View-specific keybindings (Dashboard Repos pane)
-    if state.view == View::Dashboard && state.dashboard_focus == crate::state::DashboardFocus::Repos
-    {
+    // View-specific keybindings (Dashboard)
+    if state.view == View::Dashboard {
         match key.code {
             KeyCode::Char('o') => return Action::OpenRepoUrl,
             KeyCode::Char('y') => return Action::CopyRepoUrl,
             KeyCode::Char('w') => return Action::PickWorkflow,
             _ => {}
         }
-    }
-
-    // View-specific keybindings (Dashboard Worktrees pane)
-    if state.view == View::Dashboard
-        && state.dashboard_focus == crate::state::DashboardFocus::Worktrees
-        && key.code == KeyCode::Char('w')
-    {
-        return Action::PickWorkflow;
     }
 
     // View-specific keybindings (WorktreeDetail agent controls)
@@ -311,6 +400,13 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
 
         let is_active = agent_run.is_some_and(|run| run.is_active());
         let is_waiting_for_feedback = agent_run.is_some_and(|run| run.is_waiting_for_feedback());
+        let is_failed = agent_run.is_some_and(|run| {
+            matches!(
+                run.status,
+                conductor_core::agent::AgentRunStatus::Failed
+                    | conductor_core::agent::AgentRunStatus::Cancelled
+            )
+        });
 
         let focus = state.worktree_detail_focus;
 
@@ -318,23 +414,42 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
             KeyCode::Char('p') => return Action::LaunchAgent,
             KeyCode::Char('O') if !is_active => return Action::OrchestrateAgent,
             KeyCode::Char('x') if is_active => return Action::StopAgent,
+            KeyCode::Char('R') if is_failed => return Action::RestartAgent,
             KeyCode::Char('f') if is_waiting_for_feedback => return Action::SubmitFeedback,
             KeyCode::Char('F') if is_waiting_for_feedback => return Action::DismissFeedback,
             KeyCode::Char('r') => return Action::ResumeWorktreeWorkflow,
             KeyCode::Char('w') => return Action::PickWorkflow,
+            KeyCode::Char('t') => return Action::PickTemplate,
             KeyCode::Char('y') => return Action::WorktreeDetailCopy,
             KeyCode::Char('o') => return Action::WorktreeDetailOpen,
-            KeyCode::Char('j') if focus == WorktreeDetailFocus::InfoPanel => {
+            KeyCode::Char('j')
+                if focus == WorktreeDetailFocus::InfoPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::MoveDown
             }
-            KeyCode::Char('k') if focus == WorktreeDetailFocus::InfoPanel => return Action::MoveUp,
-            KeyCode::Char('j') if focus == WorktreeDetailFocus::LogPanel => {
+            KeyCode::Char('k')
+                if focus == WorktreeDetailFocus::InfoPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
+                return Action::MoveUp
+            }
+            KeyCode::Char('j')
+                if focus == WorktreeDetailFocus::LogPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::AgentActivityDown
             }
-            KeyCode::Char('k') if focus == WorktreeDetailFocus::LogPanel => {
+            KeyCode::Char('k')
+                if focus == WorktreeDetailFocus::LogPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::AgentActivityUp
             }
-            KeyCode::Enter if focus == WorktreeDetailFocus::LogPanel => {
+            KeyCode::Enter
+                if focus == WorktreeDetailFocus::LogPanel
+                    && state.column_focus == ColumnFocus::Content =>
+            {
                 return Action::ExpandAgentEvent
             }
             KeyCode::Enter
@@ -342,6 +457,12 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                     && state.worktree_detail_selected_row == crate::state::info_row::MODEL =>
             {
                 return Action::SetModel
+            }
+            KeyCode::Enter
+                if focus == WorktreeDetailFocus::InfoPanel
+                    && state.worktree_detail_selected_row == crate::state::info_row::BASE =>
+            {
+                return Action::SetBaseBranch
             }
             KeyCode::Enter
                 if focus == WorktreeDetailFocus::InfoPanel
@@ -353,25 +474,26 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         }
     }
 
-    // View-specific keybindings (Workflows)
-    if state.view == View::Workflows {
-        match key.code {
-            KeyCode::Char('r') | KeyCode::Char('w') => return Action::RunWorkflow,
-            KeyCode::Char('v') if state.workflows_focus == crate::state::WorkflowsFocus::Defs => {
-                return Action::ViewWorkflowDef;
-            }
-            KeyCode::Char('e') if state.workflows_focus == crate::state::WorkflowsFocus::Defs => {
-                return Action::EditWorkflowDef;
-            }
-            KeyCode::Char(' ') if state.workflows_focus == crate::state::WorkflowsFocus::Runs => {
-                return Action::ToggleWorkflowRunCollapse;
-            }
-            _ => {}
-        }
-    }
-
     // View-specific keybindings (WorkflowRunDetail)
     if state.view == View::WorkflowRunDetail {
+        // Info-pane-specific keys (j/k/y only when Info is focused)
+        if state.workflow_run_detail_focus == WorkflowRunDetailFocus::Info {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => return Action::MoveDown,
+                KeyCode::Char('k') | KeyCode::Up => return Action::MoveUp,
+                KeyCode::Char('y') => return Action::WorkflowRunDetailCopy,
+                _ => {}
+            }
+        }
+        // Error-pane-specific keys (j/k scroll, y copies full error text)
+        if state.workflow_run_detail_focus == WorkflowRunDetailFocus::Error {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => return Action::MoveDown,
+                KeyCode::Char('k') | KeyCode::Up => return Action::MoveUp,
+                KeyCode::Char('y') => return Action::WorkflowRunDetailCopy,
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('x') => return Action::CancelWorkflow,
             KeyCode::Char('r') => return Action::ResumeWorkflow,
@@ -426,6 +548,28 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 _ => {}
             }
         }
+        if state.repo_detail_focus == crate::state::RepoDetailFocus::RepoAgent {
+            let latest_run = state
+                .selected_repo_id
+                .as_ref()
+                .and_then(|id| state.data.latest_repo_agent_runs.get(id));
+            let is_active = latest_run.map(|r| r.is_active()).unwrap_or(false);
+            let is_waiting = latest_run
+                .map(|r| r.is_waiting_for_feedback())
+                .unwrap_or(false);
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => return Action::AgentActivityDown,
+                KeyCode::Char('k') | KeyCode::Up => return Action::AgentActivityUp,
+                KeyCode::Char('x') if is_active => return Action::StopAgent,
+                KeyCode::Char('f') if is_waiting => return Action::SubmitFeedback,
+                KeyCode::Char('F') if is_waiting => return Action::DismissFeedback,
+                KeyCode::Enter => return Action::ExpandAgentEvent,
+                _ => {}
+            }
+        }
+        if let KeyCode::Char('p') = key.code {
+            return Action::PromptRepoAgent;
+        }
         if let KeyCode::Char('I') = key.code {
             return Action::ToggleAgentIssues;
         }
@@ -445,17 +589,24 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
 
         // Scroll navigation
         KeyCode::Char('G') | KeyCode::End => Action::GoToBottom,
-        KeyCode::Char('g') => Action::PendingG,
+        KeyCode::Char('g') => Action::GoToTop,
         KeyCode::Home => Action::GoToTop,
 
         // Toggle closed tickets visibility (all ticket views)
         KeyCode::Char('A') => Action::ToggleClosedTickets,
 
-        // Toggle global status bar expansion (useful when 4+ items are active)
-        KeyCode::Char('!') => Action::ToggleStatusBar,
+        // Toggle workflow column visibility
+        KeyCode::Char('\\') => Action::ToggleWorkflowColumn,
+
+        // Navigate between columns
+        KeyCode::Char('[') => Action::FocusContentColumn,
+        KeyCode::Char(']') => Action::FocusWorkflowColumn,
 
         // Open the in-TUI theme picker
         KeyCode::Char('T') => Action::ShowThemePicker,
+
+        // Open notification list
+        KeyCode::Char('N') => Action::ShowNotifications,
 
         // CRUD actions
         KeyCode::Char('a') => Action::RegisterRepo,
@@ -464,11 +615,6 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         KeyCode::Char('s') => Action::SyncTickets,
         KeyCode::Char('S') => Action::ManageIssueSources,
         KeyCode::Char('o') => Action::OpenTicketUrl,
-
-        // Direct view navigation
-        KeyCode::Char('1') => Action::GoToDashboard,
-        KeyCode::Char('2') => Action::GoToTickets,
-        KeyCode::Char('3') => Action::GoToWorkflows,
 
         _ => Action::None,
     }
@@ -488,6 +634,7 @@ mod tests {
         AgentRun {
             id: "run-1".into(),
             worktree_id: Some(worktree_id.to_string()),
+            repo_id: None,
             claude_session_id: None,
             prompt: "do stuff".into(),
             status,
@@ -521,46 +668,49 @@ mod tests {
         state
     }
 
-    // --- PostCreatePicker tests ---
+    // --- WorkflowPicker tests (post-create variant) ---
 
-    use crate::state::PostCreateChoice;
+    use crate::state::WorkflowPickerItem;
 
-    fn post_create_picker_state(item_count: usize) -> AppState {
-        let mut items = vec![PostCreateChoice::StartAgent];
+    fn workflow_picker_state(item_count: usize) -> AppState {
+        let mut items = vec![WorkflowPickerItem::StartAgent];
         for i in 0..item_count.saturating_sub(2) {
-            items.push(PostCreateChoice::RunWorkflow {
-                name: format!("workflow-{i}"),
-                def: conductor_core::workflow::WorkflowDef {
+            items.push(WorkflowPickerItem::Workflow(
+                conductor_core::workflow::WorkflowDef {
                     name: format!("workflow-{i}"),
                     description: String::new(),
                     trigger: conductor_core::workflow::WorkflowTrigger::Manual,
                     targets: vec![],
+                    group: None,
                     inputs: vec![],
                     body: vec![],
                     always: vec![],
                     source_path: String::new(),
                 },
-            });
+            ));
         }
         if item_count >= 2 {
-            items.push(PostCreateChoice::Skip);
+            items.push(WorkflowPickerItem::Skip);
         }
         let mut state = AppState::new();
-        state.modal = Modal::PostCreatePicker {
+        state.modal = Modal::WorkflowPicker {
+            target: crate::state::WorkflowPickerTarget::PostCreate {
+                worktree_id: "wt1".into(),
+                worktree_path: "/tmp/wt".into(),
+                worktree_slug: "wt-slug".into(),
+                repo_path: "/tmp/repo".into(),
+                ticket_id: String::new(),
+            },
             items,
             selected: 0,
-            worktree_id: "wt1".into(),
-            worktree_path: "/tmp/wt".into(),
-            worktree_slug: "wt-slug".into(),
-            repo_path: "/tmp/repo".into(),
-            ticket_id: String::new(),
+            scroll_offset: 0,
         };
         state
     }
 
     #[test]
-    fn post_create_picker_esc_dismisses_modal() {
-        let state = post_create_picker_state(3);
+    fn workflow_picker_esc_dismisses_modal() {
+        let state = workflow_picker_state(3);
         assert!(matches!(
             map_key(key(KeyCode::Esc), &state),
             Action::DismissModal
@@ -568,8 +718,8 @@ mod tests {
     }
 
     #[test]
-    fn post_create_picker_up_down_navigation() {
-        let state = post_create_picker_state(3);
+    fn workflow_picker_up_down_navigation() {
+        let state = workflow_picker_state(3);
         assert!(matches!(map_key(key(KeyCode::Up), &state), Action::MoveUp));
         assert!(matches!(
             map_key(key(KeyCode::Down), &state),
@@ -586,30 +736,113 @@ mod tests {
     }
 
     #[test]
-    fn post_create_picker_enter_selects_with_sentinel() {
-        let state = post_create_picker_state(3);
+    fn workflow_picker_enter_submits() {
+        let state = workflow_picker_state(3);
         assert!(matches!(
             map_key(key(KeyCode::Enter), &state),
-            Action::SelectPostCreateChoice(usize::MAX)
+            Action::InputSubmit
         ));
     }
 
     #[test]
-    fn post_create_picker_valid_digit_selects_item() {
-        let state = post_create_picker_state(3); // items: [StartAgent, workflow-0, Skip]
+    fn workflow_picker_unhandled_key_is_none() {
+        let state = workflow_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Char('x')), &state),
+            Action::None
+        ));
+    }
+
+    // --- BranchPicker tests ---
+
+    use crate::state::BranchPickerItem;
+
+    fn branch_picker_state(item_count: usize) -> AppState {
+        let mut items = Vec::with_capacity(item_count);
+        // First item: default branch (branch = None)
+        if item_count > 0 {
+            items.push(BranchPickerItem {
+                branch: None,
+                worktree_count: 0,
+                ticket_count: 0,
+                base_branch: None,
+                stale_days: None,
+            });
+        }
+        for i in 1..item_count {
+            items.push(BranchPickerItem {
+                branch: Some(format!("feat/branch-{i}")),
+                worktree_count: 0,
+                ticket_count: 0,
+                base_branch: Some("main".into()),
+                stale_days: None,
+            });
+        }
+        let (ordered, tree_positions) = crate::state::build_branch_picker_tree(&items);
+        let mut state = AppState::new();
+        state.modal = Modal::BranchPicker {
+            repo_slug: "test-repo".into(),
+            wt_name: "wt-name".into(),
+            ticket_id: None,
+            items: ordered,
+            tree_positions,
+            selected: 0,
+        };
+        state
+    }
+
+    #[test]
+    fn branch_picker_esc_dismisses_modal() {
+        let state = branch_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Esc), &state),
+            Action::DismissModal
+        ));
+    }
+
+    #[test]
+    fn branch_picker_up_down_navigation() {
+        let state = branch_picker_state(3);
+        assert!(matches!(map_key(key(KeyCode::Up), &state), Action::MoveUp));
+        assert!(matches!(
+            map_key(key(KeyCode::Down), &state),
+            Action::MoveDown
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('k')), &state),
+            Action::MoveUp
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('j')), &state),
+            Action::MoveDown
+        ));
+    }
+
+    #[test]
+    fn branch_picker_enter_selects_with_none() {
+        let state = branch_picker_state(3);
+        assert!(matches!(
+            map_key(key(KeyCode::Enter), &state),
+            Action::SelectBranch(None)
+        ));
+    }
+
+    #[test]
+    fn branch_picker_valid_digit_selects_item() {
+        let state = branch_picker_state(3);
         assert!(matches!(
             map_key(key(KeyCode::Char('1')), &state),
-            Action::SelectPostCreateChoice(0)
+            Action::SelectBranch(Some(0))
         ));
         assert!(matches!(
             map_key(key(KeyCode::Char('3')), &state),
-            Action::SelectPostCreateChoice(2)
+            Action::SelectBranch(Some(2))
         ));
     }
 
     #[test]
-    fn post_create_picker_out_of_range_digit_is_none() {
-        let state = post_create_picker_state(3);
+    fn branch_picker_out_of_range_digit_is_none() {
+        let state = branch_picker_state(3);
         // '0' is out of range (valid is 1..=3)
         assert!(matches!(
             map_key(key(KeyCode::Char('0')), &state),
@@ -628,8 +861,8 @@ mod tests {
     }
 
     #[test]
-    fn post_create_picker_unhandled_key_is_none() {
-        let state = post_create_picker_state(3);
+    fn branch_picker_unhandled_key_is_none() {
+        let state = branch_picker_state(3);
         assert!(matches!(
             map_key(key(KeyCode::Char('x')), &state),
             Action::None
@@ -676,6 +909,32 @@ mod tests {
     fn worktree_detail_enter_expands_agent_event_when_log_panel_focused() {
         let state = worktree_detail_state_with_focus(WorktreeDetailFocus::LogPanel);
         assert!(matches!(
+            map_key(key(KeyCode::Enter), &state),
+            Action::ExpandAgentEvent
+        ));
+    }
+
+    #[test]
+    fn worktree_detail_jk_routes_to_move_when_workflow_column_focused() {
+        // When workflow column has focus, j/k should not be captured by WorktreeDetail
+        // and should fall through to MoveDown/MoveUp for workflow column navigation.
+        let mut state = worktree_detail_state_with_focus(WorktreeDetailFocus::LogPanel);
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        assert!(matches!(
+            map_key(key(KeyCode::Char('j')), &state),
+            Action::MoveDown
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('k')), &state),
+            Action::MoveUp
+        ));
+    }
+
+    #[test]
+    fn worktree_detail_enter_does_not_expand_when_workflow_column_focused() {
+        let mut state = worktree_detail_state_with_focus(WorktreeDetailFocus::LogPanel);
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        assert!(!matches!(
             map_key(key(KeyCode::Enter), &state),
             Action::ExpandAgentEvent
         ));
@@ -742,7 +1001,7 @@ mod tests {
         let state = dashboard_state();
         // All of these were removed in the keybinding cleanup (#515)
         // Note: 'w' was re-added as PickWorkflow
-        for ch in ['p', 'P', 't', 'D'] {
+        for ch in ['p', 'P', 'D'] {
             assert!(
                 matches!(map_key(key(KeyCode::Char(ch)), &state), Action::None),
                 "key '{ch}' should map to Action::None after removal but did not"
@@ -753,7 +1012,7 @@ mod tests {
     // --- WorkflowRunDetail: y/Y fires ApproveGate when a gate step is waiting ---
 
     fn workflow_run_detail_state_with_waiting_gate() -> AppState {
-        use conductor_core::workflow::{WorkflowRunStep, WorkflowStepStatus};
+        use conductor_core::workflow::{GateType, WorkflowRunStep, WorkflowStepStatus};
         let mut state = AppState::new();
         state.view = View::WorkflowRunDetail;
         state.data.workflow_steps = vec![WorkflowRunStep {
@@ -775,13 +1034,14 @@ mod tests {
             context_out: None,
             markers_out: None,
             retry_count: 0,
-            gate_type: Some("approval".into()),
+            gate_type: Some(GateType::HumanApproval),
             gate_prompt: None,
             gate_timeout: None,
             gate_approved_by: None,
             gate_approved_at: None,
             gate_feedback: None,
             structured_output: None,
+            output_file: None,
         }];
         state
     }
@@ -833,9 +1093,9 @@ mod tests {
     }
 
     #[test]
-    fn r_maps_to_run_workflow_in_workflows_view() {
+    fn r_maps_to_run_workflow_in_workflow_column_focus() {
         let mut state = AppState::new();
-        state.view = View::Workflows;
+        state.column_focus = crate::state::ColumnFocus::Workflow;
         assert!(matches!(
             map_key(key(KeyCode::Char('r')), &state),
             Action::RunWorkflow
@@ -852,20 +1112,9 @@ mod tests {
     }
 
     #[test]
-    fn w_maps_to_run_workflow_in_workflows_view() {
+    fn w_maps_to_pick_workflow_in_workflow_column_focus() {
         let mut state = AppState::new();
-        state.view = View::Workflows;
-        assert!(matches!(
-            map_key(key(KeyCode::Char('w')), &state),
-            Action::RunWorkflow
-        ));
-    }
-
-    #[test]
-    fn w_maps_to_pick_workflow_in_dashboard_tickets() {
-        let mut state = AppState::new();
-        state.view = View::Dashboard;
-        state.dashboard_focus = crate::state::DashboardFocus::Tickets;
+        state.column_focus = crate::state::ColumnFocus::Workflow;
         assert!(matches!(
             map_key(key(KeyCode::Char('w')), &state),
             Action::PickWorkflow
@@ -873,21 +1122,9 @@ mod tests {
     }
 
     #[test]
-    fn w_maps_to_pick_workflow_in_dashboard_repos() {
+    fn w_maps_to_pick_workflow_in_dashboard() {
         let mut state = AppState::new();
         state.view = View::Dashboard;
-        state.dashboard_focus = crate::state::DashboardFocus::Repos;
-        assert!(matches!(
-            map_key(key(KeyCode::Char('w')), &state),
-            Action::PickWorkflow
-        ));
-    }
-
-    #[test]
-    fn w_maps_to_pick_workflow_in_dashboard_worktrees() {
-        let mut state = AppState::new();
-        state.view = View::Dashboard;
-        state.dashboard_focus = crate::state::DashboardFocus::Worktrees;
         assert!(matches!(
             map_key(key(KeyCode::Char('w')), &state),
             Action::PickWorkflow
@@ -1016,6 +1253,17 @@ mod tests {
     }
 
     #[test]
+    fn theme_picker_q_does_not_quit() {
+        // Regression test for #847: pressing 'q' while ThemePicker is open
+        // must return Action::None, not Action::Quit.
+        let state = theme_picker_state(0);
+        assert!(matches!(
+            map_key(key(KeyCode::Char('q')), &state),
+            Action::None
+        ));
+    }
+
+    #[test]
     fn progress_modal_swallows_esc() {
         let state = progress_modal_state();
         assert!(matches!(map_key(key(KeyCode::Esc), &state), Action::None));
@@ -1045,5 +1293,238 @@ mod tests {
         assert!(matches!(map_key(key(KeyCode::Down), &state), Action::None));
         assert!(matches!(map_key(key(KeyCode::Left), &state), Action::None));
         assert!(matches!(map_key(key(KeyCode::Right), &state), Action::None));
+    }
+
+    // --- Workflow column focus keybindings ---
+
+    #[test]
+    fn backslash_maps_to_toggle_workflow_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(key(KeyCode::Char('\\')), &state),
+            Action::ToggleWorkflowColumn
+        ));
+    }
+
+    #[test]
+    fn backslash_toggle_works_in_workflow_column_focus() {
+        let mut state = AppState::new();
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        assert!(matches!(
+            map_key(key(KeyCode::Char('\\')), &state),
+            Action::ToggleWorkflowColumn
+        ));
+    }
+
+    #[test]
+    fn left_bracket_maps_to_focus_content_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(key(KeyCode::Char('[')), &state),
+            Action::FocusContentColumn
+        ));
+    }
+
+    #[test]
+    fn right_bracket_maps_to_focus_workflow_column() {
+        let state = AppState::new();
+        assert!(matches!(
+            map_key(key(KeyCode::Char(']')), &state),
+            Action::FocusWorkflowColumn
+        ));
+    }
+
+    #[test]
+    fn w_maps_to_pick_workflow_in_workflow_column_runs() {
+        let mut state = AppState::new();
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        state.workflows_focus = crate::state::WorkflowsFocus::Runs;
+        assert!(matches!(
+            map_key(key(KeyCode::Char('w')), &state),
+            Action::PickWorkflow
+        ));
+    }
+
+    // --- `t` key: PickTemplate binding ---
+
+    #[test]
+    fn t_maps_to_pick_template_in_workflow_column_runs() {
+        let mut state = AppState::new();
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        state.workflows_focus = crate::state::WorkflowsFocus::Runs;
+        assert!(matches!(
+            map_key(key(KeyCode::Char('t')), &state),
+            Action::PickTemplate
+        ));
+    }
+
+    #[test]
+    fn t_maps_to_pick_template_in_worktree_detail() {
+        let state = worktree_detail_state_with_focus(WorktreeDetailFocus::InfoPanel);
+        assert!(matches!(
+            map_key(key(KeyCode::Char('t')), &state),
+            Action::PickTemplate
+        ));
+    }
+
+    #[test]
+    fn t_does_not_map_to_pick_template_in_workflow_column_defs() {
+        let mut state = AppState::new();
+        state.column_focus = crate::state::ColumnFocus::Workflow;
+        state.workflows_focus = crate::state::WorkflowsFocus::Defs;
+        assert!(!matches!(
+            map_key(key(KeyCode::Char('t')), &state),
+            Action::PickTemplate
+        ));
+    }
+
+    // --- WorkflowPicker tests (Repo target variant) ---
+    // Key-mapping is target-agnostic (the WorkflowPicker arm in map_key does not
+    // inspect the target), so these tests confirm the same bindings hold.
+
+    fn workflow_picker_repo_state() -> AppState {
+        let mut state = AppState::new();
+        state.modal = Modal::WorkflowPicker {
+            target: crate::state::WorkflowPickerTarget::Repo {
+                repo_id: "r1".into(),
+                repo_path: "/tmp/repo".into(),
+                repo_name: "my-repo".into(),
+            },
+            items: vec![crate::state::WorkflowPickerItem::Workflow(
+                conductor_core::workflow::WorkflowDef {
+                    name: "deploy".into(),
+                    description: String::new(),
+                    trigger: conductor_core::workflow::WorkflowTrigger::Manual,
+                    targets: vec!["repo".into()],
+                    group: None,
+                    inputs: vec![],
+                    body: vec![],
+                    always: vec![],
+                    source_path: ".conductor/workflows/deploy.wf".into(),
+                },
+            )],
+            selected: 0,
+            scroll_offset: 0,
+        };
+        state
+    }
+
+    #[test]
+    fn workflow_picker_repo_esc_dismisses_modal() {
+        let state = workflow_picker_repo_state();
+        assert!(matches!(
+            map_key(key(KeyCode::Esc), &state),
+            Action::DismissModal
+        ));
+    }
+
+    #[test]
+    fn workflow_picker_repo_up_down_navigation() {
+        let state = workflow_picker_repo_state();
+        assert!(matches!(map_key(key(KeyCode::Up), &state), Action::MoveUp));
+        assert!(matches!(
+            map_key(key(KeyCode::Down), &state),
+            Action::MoveDown
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('k')), &state),
+            Action::MoveUp
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('j')), &state),
+            Action::MoveDown
+        ));
+    }
+
+    #[test]
+    fn workflow_picker_repo_enter_submits() {
+        let state = workflow_picker_repo_state();
+        assert!(matches!(
+            map_key(key(KeyCode::Enter), &state),
+            Action::InputSubmit
+        ));
+    }
+
+    #[test]
+    fn workflow_picker_repo_unhandled_key_is_none() {
+        let state = workflow_picker_repo_state();
+        assert!(matches!(
+            map_key(key(KeyCode::Char('x')), &state),
+            Action::None
+        ));
+    }
+
+    // --- WorkflowPicker tests (standalone Worktree target variant) ---
+
+    fn workflow_picker_worktree_state() -> AppState {
+        let mut state = AppState::new();
+        state.modal = Modal::WorkflowPicker {
+            target: crate::state::WorkflowPickerTarget::Worktree {
+                worktree_id: "w1".into(),
+                worktree_path: "/tmp/ws/w1".into(),
+                repo_path: "/tmp/repo".into(),
+            },
+            items: vec![crate::state::WorkflowPickerItem::Workflow(
+                conductor_core::workflow::WorkflowDef {
+                    name: "build".into(),
+                    description: String::new(),
+                    trigger: conductor_core::workflow::WorkflowTrigger::Manual,
+                    targets: vec!["worktree".into()],
+                    group: None,
+                    inputs: vec![],
+                    body: vec![],
+                    always: vec![],
+                    source_path: ".conductor/workflows/build.wf".into(),
+                },
+            )],
+            selected: 0,
+            scroll_offset: 0,
+        };
+        state
+    }
+
+    #[test]
+    fn workflow_picker_worktree_esc_dismisses_modal() {
+        let state = workflow_picker_worktree_state();
+        assert!(matches!(
+            map_key(key(KeyCode::Esc), &state),
+            Action::DismissModal
+        ));
+    }
+
+    #[test]
+    fn workflow_picker_worktree_up_down_navigation() {
+        let state = workflow_picker_worktree_state();
+        assert!(matches!(map_key(key(KeyCode::Up), &state), Action::MoveUp));
+        assert!(matches!(
+            map_key(key(KeyCode::Down), &state),
+            Action::MoveDown
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('k')), &state),
+            Action::MoveUp
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Char('j')), &state),
+            Action::MoveDown
+        ));
+    }
+
+    #[test]
+    fn workflow_picker_worktree_enter_submits() {
+        let state = workflow_picker_worktree_state();
+        assert!(matches!(
+            map_key(key(KeyCode::Enter), &state),
+            Action::InputSubmit
+        ));
+    }
+
+    #[test]
+    fn workflow_picker_worktree_unhandled_key_is_none() {
+        let state = workflow_picker_worktree_state();
+        assert!(matches!(
+            map_key(key(KeyCode::Char('x')), &state),
+            Action::None
+        ));
     }
 }

@@ -7,3 +7,7 @@ conductor-web/frontend/dist/
 *.local.json
 PLAN.md
 .conductor/postmortems/
+script-*.out
+.conductor.db
+.conductor.db-wal
+.conductor.db-shm

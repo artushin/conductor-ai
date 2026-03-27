@@ -3,21 +3,74 @@ workflow ticket-to-pr {
     description = "Full development cycle — plan from ticket, implement, push PR, run review swarm, iterate until clean"
     trigger     = "manual"
     targets     = ["worktree"]
+    group       = "Development"
   }
 
   inputs {
-    ticket_id required
+    ticket_id  required
+    qualify    boolean
+    auto_merge boolean
+  }
+
+  if qualify {
+    call workflow qualify-ticket {
+      inputs {
+        ticket_id = "{{ticket_id}}"
+      }
+    }
   }
 
   call plan { output = "task-plan" }
 
   call implement {
     retries = 2
+    as      = "developer"
   }
 
   call workflow lint-fix
 
-  call push-and-pr
+  script fmt-fix {
+    run = ".conductor/scripts/fmt-fix.sh"
+  }
 
-  call workflow iterate-pr
+  script push-and-pr {
+    run = ".conductor/scripts/push-and-pr.sh"
+    as  = "developer"
+    env = { FEATURE_BASE_BRANCH = "{{feature_base_branch}}" }
+  }
+
+  unless push-and-pr.no_changes {
+    call workflow iterate-pr
+
+    if auto_merge {
+      gate pr_checks {
+        timeout    = "2h"
+        on_timeout = fail
+      }
+
+      gate pr_approval {
+        as            = "reviewer"
+        min_approvals = 1
+        timeout       = "72h"
+        on_timeout    = fail
+      }
+
+      call workflow rebase-worktree
+
+      if rebase-worktree.has_conflicts {
+        call workflow iterate-pr
+      }
+
+      gate pr_checks {
+        timeout    = "2h"
+        on_timeout = fail
+      }
+
+      script merge-and-close {
+        run = ".conductor/scripts/merge-and-close.sh"
+        as  = "merger"
+        env = { TICKET_NUMBER = "{{ticket_source_id}}" }
+      }
+    }
+  }
 }

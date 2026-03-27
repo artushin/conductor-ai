@@ -3,8 +3,7 @@ mod app;
 mod background;
 mod event;
 mod input;
-#[allow(dead_code)]
-mod pe_status;
+mod notify;
 mod state;
 mod theme;
 mod ui;

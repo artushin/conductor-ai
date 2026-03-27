@@ -187,23 +187,10 @@ mod tests {
     use crate::events::EventBus;
     use crate::routes::api_router;
 
-    fn open_test_db() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conductor_core::db::migrations::run(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO repos (id, slug, local_path, remote_url, default_branch, workspace_dir, created_at) \
-             VALUES ('r1', 'test-repo', '/tmp/repo', 'https://github.com/test/repo.git', 'main', '/tmp/ws', '2024-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-        conn
-    }
-
     /// Build an AppState with an in-memory DB seeded with one open ticket (source_id "10")
     /// and one closed ticket (source_id "11").
     fn seeded_state() -> AppState {
-        let conn = open_test_db();
+        let conn = conductor_core::test_helpers::setup_db();
         let syncer = TicketSyncer::new(&conn);
         let tickets = vec![
             TicketInput {
@@ -212,7 +199,7 @@ mod tests {
                 title: "Open issue".to_string(),
                 body: String::new(),
                 state: "open".to_string(),
-                labels: "[]".to_string(),
+                labels: vec![],
                 assignee: None,
                 priority: None,
                 url: String::new(),
@@ -225,7 +212,7 @@ mod tests {
                 title: "Closed issue".to_string(),
                 body: String::new(),
                 state: "open".to_string(),
-                labels: "[]".to_string(),
+                labels: vec![],
                 assignee: None,
                 priority: None,
                 url: String::new(),
@@ -242,6 +229,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             config: Arc::new(RwLock::new(Config::default())),
             events: EventBus::new(1),
+            workflow_done_notify: None,
         }
     }
 

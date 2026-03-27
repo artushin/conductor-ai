@@ -195,6 +195,7 @@ pub fn run_workflow_on_pr(
     exec_config: WorkflowExecConfig,
     mut inputs: HashMap<String, String>,
     dry_run: bool,
+    conductor_bin_dir: Option<std::path::PathBuf>,
 ) -> Result<WorkflowResult> {
     // Create a temp directory; it will be cleaned up when `_temp_dir` is dropped.
     let temp_dir = TempDir::new()
@@ -252,7 +253,11 @@ pub fn run_workflow_on_pr(
         parent_workflow_run_id: None,
         target_label: Some(&pr_target_label),
         default_bot_name: None,
+        feature_id: None,
+        iteration: 0,
         run_id_notify: None,
+        triggered_by_hook: false,
+        conductor_bin_dir,
         extra_plugin_dirs: vec![],
     };
 
@@ -373,6 +378,7 @@ mod tests {
             restart: false,
             from_step: None,
             model: None,
+            conductor_bin_dir: None,
         };
 
         let err = resume_workflow(&input).unwrap_err();

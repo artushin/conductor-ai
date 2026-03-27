@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use conductor_core::config::Config;
 use rusqlite::Connection;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::events::EventBus;
 
@@ -11,4 +11,19 @@ pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub config: Arc<RwLock<Config>>,
     pub events: EventBus,
+    /// Signalled by `run_workflow`'s background task when `execute_workflow` returns.
+    /// `None` in production. Populated in tests that need deterministic synchronization.
+    pub workflow_done_notify: Option<Arc<Notify>>,
+}
+
+impl AppState {
+    /// Construct a production `AppState` with the given connection, config, and event bus capacity.
+    pub fn new(conn: Connection, config: Config, event_capacity: usize) -> Self {
+        Self {
+            db: Arc::new(Mutex::new(conn)),
+            config: Arc::new(RwLock::new(config)),
+            events: EventBus::new(event_capacity),
+            workflow_done_notify: None,
+        }
+    }
 }

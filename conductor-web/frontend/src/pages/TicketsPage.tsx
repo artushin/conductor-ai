@@ -5,6 +5,7 @@ import { api } from "../api/client";
 import { LoadingSpinner } from "../components/shared/LoadingSpinner";
 import { EmptyState } from "../components/shared/EmptyState";
 import { TicketRow } from "../components/tickets/TicketRow";
+import { TicketCard } from "../components/tickets/TicketCard";
 import { TicketDetailModal } from "../components/tickets/TicketDetailModal";
 import type { Ticket, Repo } from "../api/types";
 import { parseLabels, buildLabelColorMap, labelTextColor } from "../utils/ticketUtils";
@@ -115,12 +116,12 @@ export function TicketsPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <h2 className="text-xl font-bold text-gray-900">Tickets</h2>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
           <button
             onClick={() => setShowClosed((v) => !v)}
-            className={`px-3 py-1.5 text-sm rounded-md border ${
+            className={`px-3 py-2 text-sm rounded-md border ${
               showClosed
                 ? "border-indigo-300 text-indigo-700 bg-indigo-50 hover:bg-indigo-100"
                 : "border-gray-300 text-gray-600 hover:bg-gray-50"
@@ -134,7 +135,7 @@ export function TicketsPage() {
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter by title, ID, or label..."
-            className="w-80 px-3 py-1.5 text-sm rounded-md border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            className="w-full sm:w-80 px-3 py-2 text-sm rounded-md border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
           />
         </div>
       </div>
@@ -179,39 +180,55 @@ export function TicketsPage() {
       ) : filtered.length === 0 ? (
         <EmptyState
           message={
-            filter || selectedLabels.size > 0 ? "No tickets match your filter" : "No tickets synced yet"
+            filter || selectedLabels.size > 0 ? "No tickets match your filter" : "No tickets issued. Sync your issues to start the journey."
           }
         />
       ) : (
-        <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-left text-xs text-gray-500 uppercase">
-              <tr>
-                <th className="px-4 py-2">Repo</th>
-                <th className="px-4 py-2">#</th>
-                <th className="px-4 py-2">Title</th>
-                <th className="px-4 py-2">State</th>
-                <th className="px-4 py-2">Labels</th>
-                <th className="px-4 py-2">Assignee</th>
-                <th className="px-4 py-2">Agent</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {filtered.map((t, index) => (
-                <TicketRow
-                  key={t.id}
-                  ticket={t}
-                  repoSlug={repoMap[t.repo_id]?.slug ?? "—"}
-                  agentTotals={ticketTotals?.[t.id]}
-                  onClick={setSelected}
-                  selected={index === selectedIndex}
-                  index={index}
-                  labelColorMap={labelColorMap}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <>
+          <div className="hidden md:block rounded-lg border border-gray-200 bg-white overflow-hidden overflow-x-auto">
+            <table className="w-full text-sm min-w-[560px]">
+              <thead className="bg-gray-50 text-left text-xs text-gray-500 uppercase">
+                <tr>
+                  <th className="px-4 py-2">Repo</th>
+                  <th className="px-4 py-2">#</th>
+                  <th className="px-4 py-2">Title</th>
+                  <th className="px-4 py-2">State</th>
+                  <th className="px-4 py-2">Labels</th>
+                  <th className="px-4 py-2">Assignee</th>
+                  <th className="px-4 py-2">Agent</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {filtered.map((t, index) => (
+                  <TicketRow
+                    key={t.id}
+                    ticket={t}
+                    repoSlug={repoMap[t.repo_id]?.slug ?? "—"}
+                    agentTotals={ticketTotals?.[t.id]}
+                    onClick={setSelected}
+                    selected={index === selectedIndex}
+                    index={index}
+                    labelColorMap={labelColorMap}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="md:hidden space-y-2">
+            {filtered.map((t, index) => (
+              <TicketCard
+                key={t.id}
+                ticket={t}
+                repoSlug={repoMap[t.repo_id]?.slug ?? "—"}
+                agentTotals={ticketTotals?.[t.id]}
+                onClick={setSelected}
+                selected={index === selectedIndex}
+                index={index}
+                labelColorMap={labelColorMap}
+              />
+            ))}
+          </div>
+        </>
       )}
 
       {selected && (

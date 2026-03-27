@@ -1,7 +1,11 @@
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 
-use crate::error::Result;
+use crate::error::{ConductorError, Result};
+
+/// The highest migration version this binary knows about.
+/// **When adding a new migration, update this constant to match the new version.**
+pub const LATEST_SCHEMA_VERSION: u32 = 55;
 
 /// Legacy plan step shape used only for migrating JSON data from agent_runs.plan.
 #[derive(Deserialize)]
@@ -11,12 +15,105 @@ struct LegacyPlanStep {
     done: bool,
 }
 
+/// Reads the current `foreign_keys` pragma value, disables FK enforcement,
+/// runs the provided closure, and unconditionally restores the original value —
+/// even if the closure returns an error.
+fn with_foreign_keys_off<F>(conn: &Connection, f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let fk_was_on: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "off")?;
+    let result = f();
+    // Always restore original state, even if `f` errored.
+    let restore_val = if fk_was_on != 0 { "on" } else { "off" };
+    let restore_result: Result<()> = conn
+        .pragma_update(None, "foreign_keys", restore_val)
+        .map_err(Into::into);
+    match result {
+        // Closure failed: return original error; discard restore error to avoid masking it.
+        Err(original) => Err(original),
+        // Closure succeeded: propagate any restore error so FK enforcement is never silently lost.
+        Ok(()) => restore_result,
+    }
+}
+
 fn bump_version(conn: &Connection, v: u32) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _conductor_meta (key, value) VALUES ('schema_version', ?1)",
         params![v.to_string()],
     )?;
     Ok(())
+}
+
+/// Migration 45 helper: copy `default_branch` and `model` column values from
+/// the repos table into per-repo `.conductor/config.toml` files before the
+/// columns are dropped. Errors are logged but do not abort the migration — the
+/// worst case is that the user must re-set a repo-level override.
+fn migrate_repo_columns_to_config(conn: &Connection) {
+    use crate::config::RepoConfig;
+    use std::path::Path;
+
+    // The columns may not exist (fresh DB or already dropped by a prior attempt).
+    let has_default_branch: bool = conn
+        .prepare("SELECT default_branch FROM repos LIMIT 0")
+        .is_ok();
+    let has_model: bool = conn.prepare("SELECT model FROM repos LIMIT 0").is_ok();
+    if !has_default_branch && !has_model {
+        return;
+    }
+
+    // Build a query that reads whatever columns exist.
+    let sql = if has_default_branch && has_model {
+        "SELECT local_path, default_branch, model FROM repos"
+    } else if has_default_branch {
+        "SELECT local_path, default_branch, NULL FROM repos"
+    } else {
+        "SELECT local_path, NULL, model FROM repos"
+    };
+
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return;
+    };
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .ok();
+    let Some(rows) = rows else { return };
+
+    for row in rows.flatten() {
+        let (local_path, default_branch, model) = row;
+        let repo_path = Path::new(&local_path);
+
+        // Skip if both are empty/default — nothing to migrate.
+        let branch_is_custom = default_branch
+            .as_deref()
+            .is_some_and(|b| !b.is_empty() && b != "main");
+        let model_is_set = model.as_deref().is_some_and(|m| !m.is_empty());
+        if !branch_is_custom && !model_is_set {
+            continue;
+        }
+
+        // Load existing repo config (or defaults) and merge the DB values.
+        let mut rc = RepoConfig::load(repo_path).unwrap_or_default();
+        if branch_is_custom && rc.defaults.default_branch.is_none() {
+            rc.defaults.default_branch = default_branch;
+        }
+        if model_is_set && rc.defaults.model.is_none() {
+            rc.defaults.model = model;
+        }
+        if let Err(e) = rc.save(repo_path) {
+            tracing::warn!(
+                path = %local_path,
+                "migration 45: failed to write .conductor/config.toml: {e}"
+            );
+        }
+    }
 }
 
 /// Run all schema migrations. Uses a simple version counter in a meta table.
@@ -37,6 +134,19 @@ pub fn run(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
+    // Stale-binary check: if the DB schema version is newer than what this
+    // binary understands, another (newer) binary already migrated the DB.
+    // Continuing would produce cryptic "no such column" SQL errors.
+    // We check here (before running migrations) because if version >
+    // LATEST_SCHEMA_VERSION, none of the `version < N` guards below will
+    // fire, so `version` still equals the on-disk schema version.
+    if version > LATEST_SCHEMA_VERSION as i64 {
+        return Err(ConductorError::Schema(format!(
+            "Database schema version ({version}) is newer than this binary supports ({LATEST_SCHEMA_VERSION}). \
+             Please rebuild: `cargo build`"
+        )));
+    }
+
     if version < 1 {
         conn.execute_batch(include_str!("migrations/001_initial.sql"))?;
         bump_version(conn, 1)?;
@@ -45,13 +155,13 @@ pub fn run(conn: &Connection) -> Result<()> {
     // Migration 002: add completed_at to worktrees.
     // Check column existence rather than version number to handle DBs that jumped
     // past version 1 via other feature branches.
-    let has_completed_at: bool = conn
-        .prepare("SELECT completed_at FROM worktrees LIMIT 0")
-        .is_ok();
-    if !has_completed_at {
-        conn.execute_batch(include_str!("migrations/002_worktree_completed_at.sql"))?;
-    }
     if version < 2 {
+        let has_completed_at: bool = conn
+            .prepare("SELECT completed_at FROM worktrees LIMIT 0")
+            .is_ok();
+        if !has_completed_at {
+            conn.execute_batch(include_str!("migrations/002_worktree_completed_at.sql"))?;
+        }
         bump_version(conn, 2)?;
     }
 
@@ -62,24 +172,24 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     // Migration 004: add tmux_window to agent_runs.
     // Check column existence to handle DBs that already have it from feature branches.
-    let has_tmux_window: bool = conn
-        .prepare("SELECT tmux_window FROM agent_runs LIMIT 0")
-        .is_ok();
-    if !has_tmux_window {
-        conn.execute_batch(include_str!("migrations/004_agent_tmux.sql"))?;
-    }
     if version < 4 {
+        let has_tmux_window: bool = conn
+            .prepare("SELECT tmux_window FROM agent_runs LIMIT 0")
+            .is_ok();
+        if !has_tmux_window {
+            conn.execute_batch(include_str!("migrations/004_agent_tmux.sql"))?;
+        }
         bump_version(conn, 4)?;
     }
 
     // Migration 005: add log_file to agent_runs.
-    let has_log_file: bool = conn
-        .prepare("SELECT log_file FROM agent_runs LIMIT 0")
-        .is_ok();
-    if !has_log_file {
-        conn.execute_batch(include_str!("migrations/005_agent_log_file.sql"))?;
-    }
     if version < 5 {
+        let has_log_file: bool = conn
+            .prepare("SELECT log_file FROM agent_runs LIMIT 0")
+            .is_ok();
+        if !has_log_file {
+            conn.execute_batch(include_str!("migrations/005_agent_log_file.sql"))?;
+        }
         bump_version(conn, 5)?;
     }
 
@@ -90,125 +200,126 @@ pub fn run(conn: &Connection) -> Result<()> {
     }
 
     // Migration 007: add agent_run_events table (trace/span model).
-    let has_agent_run_events: bool = conn
-        .prepare("SELECT id FROM agent_run_events LIMIT 0")
-        .is_ok();
-    if !has_agent_run_events {
-        conn.execute_batch(include_str!("migrations/007_agent_run_events.sql"))?;
-    }
     if version < 7 {
+        let has_agent_run_events: bool = conn
+            .prepare("SELECT id FROM agent_run_events LIMIT 0")
+            .is_ok();
+        if !has_agent_run_events {
+            conn.execute_batch(include_str!("migrations/007_agent_run_events.sql"))?;
+        }
         bump_version(conn, 7)?;
     }
 
     // Migration 008: add model column to worktrees.
-    let has_worktree_model: bool = conn.prepare("SELECT model FROM worktrees LIMIT 0").is_ok();
-    if !has_worktree_model {
-        conn.execute_batch(include_str!("migrations/008_worktree_model.sql"))?;
-    }
     if version < 8 {
+        let has_worktree_model: bool = conn.prepare("SELECT model FROM worktrees LIMIT 0").is_ok();
+        if !has_worktree_model {
+            conn.execute_batch(include_str!("migrations/008_worktree_model.sql"))?;
+        }
         bump_version(conn, 8)?;
     }
 
     // Migration 009: add model column to agent_runs.
-    let has_agent_run_model: bool = conn.prepare("SELECT model FROM agent_runs LIMIT 0").is_ok();
-    if !has_agent_run_model {
-        conn.execute_batch(include_str!("migrations/009_agent_run_model.sql"))?;
-    }
     if version < 9 {
+        let has_agent_run_model: bool =
+            conn.prepare("SELECT model FROM agent_runs LIMIT 0").is_ok();
+        if !has_agent_run_model {
+            conn.execute_batch(include_str!("migrations/009_agent_run_model.sql"))?;
+        }
         bump_version(conn, 9)?;
     }
 
     // Migration 010: add model column to repos.
-    let has_repo_model: bool = conn.prepare("SELECT model FROM repos LIMIT 0").is_ok();
-    if !has_repo_model {
-        conn.execute_batch(include_str!("migrations/010_repo_model.sql"))?;
-    }
     if version < 10 {
+        let has_repo_model: bool = conn.prepare("SELECT model FROM repos LIMIT 0").is_ok();
+        if !has_repo_model {
+            conn.execute_batch(include_str!("migrations/010_repo_model.sql"))?;
+        }
         bump_version(conn, 10)?;
     }
 
     // Migration 011: add plan column to agent_runs.
-    let has_plan: bool = conn.prepare("SELECT plan FROM agent_runs LIMIT 0").is_ok();
-    if !has_plan {
-        conn.execute_batch(include_str!("migrations/011_agent_plan.sql"))?;
-    }
     if version < 11 {
+        let has_plan: bool = conn.prepare("SELECT plan FROM agent_runs LIMIT 0").is_ok();
+        if !has_plan {
+            conn.execute_batch(include_str!("migrations/011_agent_plan.sql"))?;
+        }
         bump_version(conn, 11)?;
     }
 
     // Migration 012: add parent_run_id to agent_runs for parent/child relationships.
-    let has_parent_run_id: bool = conn
-        .prepare("SELECT parent_run_id FROM agent_runs LIMIT 0")
-        .is_ok();
-    if !has_parent_run_id {
-        conn.execute_batch(include_str!("migrations/012_parent_run_id.sql"))?;
-    }
     if version < 12 {
+        let has_parent_run_id: bool = conn
+            .prepare("SELECT parent_run_id FROM agent_runs LIMIT 0")
+            .is_ok();
+        if !has_parent_run_id {
+            conn.execute_batch(include_str!("migrations/012_parent_run_id.sql"))?;
+        }
         bump_version(conn, 12)?;
     }
 
     // Migration 013: add agent_created_issues table.
-    let has_agent_created_issues: bool = conn
-        .prepare("SELECT id FROM agent_created_issues LIMIT 0")
-        .is_ok();
-    if !has_agent_created_issues {
-        conn.execute_batch(include_str!("migrations/007_agent_created_issues.sql"))?;
-    }
     if version < 13 {
+        let has_agent_created_issues: bool = conn
+            .prepare("SELECT id FROM agent_created_issues LIMIT 0")
+            .is_ok();
+        if !has_agent_created_issues {
+            conn.execute_batch(include_str!("migrations/007_agent_created_issues.sql"))?;
+        }
         bump_version(conn, 13)?;
     }
 
     // Migration 014: add allow_agent_issue_creation to repos.
-    let has_allow_agent_issue_creation: bool = conn
-        .prepare("SELECT allow_agent_issue_creation FROM repos LIMIT 0")
-        .is_ok();
-    if !has_allow_agent_issue_creation {
-        conn.execute_batch(include_str!("migrations/008_repo_allow_agent_issues.sql"))?;
-    }
     if version < 14 {
+        let has_allow_agent_issue_creation: bool = conn
+            .prepare("SELECT allow_agent_issue_creation FROM repos LIMIT 0")
+            .is_ok();
+        if !has_allow_agent_issue_creation {
+            conn.execute_batch(include_str!("migrations/008_repo_allow_agent_issues.sql"))?;
+        }
         bump_version(conn, 14)?;
     }
 
     // Migration 015: create agent_run_steps table and migrate JSON plan data.
-    let has_agent_run_steps: bool = conn
-        .prepare("SELECT id FROM agent_run_steps LIMIT 0")
-        .is_ok();
-    if !has_agent_run_steps {
-        conn.execute_batch(include_str!("migrations/015_agent_run_steps.sql"))?;
+    if version < 15 {
+        let has_agent_run_steps: bool = conn
+            .prepare("SELECT id FROM agent_run_steps LIMIT 0")
+            .is_ok();
+        if !has_agent_run_steps {
+            conn.execute_batch(include_str!("migrations/015_agent_run_steps.sql"))?;
 
-        // Migrate existing JSON plan data from agent_runs.plan into the new table.
-        let mut read_stmt =
-            conn.prepare("SELECT id, plan FROM agent_runs WHERE plan IS NOT NULL")?;
-        let rows: Vec<(String, String)> = read_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
-        for (run_id, plan_json) in &rows {
-            if let Ok(steps) = serde_json::from_str::<Vec<LegacyPlanStep>>(plan_json) {
-                for (i, step) in steps.iter().enumerate() {
-                    let step_id = ulid::Ulid::new().to_string();
-                    let status = if step.done { "completed" } else { "pending" };
-                    conn.execute(
-                        "INSERT INTO agent_run_steps (id, run_id, position, description, status) \
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![step_id, run_id, i as i64, step.description, status],
-                    )?;
+            // Migrate existing JSON plan data from agent_runs.plan into the new table.
+            let mut read_stmt =
+                conn.prepare("SELECT id, plan FROM agent_runs WHERE plan IS NOT NULL")?;
+            let rows: Vec<(String, String)> = read_stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for (run_id, plan_json) in &rows {
+                if let Ok(steps) = serde_json::from_str::<Vec<LegacyPlanStep>>(plan_json) {
+                    for (i, step) in steps.iter().enumerate() {
+                        let step_id = crate::new_id();
+                        let status = if step.done { "completed" } else { "pending" };
+                        conn.execute(
+                            "INSERT INTO agent_run_steps (id, run_id, position, description, status) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![step_id, run_id, i as i64, step.description, status],
+                        )?;
+                    }
                 }
             }
         }
-    }
-    if version < 15 {
         bump_version(conn, 15)?;
     }
 
     // Migration 017: create review_configs table for multi-agent PR review swarms.
-    let has_review_configs: bool = conn
-        .prepare("SELECT id FROM review_configs LIMIT 0")
-        .is_ok();
-    if !has_review_configs {
-        conn.execute_batch(include_str!("migrations/017_review_configs.sql"))?;
-    }
     if version < 17 {
+        let has_review_configs: bool = conn
+            .prepare("SELECT id FROM review_configs LIMIT 0")
+            .is_ok();
+        if !has_review_configs {
+            conn.execute_batch(include_str!("migrations/017_review_configs.sql"))?;
+        }
         bump_version(conn, 17)?;
     }
 
@@ -216,49 +327,46 @@ pub fn run(conn: &Connection) -> Result<()> {
     // The agent_runs table must be recreated to add 'waiting_for_feedback' to the
     // status CHECK constraint. PRAGMA foreign_keys = OFF must be set outside a
     // transaction, so we handle the table swap in Rust code.
-    let has_feedback_requests: bool = conn
-        .prepare("SELECT id FROM feedback_requests LIMIT 0")
-        .is_ok();
-    if !has_feedback_requests {
-        // Temporarily disable FK enforcement for the table swap
-        conn.pragma_update(None, "foreign_keys", "off")?;
-
-        conn.execute_batch(
-            "CREATE TABLE agent_runs_new (
-                id                TEXT PRIMARY KEY,
-                worktree_id       TEXT NOT NULL REFERENCES worktrees(id) ON DELETE CASCADE,
-                claude_session_id TEXT,
-                prompt            TEXT NOT NULL,
-                status            TEXT NOT NULL DEFAULT 'running'
-                                  CHECK (status IN ('running','completed','failed','cancelled','waiting_for_feedback')),
-                result_text       TEXT,
-                cost_usd          REAL,
-                num_turns         INTEGER,
-                duration_ms       INTEGER,
-                started_at        TEXT NOT NULL,
-                ended_at          TEXT,
-                tmux_window       TEXT,
-                log_file          TEXT,
-                model             TEXT,
-                plan              TEXT,
-                parent_run_id     TEXT REFERENCES agent_runs_new(id) ON DELETE SET NULL
-            );
-            INSERT INTO agent_runs_new SELECT id, worktree_id, claude_session_id, prompt, status,
-                result_text, cost_usd, num_turns, duration_ms, started_at, ended_at,
-                tmux_window, log_file, model, plan, parent_run_id FROM agent_runs;
-            DROP TABLE agent_runs;
-            ALTER TABLE agent_runs_new RENAME TO agent_runs;
-            CREATE INDEX IF NOT EXISTS idx_agent_runs_parent ON agent_runs(parent_run_id);
-            CREATE INDEX IF NOT EXISTS idx_agent_runs_worktree ON agent_runs(worktree_id);",
-        )?;
-
-        // Re-enable FK enforcement
-        conn.pragma_update(None, "foreign_keys", "on")?;
-
-        // Now create the feedback_requests table
-        conn.execute_batch(include_str!("migrations/018_feedback_requests.sql"))?;
-    }
     if version < 18 {
+        let has_feedback_requests: bool = conn
+            .prepare("SELECT id FROM feedback_requests LIMIT 0")
+            .is_ok();
+        if !has_feedback_requests {
+            with_foreign_keys_off(conn, || {
+                conn.execute_batch(
+                    "CREATE TABLE agent_runs_new (
+                    id                TEXT PRIMARY KEY,
+                    worktree_id       TEXT NOT NULL REFERENCES worktrees(id) ON DELETE CASCADE,
+                    claude_session_id TEXT,
+                    prompt            TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'running'
+                                      CHECK (status IN ('running','completed','failed','cancelled','waiting_for_feedback')),
+                    result_text       TEXT,
+                    cost_usd          REAL,
+                    num_turns         INTEGER,
+                    duration_ms       INTEGER,
+                    started_at        TEXT NOT NULL,
+                    ended_at          TEXT,
+                    tmux_window       TEXT,
+                    log_file          TEXT,
+                    model             TEXT,
+                    plan              TEXT,
+                    parent_run_id     TEXT REFERENCES agent_runs_new(id) ON DELETE SET NULL
+                );
+                INSERT INTO agent_runs_new SELECT id, worktree_id, claude_session_id, prompt, status,
+                    result_text, cost_usd, num_turns, duration_ms, started_at, ended_at,
+                    tmux_window, log_file, model, plan, parent_run_id FROM agent_runs;
+                DROP TABLE agent_runs;
+                ALTER TABLE agent_runs_new RENAME TO agent_runs;
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_parent ON agent_runs(parent_run_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_worktree ON agent_runs(worktree_id);",
+                )?;
+                Ok(())
+            })?;
+
+            // Now create the feedback_requests table
+            conn.execute_batch(include_str!("migrations/018_feedback_requests.sql"))?;
+        }
         bump_version(conn, 18)?;
     }
 
@@ -269,28 +377,27 @@ pub fn run(conn: &Connection) -> Result<()> {
     }
 
     // Migration 020: workflow_runs and workflow_run_steps tables.
-    let has_workflow_runs: bool = conn.prepare("SELECT id FROM workflow_runs LIMIT 0").is_ok();
-    if !has_workflow_runs {
-        conn.execute_batch(include_str!("migrations/020_workflow_runs.sql"))?;
-    }
     if version < 20 {
+        let has_workflow_runs: bool = conn.prepare("SELECT id FROM workflow_runs LIMIT 0").is_ok();
+        if !has_workflow_runs {
+            conn.execute_batch(include_str!("migrations/020_workflow_runs.sql"))?;
+        }
         bump_version(conn, 20)?;
     }
 
     // Migration 021: workflow redesign — add structured output, iteration,
     // parallel, retry, gate, and snapshot columns.
-    let has_definition_snapshot: bool = conn
-        .prepare("SELECT definition_snapshot FROM workflow_runs LIMIT 0")
-        .is_ok();
-    if !has_definition_snapshot {
-        conn.execute_batch(include_str!("migrations/021_workflow_redesign.sql"))?;
-    }
     if version < 21 {
+        let has_definition_snapshot: bool = conn
+            .prepare("SELECT definition_snapshot FROM workflow_runs LIMIT 0")
+            .is_ok();
+        if !has_definition_snapshot {
+            conn.execute_batch(include_str!("migrations/021_workflow_redesign.sql"))?;
+        }
         // Recreate tables to update CHECK constraints (add 'waiting' status).
-        conn.pragma_update(None, "foreign_keys", "off")?;
-
-        conn.execute_batch(
-            "CREATE TABLE workflow_runs_new (
+        with_foreign_keys_off(conn, || {
+            conn.execute_batch(
+                "CREATE TABLE workflow_runs_new (
                 id                  TEXT PRIMARY KEY,
                 workflow_name       TEXT NOT NULL,
                 worktree_id         TEXT NOT NULL REFERENCES worktrees(id) ON DELETE CASCADE,
@@ -311,10 +418,10 @@ pub fn run(conn: &Connection) -> Result<()> {
             ALTER TABLE workflow_runs_new RENAME TO workflow_runs;
             CREATE INDEX IF NOT EXISTS idx_workflow_runs_worktree ON workflow_runs(worktree_id);
             CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent ON workflow_runs(parent_run_id);",
-        )?;
+            )?;
 
-        conn.execute_batch(
-            "CREATE TABLE workflow_run_steps_new (
+            conn.execute_batch(
+                "CREATE TABLE workflow_run_steps_new (
                 id                TEXT PRIMARY KEY,
                 workflow_run_id   TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
                 step_name         TEXT NOT NULL,
@@ -350,9 +457,10 @@ pub fn run(conn: &Connection) -> Result<()> {
             DROP TABLE workflow_run_steps;
             ALTER TABLE workflow_run_steps_new RENAME TO workflow_run_steps;
             CREATE INDEX IF NOT EXISTS idx_workflow_run_steps_run ON workflow_run_steps(workflow_run_id);",
-        )?;
+            )?;
 
-        conn.pragma_update(None, "foreign_keys", "on")?;
+            Ok(())
+        })?;
         bump_version(conn, 21)?;
     }
 
@@ -372,10 +480,9 @@ pub fn run(conn: &Connection) -> Result<()> {
     // SQLite requires a table swap because ALTER TABLE cannot modify CHECK constraints.
     // PRAGMA foreign_keys = OFF must be done outside a transaction (handled in Rust).
     if version < 24 {
-        conn.pragma_update(None, "foreign_keys", "off")?;
-
-        conn.execute_batch(
-            "BEGIN;
+        with_foreign_keys_off(conn, || {
+            conn.execute_batch(
+                "BEGIN;
             CREATE TABLE workflow_run_steps_new (
                 id                TEXT PRIMARY KEY,
                 workflow_run_id   TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
@@ -415,18 +522,17 @@ pub fn run(conn: &Connection) -> Result<()> {
             ALTER TABLE workflow_run_steps_new RENAME TO workflow_run_steps;
             CREATE INDEX IF NOT EXISTS idx_workflow_run_steps_run ON workflow_run_steps(workflow_run_id);
             COMMIT;",
-        )?;
-
-        conn.pragma_update(None, "foreign_keys", "on")?;
+            )?;
+            Ok(())
+        })?;
         bump_version(conn, 24)?;
     }
 
     // Migration 025: add 'workflow' to the workflow_run_steps role CHECK constraint.
     if version < 25 {
-        conn.pragma_update(None, "foreign_keys", "off")?;
-
-        conn.execute_batch(
-            "BEGIN;
+        with_foreign_keys_off(conn, || {
+            conn.execute_batch(
+                "BEGIN;
             CREATE TABLE workflow_run_steps_new (
                 id                TEXT PRIMARY KEY,
                 workflow_run_id   TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
@@ -466,20 +572,20 @@ pub fn run(conn: &Connection) -> Result<()> {
             ALTER TABLE workflow_run_steps_new RENAME TO workflow_run_steps;
             CREATE INDEX IF NOT EXISTS idx_workflow_run_steps_run ON workflow_run_steps(workflow_run_id);
             COMMIT;",
-        )?;
-
-        conn.pragma_update(None, "foreign_keys", "on")?;
+            )?;
+            Ok(())
+        })?;
         bump_version(conn, 25)?;
     }
 
     // Migration 026: add inputs column to workflow_runs for resume support.
-    let has_workflow_run_inputs: bool = conn
-        .prepare("SELECT inputs FROM workflow_runs LIMIT 0")
-        .is_ok();
-    if !has_workflow_run_inputs {
-        conn.execute_batch(include_str!("migrations/026_workflow_run_inputs.sql"))?;
-    }
     if version < 26 {
+        let has_workflow_run_inputs: bool = conn
+            .prepare("SELECT inputs FROM workflow_runs LIMIT 0")
+            .is_ok();
+        if !has_workflow_run_inputs {
+            conn.execute_batch(include_str!("migrations/026_workflow_run_inputs.sql"))?;
+        }
         bump_version(conn, 26)?;
     }
 
@@ -487,10 +593,9 @@ pub fn run(conn: &Connection) -> Result<()> {
     // and make agent_runs.worktree_id nullable with FK preserved (for ephemeral PR runs
     // that have no registered worktree).
     if version < 27 {
-        conn.pragma_update(None, "foreign_keys", "off")?;
-
-        conn.execute_batch(
-            "BEGIN;
+        with_foreign_keys_off(conn, || {
+            conn.execute_batch(
+                "BEGIN;
 
             -- Recreate workflow_runs with nullable worktree_id
             CREATE TABLE workflow_runs_new (
@@ -541,9 +646,9 @@ pub fn run(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_agent_runs_worktree ON agent_runs(worktree_id);
 
             COMMIT;",
-        )?;
-
-        conn.pragma_update(None, "foreign_keys", "on")?;
+            )?;
+            Ok(())
+        })?;
         bump_version(conn, 27)?;
     }
 
@@ -572,93 +677,290 @@ pub fn run(conn: &Connection) -> Result<()> {
     }
 
     // Migration 032: add token count columns to agent_runs.
-    let has_input_tokens: bool = conn
-        .prepare("SELECT input_tokens FROM agent_runs LIMIT 0")
-        .is_ok();
-    if !has_input_tokens {
-        conn.execute_batch(include_str!("migrations/032_agent_run_token_counts.sql"))?;
-    }
     if version < 32 {
+        let has_input_tokens: bool = conn
+            .prepare("SELECT input_tokens FROM agent_runs LIMIT 0")
+            .is_ok();
+        if !has_input_tokens {
+            conn.execute_batch(include_str!("migrations/032_agent_run_token_counts.sql"))?;
+        }
         bump_version(conn, 32)?;
     }
 
     // Migration 033: add target_label column to workflow_runs.
-    let has_target_label: bool = conn
-        .prepare("SELECT target_label FROM workflow_runs LIMIT 0")
-        .is_ok();
-    if !has_target_label {
-        conn.execute_batch(include_str!("migrations/033_workflow_target_label.sql"))?;
-    }
     if version < 33 {
+        let has_target_label: bool = conn
+            .prepare("SELECT target_label FROM workflow_runs LIMIT 0")
+            .is_ok();
+        if !has_target_label {
+            conn.execute_batch(include_str!("migrations/033_workflow_target_label.sql"))?;
+        }
         bump_version(conn, 33)?;
     }
 
     // Migration 034: add bot_name column to agent_runs.
-    let has_bot_name: bool = conn
-        .prepare("SELECT bot_name FROM agent_runs LIMIT 0")
-        .is_ok();
-    if !has_bot_name {
-        conn.execute_batch(include_str!("migrations/034_agent_run_bot_name.sql"))?;
-    }
     if version < 34 {
+        let has_bot_name: bool = conn
+            .prepare("SELECT bot_name FROM agent_runs LIMIT 0")
+            .is_ok();
+        if !has_bot_name {
+            conn.execute_batch(include_str!("migrations/034_agent_run_bot_name.sql"))?;
+        }
         bump_version(conn, 34)?;
     }
 
     // Migration 035: add default_bot_name column to workflow_runs.
-    let has_wf_default_bot_name: bool = conn
-        .prepare("SELECT default_bot_name FROM workflow_runs LIMIT 0")
-        .is_ok();
-    if !has_wf_default_bot_name {
-        conn.execute_batch(include_str!(
-            "migrations/035_workflow_run_default_bot_name.sql"
-        ))?;
-    }
     if version < 35 {
+        let has_wf_default_bot_name: bool = conn
+            .prepare("SELECT default_bot_name FROM workflow_runs LIMIT 0")
+            .is_ok();
+        if !has_wf_default_bot_name {
+            conn.execute_batch(include_str!(
+                "migrations/035_workflow_run_default_bot_name.sql"
+            ))?;
+        }
         bump_version(conn, 35)?;
     }
 
-    // Migration 036: add plugin_dirs column to repos (DECISION-004).
-    let has_plugin_dirs: bool = conn
-        .prepare("SELECT plugin_dirs FROM repos LIMIT 0")
-        .is_ok();
-    if !has_plugin_dirs {
-        conn.execute_batch(include_str!("migrations/036_repo_plugin_dirs.sql"))?;
-    }
+    // Migration 036: drop source_type CHECK constraint from tickets and repo_issue_sources.
+    // SQLite cannot drop CHECK constraints in-place; a table swap is required.
+    // PRAGMA foreign_keys = OFF must be set outside a transaction (handled in Rust).
     if version < 36 {
+        with_foreign_keys_off(conn, || {
+            conn.execute_batch(include_str!("migrations/036_drop_source_type_check.sql"))?;
+            Ok(())
+        })?;
         bump_version(conn, 36)?;
     }
 
-    // Migration 037: expand tickets.source_type CHECK to allow 'local'.
-    // SQLite requires a table swap to alter CHECK constraints.
+    // Migration 037: add 'script' to the role CHECK constraint and add output_file column.
+    // Requires a table swap (FK constraint). The table swap serves two purposes:
+    // (1) add output_file column, (2) update role CHECK to include 'script'.
+    // We must run the swap if EITHER is missing (column absent OR constraint stale).
     if version < 37 {
-        conn.pragma_update(None, "foreign_keys", "off")?;
-
-        conn.execute_batch(include_str!("migrations/037_ticket_local_source_type.sql"))?;
-
-        conn.pragma_update(None, "foreign_keys", "on")?;
+        let has_output_file: bool = conn
+            .prepare("SELECT output_file FROM workflow_run_steps LIMIT 0")
+            .is_ok();
+        let needs_swap = if !has_output_file {
+            // Column missing — need the swap if the table exists at all.
+            conn.prepare("SELECT 1 FROM workflow_run_steps LIMIT 0")
+                .is_ok()
+        } else {
+            // Column exists — check if the CHECK constraint includes 'script'.
+            let has_script_role: bool = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_run_steps'",
+                    [],
+                    |row| {
+                        let ddl: String = row.get(0)?;
+                        Ok(ddl.contains("'script'"))
+                    },
+                )
+                .unwrap_or(false);
+            !has_script_role
+        };
+        if needs_swap {
+            with_foreign_keys_off(conn, || {
+                conn.execute_batch(include_str!("migrations/037_workflow_step_output_file.sql"))?;
+                Ok(())
+            })?;
+        }
         bump_version(conn, 37)?;
     }
 
-    // Migration 038: add optional workflow column to tickets.
-    let has_ticket_workflow: bool = conn
-        .prepare("SELECT workflow FROM tickets LIMIT 0")
-        .is_ok();
-    if !has_ticket_workflow {
-        conn.execute_batch(include_str!("migrations/038_ticket_workflow.sql"))?;
-    }
+    // Migration 038: notification_log table for cross-process dedup.
     if version < 38 {
+        conn.execute_batch(include_str!("migrations/038_notification_log.sql"))?;
         bump_version(conn, 38)?;
     }
 
-    // Migration 039: add agent_map column to tickets for programmatic agent selection.
-    let has_agent_map: bool = conn
-        .prepare("SELECT agent_map FROM tickets LIMIT 0")
-        .is_ok();
-    if !has_agent_map {
-        conn.execute_batch(include_str!("migrations/039_ticket_agent_map.sql"))?;
-    }
+    // Migration 039: composite index on workflow_run_steps(status, gate_type)
+    // for list_all_waiting_gate_steps poll performance.
+    // Guard: only create the index if the table exists (it may be absent in
+    // minimal test schemas that start at version > 20).
     if version < 39 {
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='workflow_run_steps'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_exists {
+            conn.execute_batch(include_str!("migrations/039_idx_steps_status_gate.sql"))?;
+        }
         bump_version(conn, 39)?;
+    }
+
+    // Migration 040: add iteration column to workflow_runs for loop-based tree filtering.
+    let has_wf_run_iteration: bool = conn
+        .prepare("SELECT iteration FROM workflow_runs LIMIT 0")
+        .is_ok();
+    if !has_wf_run_iteration {
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='workflow_runs'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_exists {
+            conn.execute_batch(include_str!("migrations/040_workflow_run_iteration.sql"))?;
+        }
+    }
+    if version < 40 {
+        bump_version(conn, 40)?;
+    }
+
+    // --- Migration 41: workflow_runs.blocked_on ---
+    if version < 41 {
+        let has_blocked_on: bool = conn
+            .prepare("SELECT blocked_on FROM workflow_runs LIMIT 0")
+            .is_ok();
+        if !has_blocked_on {
+            let table_exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='workflow_runs'",
+                [],
+                |row| row.get(0),
+            )?;
+            if table_exists {
+                conn.execute_batch(include_str!("migrations/041_workflow_run_blocked_on.sql"))?;
+            }
+        }
+        bump_version(conn, 41)?;
+    }
+
+    // --- Migration 42: features + feature_tickets tables ---
+    if version < 42 {
+        conn.execute_batch(include_str!("migrations/042_features.sql"))?;
+        bump_version(conn, 42)?;
+    }
+
+    // --- Migration 43: index on worktrees(repo_id, base_branch) for feature list subquery ---
+    if version < 43 {
+        conn.execute_batch(include_str!(
+            "migrations/043_idx_worktrees_repo_base_branch.sql"
+        ))?;
+        bump_version(conn, 43)?;
+    }
+
+    if version < 44 {
+        conn.execute_batch(include_str!("migrations/044_workflow_run_feature_id.sql"))?;
+        bump_version(conn, 44)?;
+    }
+
+    if version < 45 {
+        // Before dropping the columns, migrate any non-default default_branch values
+        // to per-repo .conductor/config.toml so they are not lost.
+        migrate_repo_columns_to_config(conn);
+        conn.execute_batch(include_str!(
+            "migrations/045_drop_repo_model_default_branch.sql"
+        ))?;
+        bump_version(conn, 45)?;
+    }
+
+    // Migration 046: notifications table for in-app notification system.
+    if version < 46 {
+        conn.execute_batch(include_str!("migrations/046_notifications.sql"))?;
+        bump_version(conn, 46)?;
+    }
+
+    // Migration 047: widen trigger CHECK to include 'hook'.
+    // SQLite cannot alter CHECK constraints in-place; a table swap is required.
+    // Also recreates indexes dropped by the table swap (ticket, repo, parent_wf).
+    if version < 47 {
+        // Guard: check if the trigger CHECK already includes 'hook' by inspecting
+        // the table schema DDL.
+        let schema_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_runs'",
+            [],
+            |row| row.get(0),
+        )?;
+        let needs_table_swap =
+            !schema_sql.contains("'hook'") || schema_sql.contains("triggered_by_hook");
+        if needs_table_swap {
+            // Either the CHECK is missing 'hook' or the old `triggered_by_hook`
+            // column still exists — both require a full table swap.
+            with_foreign_keys_off(conn, || {
+                conn.execute_batch(include_str!("migrations/047_workflow_run_hooks.sql"))?;
+                Ok(())
+            })?;
+        } else {
+            // Table is up-to-date — just ensure indexes exist (idempotent).
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_runs_ticket ON workflow_runs(ticket_id);
+                 CREATE INDEX IF NOT EXISTS idx_workflow_runs_repo ON workflow_runs(repo_id);
+                 CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_wf ON workflow_runs(parent_workflow_run_id);",
+            )?;
+        }
+        bump_version(conn, 47)?;
+    }
+
+    if version < 48 {
+        conn.execute_batch(include_str!(
+            "migrations/048_backfill_workflow_run_repo_id.sql"
+        ))?;
+        bump_version(conn, 48)?;
+    }
+
+    if version < 49 {
+        conn.execute_batch(include_str!("migrations/049_feature_last_commit_at.sql"))?;
+        bump_version(conn, 49)?;
+    }
+
+    if version < 50 {
+        // Only ALTER if feedback_requests table exists (created in migration 18).
+        let has_table: bool = conn
+            .prepare("SELECT 1 FROM feedback_requests LIMIT 0")
+            .is_ok();
+        if has_table {
+            let has_col: bool = conn
+                .prepare("SELECT feedback_type FROM feedback_requests LIMIT 0")
+                .is_ok();
+            if !has_col {
+                conn.execute_batch(include_str!("migrations/050_feedback_type_and_timeout.sql"))?;
+            }
+        }
+        bump_version(conn, 50)?;
+    }
+
+    // Migration 051: add repo_id column to agent_runs for repo-scoped agents.
+    if version < 51 {
+        let has_repo_id: bool = conn
+            .prepare("SELECT repo_id FROM agent_runs LIMIT 0")
+            .is_ok();
+        if !has_repo_id {
+            conn.execute_batch(include_str!("migrations/051_agent_run_repo_id.sql"))?;
+        }
+        bump_version(conn, 51)?;
+    }
+
+    // Migration 052: create push_subscriptions table for PWA push notifications.
+    if version < 52 {
+        let has_table: bool = conn
+            .prepare("SELECT 1 FROM push_subscriptions LIMIT 0")
+            .is_ok();
+        if !has_table {
+            conn.execute_batch(include_str!("migrations/052_push_subscriptions.sql"))?;
+        }
+        bump_version(conn, 52)?;
+    }
+
+    // Migration 053: covering index on agent_runs(worktree_id, started_at) to
+    // speed up the latest-run-per-worktree subquery in list_all_with_status().
+    if version < 53 {
+        conn.execute_batch(include_str!(
+            "migrations/053_idx_agent_runs_worktree_started.sql"
+        ))?;
+        bump_version(conn, 53)?;
+    }
+
+    // Migration 054: add workflow column to tickets table for routing overrides.
+    if version < 54 {
+        conn.execute_batch(include_str!("migrations/054_ticket_workflow.sql"))?;
+        bump_version(conn, 54)?;
+    }
+
+    // Migration 055: add agent_map column to tickets table for pre-resolved agent assignments.
+    if version < 55 {
+        conn.execute_batch(include_str!("migrations/055_ticket_agent_map.sql"))?;
+        bump_version(conn, 55)?;
     }
 
     Ok(())
@@ -688,12 +990,19 @@ mod tests {
                 id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
                 local_path TEXT NOT NULL, remote_url TEXT NOT NULL,
                 default_branch TEXT NOT NULL, workspace_dir TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL, model TEXT
             );
             CREATE TABLE worktrees (
                 id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
                 slug TEXT NOT NULL, branch TEXT NOT NULL, path TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+                status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+                base_branch TEXT NOT NULL DEFAULT 'main'
+            );
+            CREATE TABLE repo_issue_sources (
+                id          TEXT PRIMARY KEY,
+                repo_id     TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL CHECK (source_type IN ('github', 'jira')),
+                config_json TEXT NOT NULL
             );
             CREATE TABLE tickets (
                 id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
@@ -739,9 +1048,9 @@ mod tests {
             );
             INSERT INTO _conductor_meta VALUES ('schema_version', '26');
             INSERT INTO repos VALUES ('r1', 'test-repo', '/tmp/repo',
-                'https://github.com/test/repo.git', 'main', '/tmp/ws', '2024-01-01T00:00:00Z');
+                'https://github.com/test/repo.git', 'main', '/tmp/ws', '2024-01-01T00:00:00Z', NULL);
             INSERT INTO worktrees VALUES ('w1', 'r1', 'feat-test', 'feat/test',
-                '/tmp/ws/feat-test', 'active', '2024-01-01T00:00:00Z');
+                '/tmp/ws/feat-test', 'active', '2024-01-01T00:00:00Z', 'main');
             INSERT INTO agent_runs (id, worktree_id, prompt, started_at)
                 VALUES ('ar1', 'w1', 'workflow', '2024-01-01T00:00:00Z');
             INSERT INTO workflow_runs (id, workflow_name, worktree_id, parent_run_id,
@@ -801,5 +1110,352 @@ mod tests {
             )
             .unwrap();
         assert_eq!(null_count, 1);
+    }
+
+    /// Verifies that `with_foreign_keys_off` restores FK enforcement even when
+    /// the closure returns an error.
+    #[test]
+    fn test_foreign_keys_restored_on_migration_error() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Enable FK enforcement before the call.
+        conn.pragma_update(None, "foreign_keys", "on").unwrap();
+
+        // Call with a closure that always fails.
+        let result = with_foreign_keys_off(&conn, || {
+            Err(crate::error::ConductorError::Git(
+                "simulated migration error".to_string(),
+            ))
+        });
+        assert!(result.is_err(), "helper must propagate the closure error");
+
+        // FK pragma must be restored to ON despite the error.
+        let fk_on: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            fk_on, 1,
+            "foreign_keys pragma must be restored to ON after closure error"
+        );
+    }
+
+    #[test]
+    fn test_migrate_repo_columns_to_config_writes_files() {
+        use crate::config::RepoConfig;
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        // Create a minimal repos table with the old columns still present.
+        conn.execute_batch(
+            "CREATE TABLE repos (
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                local_path TEXT NOT NULL,
+                remote_url TEXT NOT NULL,
+                default_branch TEXT NOT NULL DEFAULT 'main',
+                workspace_dir TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                model TEXT
+            );",
+        )
+        .unwrap();
+
+        // Repo 1: custom default_branch and model — both should be migrated.
+        conn.execute(
+            "INSERT INTO repos (id, slug, local_path, remote_url, default_branch, workspace_dir, created_at, model)
+             VALUES ('r1', 'repo1', ?1, 'https://x/r1.git', 'develop', '/ws/repo1', '2025-01-01T00:00:00Z', 'opus')",
+            rusqlite::params![dir1.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        // Repo 2: default values — should be skipped (no config file created).
+        conn.execute(
+            "INSERT INTO repos (id, slug, local_path, remote_url, default_branch, workspace_dir, created_at, model)
+             VALUES ('r2', 'repo2', ?1, 'https://x/r2.git', 'main', '/ws/repo2', '2025-01-01T00:00:00Z', NULL)",
+            rusqlite::params![dir2.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        migrate_repo_columns_to_config(&conn);
+
+        // Repo 1 should have a .conductor/config.toml with the migrated values.
+        let rc1 = RepoConfig::load(dir1.path()).unwrap();
+        assert_eq!(rc1.defaults.default_branch.as_deref(), Some("develop"));
+        assert_eq!(rc1.defaults.model.as_deref(), Some("opus"));
+
+        // Repo 2 should NOT have a config file (all defaults — nothing to migrate).
+        assert!(
+            !dir2.path().join(".conductor").join("config.toml").exists(),
+            "repo with default values should not get a config file"
+        );
+    }
+
+    #[test]
+    fn test_migrate_repo_columns_to_config_no_columns() {
+        // If columns are already gone, migration should be a no-op.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE repos (
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                local_path TEXT NOT NULL,
+                remote_url TEXT NOT NULL,
+                workspace_dir TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // Should not panic.
+        migrate_repo_columns_to_config(&conn);
+    }
+
+    // -----------------------------------------------------------------------
+    // Migration 047 tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a minimal v46 schema with the given `workflow_runs` DDL.
+    /// Returns a connection positioned at version 46, ready for migration 047.
+    fn setup_v46_schema(conn: &Connection, workflow_runs_ddl: &str) {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _conductor_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE repos (
+                 id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
+                 local_path TEXT NOT NULL, remote_url TEXT NOT NULL,
+                 workspace_dir TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE TABLE worktrees (
+                 id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
+                 slug TEXT NOT NULL, branch TEXT NOT NULL, path TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+                 base_branch TEXT NOT NULL DEFAULT 'main'
+             );
+             CREATE TABLE tickets (
+                 id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
+                 source_type TEXT NOT NULL, source_id TEXT NOT NULL,
+                 title TEXT NOT NULL, body TEXT, url TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'open', priority TEXT,
+                 labels TEXT, assignee TEXT, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE agent_runs (
+                 id TEXT PRIMARY KEY, worktree_id TEXT,
+                 claude_session_id TEXT, prompt TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'running', result_text TEXT,
+                 cost_usd REAL, num_turns INTEGER, duration_ms INTEGER,
+                 started_at TEXT NOT NULL, ended_at TEXT, tmux_window TEXT,
+                 log_file TEXT, model TEXT, plan TEXT, parent_run_id TEXT
+             );
+             CREATE TABLE features (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(workflow_runs_ddl).unwrap();
+        conn.execute_batch(
+            "INSERT INTO _conductor_meta VALUES ('schema_version', '46');
+             INSERT INTO repos VALUES ('r1', 'test-repo', '/tmp/repo',
+                 'https://github.com/test/repo.git', '/tmp/ws', '2024-01-01T00:00:00Z');
+             INSERT INTO agent_runs (id, prompt, started_at)
+                 VALUES ('ar1', 'workflow', '2024-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    }
+
+    #[test]
+    fn test_migration_047_table_swap_adds_hook_trigger() {
+        // Path 1: table CHECK does not include 'hook' — full table swap required.
+        let conn = Connection::open_in_memory().unwrap();
+        let old_ddl = "CREATE TABLE workflow_runs (
+            id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL,
+            worktree_id TEXT REFERENCES worktrees(id) ON DELETE CASCADE,
+            parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','running','waiting','completed','failed','cancelled','timed_out')),
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            trigger TEXT NOT NULL DEFAULT 'manual'
+                CHECK (trigger IN ('manual','pr','scheduled')),
+            started_at TEXT NOT NULL, ended_at TEXT, result_summary TEXT,
+            definition_snapshot TEXT, inputs TEXT,
+            ticket_id TEXT REFERENCES tickets(id),
+            repo_id TEXT REFERENCES repos(id),
+            parent_workflow_run_id TEXT,
+            target_label TEXT, default_bot_name TEXT,
+            iteration INTEGER NOT NULL DEFAULT 0, blocked_on TEXT,
+            feature_id TEXT REFERENCES features(id)
+        );
+        CREATE INDEX idx_workflow_runs_ticket ON workflow_runs(ticket_id);
+        CREATE INDEX idx_workflow_runs_repo ON workflow_runs(repo_id);
+        CREATE INDEX idx_workflow_runs_parent_wf ON workflow_runs(parent_workflow_run_id);
+        INSERT INTO workflow_runs (id, workflow_name, parent_run_id, status, trigger, started_at)
+            VALUES ('wfr1', 'my-flow', 'ar1', 'completed', 'manual', '2024-01-01T00:00:00Z');";
+        setup_v46_schema(&conn, old_ddl);
+
+        run(&conn).unwrap();
+
+        // 'hook' trigger must now be accepted.
+        conn.execute(
+            "INSERT INTO workflow_runs (id, workflow_name, parent_run_id, trigger, started_at)
+             VALUES ('wfr2', 'hook-flow', 'ar1', 'hook', '2024-01-02T00:00:00Z')",
+            [],
+        )
+        .expect("trigger='hook' should be accepted after migration 047");
+
+        // Original row must survive.
+        let name: String = conn
+            .query_row(
+                "SELECT workflow_name FROM workflow_runs WHERE id = 'wfr1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "my-flow");
+
+        // Indexes must be recreated.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name IN ('idx_workflow_runs_ticket','idx_workflow_runs_repo','idx_workflow_runs_parent_wf')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 3, "all three indexes must be recreated");
+    }
+
+    #[test]
+    fn test_migration_047_drops_triggered_by_hook_column() {
+        // Path 2: table already has 'hook' CHECK but still has old
+        // `triggered_by_hook` column — table swap should drop it.
+        let conn = Connection::open_in_memory().unwrap();
+        let ddl_with_old_column = "CREATE TABLE workflow_runs (
+            id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL,
+            worktree_id TEXT REFERENCES worktrees(id) ON DELETE CASCADE,
+            parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','running','waiting','completed','failed','cancelled','timed_out')),
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            trigger TEXT NOT NULL DEFAULT 'manual'
+                CHECK (trigger IN ('manual','pr','scheduled','hook')),
+            triggered_by_hook INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL, ended_at TEXT, result_summary TEXT,
+            definition_snapshot TEXT, inputs TEXT,
+            ticket_id TEXT REFERENCES tickets(id),
+            repo_id TEXT REFERENCES repos(id),
+            parent_workflow_run_id TEXT,
+            target_label TEXT, default_bot_name TEXT,
+            iteration INTEGER NOT NULL DEFAULT 0, blocked_on TEXT,
+            feature_id TEXT REFERENCES features(id)
+        );
+        INSERT INTO workflow_runs (id, workflow_name, parent_run_id, trigger, started_at)
+            VALUES ('wfr1', 'old-flow', 'ar1', 'hook', '2024-01-01T00:00:00Z');";
+        setup_v46_schema(&conn, ddl_with_old_column);
+
+        run(&conn).unwrap();
+
+        // `triggered_by_hook` column must be gone.
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !schema.contains("triggered_by_hook"),
+            "triggered_by_hook column should be removed"
+        );
+
+        // Original row must survive (trigger value preserved).
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM workflow_runs WHERE id = 'wfr1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "hook");
+    }
+
+    #[test]
+    fn test_migration_047_index_only_when_up_to_date() {
+        // Path 3: table is already fully up-to-date (has 'hook' CHECK,
+        // no `triggered_by_hook` column) — only indexes should be created.
+        let conn = Connection::open_in_memory().unwrap();
+        let up_to_date_ddl = "CREATE TABLE workflow_runs (
+            id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL,
+            worktree_id TEXT REFERENCES worktrees(id) ON DELETE CASCADE,
+            parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','running','waiting','completed','failed','cancelled','timed_out')),
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            trigger TEXT NOT NULL DEFAULT 'manual'
+                CHECK (trigger IN ('manual','pr','scheduled','hook')),
+            started_at TEXT NOT NULL, ended_at TEXT, result_summary TEXT,
+            definition_snapshot TEXT, inputs TEXT,
+            ticket_id TEXT REFERENCES tickets(id),
+            repo_id TEXT REFERENCES repos(id),
+            parent_workflow_run_id TEXT,
+            target_label TEXT, default_bot_name TEXT,
+            iteration INTEGER NOT NULL DEFAULT 0, blocked_on TEXT,
+            feature_id TEXT REFERENCES features(id)
+        );
+        INSERT INTO workflow_runs (id, workflow_name, parent_run_id, trigger, started_at)
+            VALUES ('wfr1', 'ok-flow', 'ar1', 'hook', '2024-01-01T00:00:00Z');";
+        setup_v46_schema(&conn, up_to_date_ddl);
+
+        run(&conn).unwrap();
+
+        // Indexes must exist.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name IN ('idx_workflow_runs_ticket','idx_workflow_runs_repo','idx_workflow_runs_parent_wf')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 3, "indexes must be created in index-only path");
+
+        // Data must be intact (no table swap).
+        let name: String = conn
+            .query_row(
+                "SELECT workflow_name FROM workflow_runs WHERE id = 'wfr1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "ok-flow");
+    }
+
+    #[test]
+    fn test_stale_binary_detection() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Run all migrations normally first.
+        run(&conn).unwrap();
+
+        // Simulate a newer binary having migrated the DB further.
+        let future_version = LATEST_SCHEMA_VERSION + 1;
+        bump_version(&conn, future_version).unwrap();
+
+        // Now run() should detect the stale binary and fail.
+        let err = run(&conn).expect_err("should fail with stale binary error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("Database schema version ({future_version})")),
+            "error should mention the DB version, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("this binary supports ({LATEST_SCHEMA_VERSION})")),
+            "error should mention the binary version, got: {msg}"
+        );
+        assert!(
+            msg.contains("cargo build"),
+            "error should suggest rebuilding, got: {msg}"
+        );
     }
 }

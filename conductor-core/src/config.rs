@@ -1,17 +1,57 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::error::{ConductorError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WorkTarget {
-    pub name: String,
-    pub command: String,
-    #[serde(rename = "type")]
-    pub target_type: String,
+/// Controls which permission flag is passed to Claude Code when launching agent runs.
+///
+/// ```toml
+/// [general]
+/// agent_permission_mode = "skip-permissions" # default — uses --dangerously-skip-permissions
+/// agent_permission_mode = "auto-mode"        # uses --enable-auto-mode (may prompt in headless agents)
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPermissionMode {
+    /// Use `--enable-auto-mode` (may prompt for permissions in headless agents).
+    AutoMode,
+    /// Use `--dangerously-skip-permissions` (default for headless agent runs).
+    #[default]
+    SkipPermissions,
+    /// Use `--permission-mode plan` (read-only mode for repo-scoped agents).
+    Plan,
+}
+
+impl AgentPermissionMode {
+    /// Returns the CLI flag string to pass to the `claude` command.
+    pub fn cli_flag(&self) -> &str {
+        match self {
+            Self::AutoMode => "--enable-auto-mode",
+            Self::SkipPermissions => "--dangerously-skip-permissions",
+            Self::Plan => "--permission-mode",
+        }
+    }
+
+    /// Returns the optional value argument that follows the flag (e.g. "plan" for `--permission-mode plan`).
+    pub fn cli_flag_value(&self) -> Option<&str> {
+        match self {
+            Self::Plan => Some("plan"),
+            _ => None,
+        }
+    }
+
+    /// Returns the `--allowedTools` glob pattern for this mode, if any.
+    ///
+    /// Plan mode restricts agents to conductor MCP tools only.
+    pub fn allowed_tools(&self) -> Option<&'static str> {
+        match self {
+            Self::Plan => Some("mcp__conductor__*"),
+            _ => None,
+        }
+    }
 }
 
 /// Controls whether an agent is auto-started after creating a worktree from a ticket.
@@ -27,12 +67,59 @@ pub enum AutoStartAgent {
     Never,
 }
 
-fn default_work_targets() -> Vec<WorkTarget> {
-    vec![WorkTarget {
-        name: "VS Code".to_string(),
-        command: "code".to_string(),
-        target_type: "editor".to_string(),
-    }]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub workflows: WorkflowNotificationConfig,
+    #[serde(default)]
+    pub slack: SlackConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowNotificationConfig {
+    #[serde(default)]
+    pub on_success: bool,
+    #[serde(default = "default_true")]
+    pub on_failure: bool,
+    #[serde(default = "default_true")]
+    pub on_gate_human: bool,
+    #[serde(default)]
+    pub on_gate_ci: bool,
+    #[serde(default = "default_true")]
+    pub on_gate_pr_review: bool,
+}
+
+impl Default for WorkflowNotificationConfig {
+    fn default() -> Self {
+        Self {
+            on_success: false,
+            on_failure: true,
+            on_gate_human: true,
+            on_gate_ci: false,
+            on_gate_pr_review: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebPushConfig {
+    /// VAPID public key (base64url encoded)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vapid_public_key: Option<String>,
+    /// VAPID private key (base64url encoded)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vapid_private_key: Option<String>,
+    /// Subject for VAPID (typically a mailto: or https: URL)
+    #[serde(default)]
+    pub vapid_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,6 +130,10 @@ pub struct Config {
     pub defaults: DefaultsConfig,
     #[serde(default)]
     pub github: GitHubSettings,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub web_push: WebPushConfig,
 }
 
 /// Top-level `[github]` section.
@@ -90,13 +181,12 @@ pub struct GeneralConfig {
     pub workspace_root: PathBuf,
     #[serde(default = "default_sync_interval")]
     pub sync_interval_minutes: u32,
-    /// Deprecated: use `work_targets` instead. Kept for backward compatibility.
-    #[serde(default, skip_serializing)]
-    pub editor: Option<String>,
-    #[serde(default = "default_work_targets")]
-    pub work_targets: Vec<WorkTarget>,
     #[serde(default)]
     pub auto_start_agent: AutoStartAgent,
+    /// Which permission flag to pass to Claude Code for agent runs.
+    /// Defaults to `auto-mode` (`--enable-auto-mode`).
+    #[serde(default)]
+    pub agent_permission_mode: AgentPermissionMode,
     /// Global default model for Claude agent runs (e.g. "sonnet", "claude-opus-4-6").
     /// Overridden by per-worktree and per-run model settings. Omit to use claude's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +199,10 @@ pub struct GeneralConfig {
     /// or the stem of a file in `~/.conductor/themes/`. Omit to use the default conductor theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Automatically detect merged PRs and clean up worktrees (delete local/remote branch,
+    /// remove worktree directory, auto-close orphaned features). Defaults to true.
+    #[serde(default = "default_true")]
+    pub auto_cleanup_merged_branches: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +213,10 @@ pub struct DefaultsConfig {
     pub worktree_prefix_feat: String,
     #[serde(default = "default_fix_prefix")]
     pub worktree_prefix_fix: String,
+    /// Number of days after which an active feature with no recent activity is
+    /// considered stale. Set to 0 to disable stale detection.
+    #[serde(default = "default_stale_feature_days")]
+    pub stale_feature_days: u32,
 }
 
 fn default_workspace_root() -> PathBuf {
@@ -141,6 +239,10 @@ fn default_fix_prefix() -> String {
     "fix-".to_string()
 }
 
+fn default_stale_feature_days() -> u32 {
+    14
+}
+
 fn default_true() -> bool {
     true
 }
@@ -150,12 +252,12 @@ impl Default for GeneralConfig {
         Self {
             workspace_root: default_workspace_root(),
             sync_interval_minutes: default_sync_interval(),
-            editor: None,
-            work_targets: default_work_targets(),
             auto_start_agent: AutoStartAgent::default(),
+            agent_permission_mode: AgentPermissionMode::default(),
             model: None,
             inject_startup_context: true,
             theme: None,
+            auto_cleanup_merged_branches: true,
         }
     }
 }
@@ -166,6 +268,7 @@ impl Default for DefaultsConfig {
             default_branch: default_branch(),
             worktree_prefix_feat: default_feat_prefix(),
             worktree_prefix_fix: default_fix_prefix(),
+            stale_feature_days: default_stale_feature_days(),
         }
     }
 }
@@ -175,9 +278,16 @@ impl Default for DefaultsConfig {
 /// The result is cached after the first call so that repeated invocations
 /// (e.g. inside loops that call `agent_log_path`) avoid redundant OS-level
 /// `home_dir()` lookups.
+///
+/// The `CONDUCTOR_HOME` environment variable overrides the default location.
+/// This is used by CLI integration tests to point each subprocess at an
+/// isolated temp directory without touching the developer's real data.
 pub fn conductor_dir() -> &'static PathBuf {
     static CONDUCTOR_DIR: OnceLock<PathBuf> = OnceLock::new();
     CONDUCTOR_DIR.get_or_init(|| {
+        if let Ok(home) = std::env::var("CONDUCTOR_HOME") {
+            return PathBuf::from(home);
+        }
         dirs::home_dir()
             .expect("could not determine home directory")
             .join(".conductor")
@@ -185,7 +295,27 @@ pub fn conductor_dir() -> &'static PathBuf {
 }
 
 /// Returns the path to the SQLite database.
+///
+/// When the `CONDUCTOR_DB_PATH` environment variable is set to a non-empty
+/// value, uses that path directly. Otherwise returns the global
+/// `~/.conductor/conductor.db`.
+///
+/// The default global path ensures that repos, tickets, and workflow runs
+/// are accessible regardless of the current working directory (including
+/// from within worktrees where workflow script steps execute).
+///
+/// Use `CONDUCTOR_DB_PATH` for isolated migration testing against a local
+/// database with seed data, without affecting the production DB:
+///
+/// ```sh
+/// CONDUCTOR_DB_PATH=/tmp/test.db conductor tickets list
+/// ```
 pub fn db_path() -> PathBuf {
+    if let Ok(custom) = std::env::var("CONDUCTOR_DB_PATH") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
     conductor_dir().join("conductor.db")
 }
 
@@ -212,9 +342,6 @@ pub fn agent_log_path(run_id: &str) -> PathBuf {
 }
 
 /// Load config from disk, returning defaults if the file doesn't exist.
-/// Handles backward compatibility: if the old `editor` field is present
-/// and `work_targets` was not explicitly set, migrates the editor value
-/// into a single work target.
 pub fn load_config() -> Result<Config> {
     load_config_from(&config_path())
 }
@@ -224,7 +351,7 @@ fn load_config_from(path: &std::path::Path) -> Result<Config> {
         return Ok(Config::default());
     }
     let contents = std::fs::read_to_string(path)?;
-    let mut config: Config =
+    let config: Config =
         toml::from_str(&contents).map_err(|e| ConductorError::Config(e.to_string()))?;
 
     // Parse raw TOML once for migration checks and github.app validation.
@@ -258,24 +385,6 @@ fn load_config_from(path: &std::path::Path) -> Result<Config> {
             }
         }
     }
-
-    // Backward compat: migrate old `editor` field to `work_targets`
-    if let Some(ref editor) = config.general.editor {
-        // Check if the raw TOML has work_targets explicitly set
-        let has_work_targets = raw
-            .get("general")
-            .and_then(|g| g.get("work_targets"))
-            .is_some();
-
-        if !has_work_targets {
-            config.general.work_targets = vec![WorkTarget {
-                name: editor.clone(),
-                command: editor.clone(),
-                target_type: "editor".to_string(),
-            }];
-        }
-    }
-    config.general.editor = None;
 
     Ok(config)
 }
@@ -346,6 +455,90 @@ pub fn ensure_dirs(config: &Config) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-repo .conductor/config.toml
+// ---------------------------------------------------------------------------
+
+/// Per-repo configuration loaded from `<repo_root>/.conductor/config.toml`.
+///
+/// All fields are optional — absent keys fall through to global [`Config`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoConfig {
+    #[serde(default)]
+    pub defaults: RepoDefaults,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_merge_strategy: Option<String>,
+}
+
+impl RepoConfig {
+    /// Load repo-level config from `<repo_root>/.conductor/config.toml`.
+    /// Returns defaults (all-None) if the file doesn't exist.
+    pub fn load(repo_path: &Path) -> Result<RepoConfig> {
+        let path = repo_path.join(".conductor").join("config.toml");
+        if !path.exists() {
+            return Ok(RepoConfig::default());
+        }
+        let contents = std::fs::read_to_string(&path)?;
+        let config: RepoConfig =
+            toml::from_str(&contents).map_err(|e| ConductorError::Config(e.to_string()))?;
+        Ok(config)
+    }
+
+    /// Save repo-level config to `<repo_root>/.conductor/config.toml`.
+    /// Creates the `.conductor/` directory if needed.
+    pub fn save(&self, repo_path: &Path) -> Result<()> {
+        let dir = repo_path.join(".conductor");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+
+        // Patch-write: preserve unknown sections
+        let mut merged: toml::Value = if path.exists() {
+            let existing = std::fs::read_to_string(&path)?;
+            toml::from_str(&existing).map_err(|e| {
+                ConductorError::Config(format!("existing repo config is malformed: {e}"))
+            })?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+
+        let new_value: toml::Value = toml::Value::try_from(self)
+            .map_err(|e| ConductorError::Config(format!("serialize repo config: {e}")))?;
+        merge_toml(&mut merged, new_value);
+
+        // Explicitly remove keys that are None in the struct but survived merge
+        // (because skip_serializing_if omits them, so merge_toml preserves stale keys).
+        if let Some(defaults) = merged.get_mut("defaults").and_then(|d| d.as_table_mut()) {
+            if self.defaults.model.is_none() {
+                defaults.remove("model");
+            }
+            if self.defaults.default_branch.is_none() {
+                defaults.remove("default_branch");
+            }
+            if self.defaults.bot_name.is_none() {
+                defaults.remove("bot_name");
+            }
+            if self.defaults.feature_merge_strategy.is_none() {
+                defaults.remove("feature_merge_strategy");
+            }
+        }
+
+        let contents = toml::to_string_pretty(&merged)
+            .map_err(|e| ConductorError::Config(format!("serialize repo config: {e}")))?;
+        std::fs::write(&path, contents)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +571,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.general.auto_start_agent, AutoStartAgent::Never);
+    }
+
+    #[test]
+    fn test_agent_permission_mode_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.general.agent_permission_mode,
+            AgentPermissionMode::SkipPermissions
+        );
+    }
+
+    #[test]
+    fn test_agent_permission_mode_auto_mode() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            agent_permission_mode = "auto-mode"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.general.agent_permission_mode,
+            AgentPermissionMode::AutoMode
+        );
+    }
+
+    #[test]
+    fn test_agent_permission_mode_skip_permissions() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            agent_permission_mode = "skip-permissions"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.general.agent_permission_mode,
+            AgentPermissionMode::SkipPermissions
+        );
+    }
+
+    #[test]
+    fn test_agent_permission_mode_cli_flag_auto() {
+        assert_eq!(
+            AgentPermissionMode::AutoMode.cli_flag(),
+            "--enable-auto-mode"
+        );
+    }
+
+    #[test]
+    fn test_agent_permission_mode_cli_flag_skip() {
+        assert_eq!(
+            AgentPermissionMode::SkipPermissions.cli_flag(),
+            "--dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn test_agent_permission_mode_cli_flag_plan() {
+        assert_eq!(AgentPermissionMode::Plan.cli_flag(), "--permission-mode");
+    }
+
+    #[test]
+    fn test_agent_permission_mode_cli_flag_value() {
+        assert_eq!(AgentPermissionMode::AutoMode.cli_flag_value(), None);
+        assert_eq!(AgentPermissionMode::SkipPermissions.cli_flag_value(), None);
+        assert_eq!(AgentPermissionMode::Plan.cli_flag_value(), Some("plan"));
     }
 
     #[test]
@@ -414,6 +674,24 @@ mod tests {
     fn test_inject_startup_context_default_true() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.general.inject_startup_context);
+    }
+
+    #[test]
+    fn test_auto_cleanup_merged_branches_default_true() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.general.auto_cleanup_merged_branches);
+    }
+
+    #[test]
+    fn test_auto_cleanup_merged_branches_opt_out() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            auto_cleanup_merged_branches = false
+        "#,
+        )
+        .unwrap();
+        assert!(!config.general.auto_cleanup_merged_branches);
     }
 
     #[test]
@@ -625,6 +903,75 @@ app_id = 123456
     }
 
     #[test]
+    fn test_notification_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.notifications.enabled);
+        assert!(!config.notifications.workflows.on_success);
+        assert!(config.notifications.workflows.on_failure);
+        assert!(config.notifications.workflows.on_gate_human);
+        assert!(!config.notifications.workflows.on_gate_ci);
+        assert!(config.notifications.workflows.on_gate_pr_review);
+        assert!(config.notifications.slack.webhook_url.is_none());
+    }
+
+    #[test]
+    fn test_notification_slack_config() {
+        let config: Config = toml::from_str(
+            r#"
+            [notifications]
+            enabled = true
+            [notifications.slack]
+            webhook_url = "https://hooks.slack.com/services/T00/B00/xxx"
+        "#,
+        )
+        .unwrap();
+        assert!(config.notifications.enabled);
+        assert_eq!(
+            config.notifications.slack.webhook_url.as_deref(),
+            Some("https://hooks.slack.com/services/T00/B00/xxx")
+        );
+    }
+
+    #[test]
+    fn test_notification_full_override() {
+        let config: Config = toml::from_str(
+            r#"
+            [notifications]
+            enabled = true
+            [notifications.workflows]
+            on_success = true
+            on_failure = false
+        "#,
+        )
+        .unwrap();
+        assert!(config.notifications.enabled);
+        assert!(config.notifications.workflows.on_success);
+        assert!(!config.notifications.workflows.on_failure);
+        // Gate fields should still be at their defaults
+        assert!(config.notifications.workflows.on_gate_human);
+        assert!(!config.notifications.workflows.on_gate_ci);
+        assert!(config.notifications.workflows.on_gate_pr_review);
+    }
+
+    #[test]
+    fn test_notification_gate_overrides() {
+        let config: Config = toml::from_str(
+            r#"
+            [notifications]
+            enabled = true
+            [notifications.workflows]
+            on_gate_human = false
+            on_gate_ci = true
+            on_gate_pr_review = false
+        "#,
+        )
+        .unwrap();
+        assert!(!config.notifications.workflows.on_gate_human);
+        assert!(config.notifications.workflows.on_gate_ci);
+        assert!(!config.notifications.workflows.on_gate_pr_review);
+    }
+
+    #[test]
     fn test_save_config_preserves_unknown_sections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -655,5 +1002,153 @@ some_key = "some_value"
                 .and_then(|v| v.as_str()),
             Some("some_value")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // RepoConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_config_load_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = RepoConfig::load(dir.path()).unwrap();
+        assert!(rc.defaults.model.is_none());
+        assert!(rc.defaults.default_branch.is_none());
+        assert!(rc.defaults.bot_name.is_none());
+        assert!(rc.defaults.feature_merge_strategy.is_none());
+    }
+
+    #[test]
+    fn test_repo_config_load_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let conductor_dir = dir.path().join(".conductor");
+        std::fs::create_dir_all(&conductor_dir).unwrap();
+        std::fs::write(
+            conductor_dir.join("config.toml"),
+            r#"
+[defaults]
+model = "claude-opus-4-6"
+default_branch = "develop"
+"#,
+        )
+        .unwrap();
+
+        let rc = RepoConfig::load(dir.path()).unwrap();
+        assert_eq!(rc.defaults.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(rc.defaults.default_branch.as_deref(), Some("develop"));
+        assert!(rc.defaults.bot_name.is_none());
+    }
+
+    #[test]
+    fn test_repo_config_load_partial_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let conductor_dir = dir.path().join(".conductor");
+        std::fs::create_dir_all(&conductor_dir).unwrap();
+        std::fs::write(
+            conductor_dir.join("config.toml"),
+            r#"
+[defaults]
+bot_name = "my-bot"
+"#,
+        )
+        .unwrap();
+
+        let rc = RepoConfig::load(dir.path()).unwrap();
+        assert!(rc.defaults.model.is_none());
+        assert!(rc.defaults.default_branch.is_none());
+        assert_eq!(rc.defaults.bot_name.as_deref(), Some("my-bot"));
+    }
+
+    #[test]
+    fn test_repo_config_save_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = RepoConfig {
+            defaults: RepoDefaults {
+                model: Some("sonnet".to_string()),
+                default_branch: Some("main".to_string()),
+                bot_name: None,
+                feature_merge_strategy: Some("merge".to_string()),
+            },
+        };
+        rc.save(dir.path()).unwrap();
+
+        let loaded = RepoConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(loaded.defaults.default_branch.as_deref(), Some("main"));
+        assert!(loaded.defaults.bot_name.is_none());
+        assert_eq!(
+            loaded.defaults.feature_merge_strategy.as_deref(),
+            Some("merge")
+        );
+    }
+
+    #[test]
+    fn test_repo_config_save_creates_conductor_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = RepoConfig::default();
+        rc.save(dir.path()).unwrap();
+        assert!(dir.path().join(".conductor").join("config.toml").exists());
+    }
+
+    #[test]
+    fn test_repo_config_save_clears_option_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        // First, save a config with model set.
+        let rc = RepoConfig {
+            defaults: RepoDefaults {
+                model: Some("opus".to_string()),
+                default_branch: Some("develop".to_string()),
+                bot_name: None,
+                feature_merge_strategy: None,
+            },
+        };
+        rc.save(dir.path()).unwrap();
+        let loaded = RepoConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.defaults.model.as_deref(), Some("opus"));
+        assert_eq!(loaded.defaults.default_branch.as_deref(), Some("develop"));
+
+        // Now clear model by saving with None — it must actually be removed.
+        let rc2 = RepoConfig {
+            defaults: RepoDefaults {
+                model: None,
+                default_branch: Some("develop".to_string()),
+                bot_name: None,
+                feature_merge_strategy: None,
+            },
+        };
+        rc2.save(dir.path()).unwrap();
+        let loaded2 = RepoConfig::load(dir.path()).unwrap();
+        assert!(
+            loaded2.defaults.model.is_none(),
+            "model should be cleared after saving with None"
+        );
+        assert_eq!(loaded2.defaults.default_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn test_db_path_env_override() {
+        let custom = "/tmp/conductor-test-db-path-override.db";
+        // Safety: no other test touches CONDUCTOR_DB_PATH
+        unsafe {
+            std::env::set_var("CONDUCTOR_DB_PATH", custom);
+        }
+        let result = db_path();
+        unsafe {
+            std::env::remove_var("CONDUCTOR_DB_PATH");
+        }
+        assert_eq!(result, PathBuf::from(custom));
+    }
+
+    #[test]
+    fn test_db_path_empty_env_falls_back_to_default() {
+        unsafe {
+            std::env::set_var("CONDUCTOR_DB_PATH", "");
+        }
+        let result = db_path();
+        unsafe {
+            std::env::remove_var("CONDUCTOR_DB_PATH");
+        }
+        // Should fall back to conductor_dir()/conductor.db
+        assert_eq!(result, conductor_dir().join("conductor.db"));
     }
 }

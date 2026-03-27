@@ -20,6 +20,9 @@ pub enum ConductorError {
     #[error("git error: {0}")]
     Git(String),
 
+    #[error("gh cli error: {0}")]
+    GhCli(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -41,6 +44,9 @@ pub enum ConductorError {
     #[error("agent error: {0}")]
     Agent(String),
 
+    #[error("feedback request {id} is not pending (current status: {status})")]
+    FeedbackNotPending { id: String, status: String },
+
     #[error("worktree already has a linked ticket")]
     TicketAlreadyLinked,
 
@@ -55,6 +61,18 @@ pub enum ConductorError {
 
     #[error("worktree already has an active workflow run (\"{name}\") — wait for it to finish or cancel it before starting another")]
     WorkflowRunAlreadyActive { name: String },
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("feature not found: {name}")]
+    FeatureNotFound { name: String },
+
+    #[error("feature already exists: {name}")]
+    FeatureAlreadyExists { name: String },
+
+    #[error("feature '{name}' is still active. Run `conductor feature close {repo} {name}` first")]
+    FeatureStillActive { repo: String, name: String },
 }
 
 pub type Result<T> = std::result::Result<T, ConductorError>;

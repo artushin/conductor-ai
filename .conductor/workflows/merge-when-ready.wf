@@ -3,10 +3,12 @@ workflow merge-when-ready {
     description = "Wait for CI checks and PR approval, then merge and close"
     trigger     = "manual"
     targets     = ["worktree"] // not "pr": merge-and-close runs `gh pr merge` from the branch checkout; the ephemeral --pr shallow clone has no push remote configured so the merge step would fail
+    group       = "Development"
   }
 
   inputs {
-    pr_url required
+    pr_url    required
+    ticket_source_id
   }
 
   gate pr_checks {
@@ -20,5 +22,9 @@ workflow merge-when-ready {
     on_timeout = fail
   }
 
-  call merge-and-close
+  script merge-and-close {
+    run = ".conductor/scripts/merge-and-close.sh"
+    as  = "merger"
+    env = { TICKET_NUMBER = "{{ticket_source_id}}" }
+  }
 }

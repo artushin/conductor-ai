@@ -3,6 +3,18 @@ workflow review-pr {
     description = "Run review swarm and aggregate findings"
     trigger     = "manual"
     targets     = ["pr", "worktree"]
+    group       = "Review"
+  }
+
+  inputs {
+    scope default = "full"
+  }
+
+  script detect-db-migrations {
+    run = ".conductor/scripts/detect-db-migrations.sh"
+  }
+  script detect-file-types {
+    run = ".conductor/scripts/detect-file-types.sh"
   }
 
   parallel {
@@ -10,13 +22,18 @@ workflow review-pr {
     with      = ["review-diff-scope", "off-diff-findings"]
     fail_fast = false
     call review-architecture    { retries = 1 }
-    call review-security        { retries = 1 }
-    call review-performance     { retries = 1 }
     call review-dry-abstraction { retries = 1 }
-    call review-error-handling  { retries = 1 }
-    call review-test-coverage   { retries = 1 }
-    call review-db-migrations   { retries = 1 }
+    call review-security        { retries = 1  if = "detect-file-types.has_code_changes" }
+    call review-performance     { retries = 1  if = "detect-file-types.has_code_changes" }
+    call review-error-handling  { retries = 1  if = "detect-file-types.has_code_changes" }
+    call review-test-coverage   { retries = 1  if = "detect-file-types.has_code_changes" }
+    call review-db-migrations   { retries = 1  if = "detect-db-migrations.has_db_migrations" }
   }
 
-  call review-aggregator { output = "review-aggregator" retries = 1 as = "conductor-ai-reviewer" }
+  call review-aggregator { output = "review-aggregator" retries = 1 }
+  script submit-review {
+    run = ".conductor/scripts/submit-review.sh"
+    as  = "reviewer"
+    env = { PRIOR_OUTPUT = "{{prior_output}}" PR_NUMBER = "{{pr_number}}" DRY_RUN = "{{dry_run}}" }
+  }
 }

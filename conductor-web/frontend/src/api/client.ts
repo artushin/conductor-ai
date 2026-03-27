@@ -1,6 +1,7 @@
 import type {
   Repo,
   Worktree,
+  WorktreeWithStatus,
   Ticket,
   TicketLabel,
   TicketAgentTotals,
@@ -13,10 +14,6 @@ import type {
   AgentPromptInfo,
   RunTreeTotals,
   AgentCreatedIssue,
-  WorkTarget,
-  CreateWorkTargetRequest,
-  PushResult,
-  CreatePrResult,
   IssueSource,
   CreateIssueSourceRequest,
   DiscoverableRepo,
@@ -26,12 +23,17 @@ import type {
   WorkflowRun,
   WorkflowRunStep,
   RunWorkflowRequest,
+  FeedbackRequest,
+  Notification,
+  PushSubscribeRequest,
+  VapidPublicKeyResponse,
+  PushSubscribeResponse,
 } from "./types";
-
-const BASE = "/api";
+import { getApiBaseUrl } from "./transport";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const base = await getApiBaseUrl();
+  const res = await fetch(`${base}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
@@ -57,6 +59,10 @@ export const api = {
     }),
 
   // Worktrees
+  listAllWorktrees: (showCompleted = false) =>
+    request<WorktreeWithStatus[]>(
+      showCompleted ? `/worktrees?show_completed=true` : `/worktrees`,
+    ),
   listWorktrees: (repoId: string, showCompleted = false) =>
     request<Worktree[]>(
       showCompleted
@@ -70,13 +76,6 @@ export const api = {
     }),
   deleteWorktree: (id: string) =>
     request<Worktree>(`/worktrees/${id}`, { method: "DELETE" }),
-  pushWorktree: (id: string) =>
-    request<PushResult>(`/worktrees/${id}/push`, { method: "POST" }),
-  createPr: (id: string, draft = false) =>
-    request<CreatePrResult>(`/worktrees/${id}/pr`, {
-      method: "POST",
-      body: JSON.stringify({ draft }),
-    }),
   linkTicket: (id: string, ticketId: string) =>
     request<Worktree>(`/worktrees/${id}/link-ticket`, {
       method: "POST",
@@ -108,6 +107,25 @@ export const api = {
     request<Record<string, AgentRun>>("/agent/latest-runs"),
   ticketAgentTotals: () =>
     request<Record<string, TicketAgentTotals>>("/agent/ticket-totals"),
+  latestRunsByWorktreeForRepo: (repoId: string) =>
+    request<Record<string, AgentRun>>(`/repos/${repoId}/agent/latest-runs`),
+  ticketAgentTotalsForRepo: (repoId: string) =>
+    request<Record<string, TicketAgentTotals>>(`/repos/${repoId}/agent/ticket-totals`),
+
+  // Repo-scoped agents (read-only)
+  startRepoAgent: (repoId: string, prompt: string, newSession?: boolean) =>
+    request<AgentRun>(`/repos/${repoId}/agent/start`, {
+      method: "POST",
+      body: JSON.stringify({ prompt, new_session: newSession ?? false }),
+    }),
+  listRepoAgentRuns: (repoId: string) =>
+    request<AgentRun[]>(`/repos/${repoId}/agent/runs`),
+  stopRepoAgent: (repoId: string, runId: string) =>
+    request<AgentRun>(`/repos/${repoId}/agent/${runId}/stop`, {
+      method: "POST",
+    }),
+  getRepoAgentEvents: (repoId: string, runId: string) =>
+    request<AgentEvent[]>(`/repos/${repoId}/agent/${runId}/events`),
 
   // Agent orchestration
   listAgentRuns: (worktreeId: string) =>
@@ -182,23 +200,6 @@ export const api = {
       body: JSON.stringify({ prompt }),
     }),
 
-  // Work Targets
-  listWorkTargets: () => request<WorkTarget[]>("/config/work-targets"),
-  createWorkTarget: (data: CreateWorkTargetRequest) =>
-    request<WorkTarget[]>("/config/work-targets", {
-      method: "POST",
-      body: JSON.stringify(data),
-    }),
-  deleteWorkTarget: (index: number) =>
-    request<WorkTarget[]>(`/config/work-targets/${index}`, {
-      method: "DELETE",
-    }),
-  replaceWorkTargets: (targets: CreateWorkTargetRequest[]) =>
-    request<WorkTarget[]>("/config/work-targets", {
-      method: "PUT",
-      body: JSON.stringify(targets),
-    }),
-
   // Issue Sources
   listIssueSources: (repoId: string) =>
     request<IssueSource[]>(`/repos/${repoId}/sources`),
@@ -219,6 +220,19 @@ export const api = {
       owner ? `/github/repos?owner=${encodeURIComponent(owner)}` : "/github/repos",
     ),
 
+  // Agent Feedback
+  getPendingFeedback: (worktreeId: string) =>
+    request<FeedbackRequest | null>(`/worktrees/${worktreeId}/agent/feedback`),
+  submitFeedback: (worktreeId: string, feedbackId: string, response: string) =>
+    request<FeedbackRequest>(`/worktrees/${worktreeId}/agent/feedback/${feedbackId}/respond`, {
+      method: "POST",
+      body: JSON.stringify({ response }),
+    }),
+  dismissFeedback: (worktreeId: string, feedbackId: string) =>
+    request<void>(`/worktrees/${worktreeId}/agent/feedback/${feedbackId}/dismiss`, {
+      method: "POST",
+    }),
+
   // Workflows
   listWorkflowDefs: (worktreeId: string) =>
     request<WorkflowDefSummary[]>(`/worktrees/${worktreeId}/workflows/defs`),
@@ -227,6 +241,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  listAllWorkflowRuns: (statuses?: string[]) => {
+    const params = statuses && statuses.length > 0 ? `?status=${statuses.join(",")}` : "";
+    return request<WorkflowRun[]>(`/workflows/runs${params}`);
+  },
   listWorkflowRuns: (worktreeId: string) =>
     request<WorkflowRun[]>(`/worktrees/${worktreeId}/workflows/runs`),
   getWorkflowRun: (runId: string) =>
@@ -242,4 +260,33 @@ export const api = {
     }),
   rejectGate: (runId: string) =>
     request<void>(`/workflows/runs/${runId}/gate/reject`, { method: "POST" }),
+
+  // Notifications
+  listNotifications: (unreadOnly = false, limit = 50, offset = 0) =>
+    request<Notification[]>(
+      `/notifications?unread_only=${unreadOnly}&limit=${limit}&offset=${offset}`,
+    ),
+  unreadNotificationCount: () =>
+    request<{ count: number }>("/notifications/unread-count"),
+  markNotificationRead: (id: string) =>
+    request<void>(`/notifications/${id}/read`, { method: "POST" }),
+  markAllNotificationsRead: () =>
+    request<void>("/notifications/read-all", { method: "POST" }),
+
+  // Push Notifications
+  getPushVapidKey: () =>
+    request<VapidPublicKeyResponse>("/push/vapid-public-key"),
+  subscribePush: (data: PushSubscribeRequest) =>
+    request<PushSubscribeResponse>("/push/subscribe", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  unsubscribePush: (data: PushSubscribeRequest) =>
+    request<PushSubscribeResponse>("/push/subscribe", {
+      method: "DELETE",
+      body: JSON.stringify(data),
+    }),
 };
+
+// Export as apiClient for consistency with hook usage
+export const apiClient = api;

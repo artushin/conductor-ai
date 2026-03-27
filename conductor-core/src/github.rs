@@ -286,7 +286,7 @@ pub fn sync_github_issues(
         .map(|issue| {
             let number = issue["number"].as_u64().unwrap_or(0);
             let (label_details, assignee) = parse_issue_metadata(&issue);
-            let label_names: Vec<&str> = label_details.iter().map(|l| l.name.as_str()).collect();
+            let label_names: Vec<String> = label_details.iter().map(|l| l.name.clone()).collect();
 
             TicketInput {
                 source_type: "github".to_string(),
@@ -294,7 +294,7 @@ pub fn sync_github_issues(
                 title: issue["title"].as_str().unwrap_or("").to_string(),
                 body: issue["body"].as_str().unwrap_or("").to_string(),
                 state: "open".to_string(),
-                labels: serde_json::to_string(&label_names).unwrap_or_else(|_| "[]".to_string()),
+                labels: label_names,
                 assignee,
                 priority: None,
                 url: issue["url"].as_str().unwrap_or("").to_string(),
@@ -345,7 +345,7 @@ pub fn fetch_github_issue(
         ConductorError::TicketSync("gh issue view response missing 'number' field".to_string())
     })?;
     let (label_details, assignee) = parse_issue_metadata(&issue);
-    let label_names: Vec<&str> = label_details.iter().map(|l| l.name.as_str()).collect();
+    let label_names: Vec<String> = label_details.iter().map(|l| l.name.clone()).collect();
 
     // gh issue view returns state as "OPEN" or "CLOSED"; normalize to lowercase
     let raw_state = issue["state"].as_str().unwrap_or("OPEN");
@@ -361,7 +361,7 @@ pub fn fetch_github_issue(
         title: issue["title"].as_str().unwrap_or("").to_string(),
         body: issue["body"].as_str().unwrap_or("").to_string(),
         state,
-        labels: serde_json::to_string(&label_names).unwrap_or_else(|_| "[]".to_string()),
+        labels: label_names,
         assignee,
         priority: None,
         url: issue["url"].as_str().unwrap_or("").to_string(),
@@ -599,6 +599,54 @@ pub fn has_merged_pr(remote_url: &str, branch: &str) -> bool {
     !json.is_empty()
 }
 
+/// Given a remote URL and a list of branch names, return the subset of branches
+/// that have at least one merged PR. Makes a single `gh pr list` call per repo
+/// instead of one per branch, avoiding N+1 API calls.
+pub fn merged_branches_for_repo(
+    remote_url: &str,
+    branches: &[String],
+) -> std::collections::HashSet<String> {
+    let mut result = std::collections::HashSet::new();
+    if branches.is_empty() {
+        return result;
+    }
+    let Some((owner, repo)) = parse_github_remote(remote_url) else {
+        return result;
+    };
+    let slug = repo_slug(&owner, &repo);
+    let limit = branches.len().max(50).to_string();
+    let Ok(output) = run_gh(&[
+        "pr",
+        "list",
+        "--repo",
+        &slug,
+        "--state",
+        "merged",
+        "--json",
+        "headRefName",
+        "--limit",
+        &limit,
+    ]) else {
+        return result;
+    };
+    #[derive(serde::Deserialize)]
+    struct PrHead {
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+    }
+    let Ok(prs) = serde_json::from_slice::<Vec<PrHead>>(&output.stdout) else {
+        return result;
+    };
+    let merged_set: std::collections::HashSet<&str> =
+        prs.iter().map(|p| p.head_ref_name.as_str()).collect();
+    for b in branches {
+        if merged_set.contains(b.as_str()) {
+            result.insert(b.clone());
+        }
+    }
+    result
+}
+
 /// Close a GitHub issue as completed via the `gh` CLI.
 pub fn close_github_issue(owner: &str, repo: &str, issue_number: &str) -> Result<()> {
     let repo_slug = repo_slug(owner, repo);
@@ -647,6 +695,7 @@ pub fn add_pr_label(owner: &str, repo: &str, pr_number: i64, label: &str) -> Res
 }
 
 /// Create a PR with a specific title and body via the `gh` CLI.
+/// When `base` is `Some`, the PR targets that branch instead of the repo default.
 /// Returns the PR URL.
 pub fn create_pr_with_body(
     owner: &str,
@@ -654,11 +703,17 @@ pub fn create_pr_with_body(
     branch: &str,
     title: &str,
     body: &str,
+    base: Option<&str>,
 ) -> Result<String> {
     let repo_slug = repo_slug(owner, repo);
-    let output = run_gh(&[
+    let mut args = vec![
         "pr", "create", "--repo", &repo_slug, "--head", branch, "--title", title, "--body", body,
-    ])?;
+    ];
+    if let Some(b) = base {
+        args.push("--base");
+        args.push(b);
+    }
+    let output = run_gh(&args)?;
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(url)
 }

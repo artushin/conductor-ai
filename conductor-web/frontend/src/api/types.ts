@@ -23,6 +23,10 @@ export interface Worktree {
   model: string | null;
 }
 
+export interface WorktreeWithStatus extends Worktree {
+  agent_status: AgentRun["status"] | null;
+}
+
 export interface Ticket {
   id: string;
   repo_id: string;
@@ -85,7 +89,8 @@ export interface PlanStep {
 
 export interface AgentRun {
   id: string;
-  worktree_id: string;
+  worktree_id: string | null;
+  repo_id?: string | null;
   claude_session_id: string | null;
   prompt: string;
   status: "running" | "completed" | "failed" | "cancelled" | "waiting_for_feedback";
@@ -118,7 +123,7 @@ export interface RunTreeTotals {
 export interface AgentEvent {
   id: string;
   run_id: string;
-  kind: "text" | "tool" | "result" | "system" | "error" | "prompt";
+  kind: "text" | "tool" | "result" | "system" | "error" | "tool_error" | "prompt";
   summary: string;
   started_at: string;
   ended_at: string | null;
@@ -140,26 +145,6 @@ export interface AgentCreatedIssue {
   title: string;
   url: string;
   created_at: string;
-}
-
-export interface WorkTarget {
-  name: string;
-  command: string;
-  type: string;
-}
-
-export interface CreateWorkTargetRequest {
-  name: string;
-  command: string;
-  type: string;
-}
-
-export interface PushResult {
-  message: string;
-}
-
-export interface CreatePrResult {
-  url: string;
 }
 
 export interface TicketDetail {
@@ -208,14 +193,15 @@ export interface WorkflowDefSummary {
   name: string;
   description: string;
   trigger: string;
-  inputs: { name: string; required: boolean }[];
+  inputs: { name: string; required: boolean; input_type: string; default: string | null }[];
   node_count: number;
+  group: string | null;
 }
 
 export interface WorkflowRun {
   id: string;
   workflow_name: string;
-  worktree_id: string;
+  worktree_id: string | null;
   parent_run_id: string;
   status: "pending" | "running" | "completed" | "failed" | "cancelled" | "waiting";
   dry_run: boolean;
@@ -223,6 +209,10 @@ export interface WorkflowRun {
   started_at: string;
   ended_at: string | null;
   result_summary: string | null;
+  repo_id: string | null;
+  parent_workflow_run_id: string | null;
+  target_label: string | null;
+  active_steps?: WorkflowRunStep[];
 }
 
 export interface WorkflowRunStep {
@@ -232,6 +222,7 @@ export interface WorkflowRunStep {
   role: string;
   can_commit: boolean;
   status: "pending" | "running" | "completed" | "failed" | "skipped" | "waiting";
+  child_run_id: string | null;
   position: number;
   iteration: number;
   started_at: string | null;
@@ -250,4 +241,56 @@ export interface RunWorkflowRequest {
   model?: string;
   dry_run?: boolean;
   inputs?: Record<string, string>;
+}
+
+export type FeedbackType = "text" | "confirm" | "single_select" | "multi_select";
+
+export interface FeedbackOption {
+  value: string;
+  label: string;
+}
+
+export interface FeedbackRequest {
+  id: string;
+  run_id: string;
+  prompt: string;
+  response: string | null;
+  status: "pending" | "responded" | "dismissed";
+  created_at: string;
+  feedback_type: FeedbackType;
+  options?: FeedbackOption[];
+  timeout_secs?: number;
+}
+
+export interface Notification {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+  severity: "info" | "warning" | "action_required";
+  entity_id: string | null;
+  entity_type: string | null;
+  read: boolean;
+  created_at: string;
+  read_at: string | null;
+}
+
+// Push Notifications
+export interface PushSubscriptionKeys {
+  p256dh: string;
+  auth: string;
+}
+
+export interface PushSubscribeRequest {
+  endpoint: string;
+  keys: PushSubscriptionKeys;
+}
+
+export interface VapidPublicKeyResponse {
+  public_key: string;
+}
+
+export interface PushSubscribeResponse {
+  success: boolean;
+  message: string;
 }

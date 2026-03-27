@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use conductor_core::repo::RepoManager;
 use conductor_core::tickets::TicketSyncer;
-use conductor_core::worktree::{Worktree, WorktreeManager};
+use conductor_core::worktree::{Worktree, WorktreeManager, WorktreeWithStatus};
 
 use crate::error::ApiError;
 use crate::events::ConductorEvent;
@@ -19,12 +19,6 @@ pub struct CreateWorktreeRequest {
 }
 
 #[derive(Deserialize)]
-pub struct CreatePrRequest {
-    #[serde(default)]
-    pub draft: bool,
-}
-
-#[derive(Deserialize)]
 pub struct LinkTicketRequest {
     pub ticket_id: String,
 }
@@ -34,6 +28,18 @@ pub struct WorktreeListQuery {
     /// When true, include merged/abandoned worktrees. Defaults to false (completed worktrees hidden).
     #[serde(default)]
     pub show_completed: bool,
+}
+
+pub async fn list_all_worktrees(
+    State(state): State<AppState>,
+    Query(params): Query<WorktreeListQuery>,
+) -> Result<Json<Vec<WorktreeWithStatus>>, ApiError> {
+    let db = state.db.lock().await;
+    let config = state.config.read().await;
+    let mgr = WorktreeManager::new(&db, &config);
+    let active_only = !params.show_completed;
+    let worktrees = mgr.list_all_with_status(active_only)?;
+    Ok(Json(worktrees))
 }
 
 pub async fn list_worktrees(
@@ -87,33 +93,6 @@ pub async fn delete_worktree(
         repo_id: wt.repo_id.clone(),
     });
     Ok(Json(wt))
-}
-
-pub async fn push_worktree(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.db.lock().await;
-    let config = state.config.read().await;
-    let mgr = WorktreeManager::new(&db, &config);
-    let wt = mgr.get_by_id(&id)?;
-    let repo = RepoManager::new(&db, &config).get_by_id(&wt.repo_id)?;
-    let message = mgr.push(&repo.slug, &wt.slug)?;
-    Ok(Json(serde_json::json!({ "message": message })))
-}
-
-pub async fn create_pr(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<CreatePrRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.db.lock().await;
-    let config = state.config.read().await;
-    let mgr = WorktreeManager::new(&db, &config);
-    let wt = mgr.get_by_id(&id)?;
-    let repo = RepoManager::new(&db, &config).get_by_id(&wt.repo_id)?;
-    let url = mgr.create_pr(&repo.slug, &wt.slug, body.draft)?;
-    Ok(Json(serde_json::json!({ "url": url })))
 }
 
 #[derive(Deserialize)]

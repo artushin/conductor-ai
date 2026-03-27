@@ -1,0 +1,41 @@
+workflow update-diagrams {
+  meta {
+    description = "Update Mermaid diagrams based on a ticket; gates on ticket readiness before touching files"
+    trigger     = "manual"
+    targets     = ["worktree"]
+    group       = "Analysis"
+  }
+
+  inputs {
+    repo   required
+    ticket required
+    types  default = ""
+  }
+
+  call read-ticket
+
+  if read-ticket.is_refined {
+    call identify-affected-diagrams
+    call update-diagram-files
+
+    gate human_review {
+      prompt     = "Review the diagram diff above. Approve to commit and open a PR, or provide feedback to revise."
+      timeout    = "48h"
+      on_timeout = fail
+    }
+
+    script commit-diagrams {
+      run = ".conductor/scripts/commit-diagrams.sh"
+      env = { TICKET = "{{ticket}}" }
+    }
+    script push-and-pr {
+      run = ".conductor/scripts/push-and-pr.sh"
+      as  = "developer"
+      env = { FEATURE_BASE_BRANCH = "{{feature_base_branch}}" }
+    }
+  }
+
+  unless read-ticket.is_refined {
+    call report-open-questions
+  }
+}

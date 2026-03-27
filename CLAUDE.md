@@ -32,15 +32,14 @@ cd conductor-web/frontend && bun install && bun run build
 
 Pre-commit hook: `git config core.hooksPath .githooks`
 
-## Crate Architecture
+# One-time dev setup: enable git hooks (pre-commit fmt check + pre-push E2E tests)
+git config core.hooksPath .githooks
 
-| Crate | Binary | Purpose |
-|-------|--------|---------|
-| conductor-core | (library) | All domain logic: workflow engine, agent management, repo/worktree, tickets, DB |
-| conductor-cli | `conductor` | CLI (clap) + MCP server (stdio transport) |
-| conductor-tui | `conductor-tui` | Terminal UI (ratatui + crossterm) |
-| conductor-web | `conductor-web` | Web UI (axum + embedded React frontend) |
-| conductor-service | `conductor-service` | Daemon: Unix socket JSON-RPC, PE watcher (early stage) |
+# Playwright E2E tests run automatically on push when conductor-web files change.
+# To skip: SKIP_E2E=1 git push
+# To run manually: cd conductor-web/frontend && bun run test:e2e
+
+## Architecture
 
 All binaries depend on conductor-core. No binary-to-binary dependencies. For the full module map and design trade-offs, see [docs/architecture/crate-structure.md](docs/architecture/crate-structure.md).
 
@@ -87,7 +86,35 @@ Full schema: [docs/reference/database-schema.md](docs/reference/database-schema.
 
 ## CI
 
-GitHub Actions on PRs to `main`: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. Branch ruleset: PRs required, linear history, Clippy + Test must pass.
+Reference implementations already using this pattern correctly:
+- `has_merged_pr()` check before worktree delete (`conductor-tui/src/app/crud_operations.rs`)
+- Workflow execution (`conductor-tui/src/app/workflow_management.rs` — `spawn_workflow_in_background`)
+- Workflow resume (`conductor-tui/src/app/workflow_management.rs` — `handle_resume_workflow`)
+- PR fetch background task (`conductor-tui/src/background.rs`)
+
+## Worktree Workflow (REQUIRED)
+
+**Always create a conductor worktree before starting any fix or feature.** Never make changes directly on `main` or in the primary working directory.
+
+```bash
+# Create a worktree (branch auto-normalizes: feat- → feat/, fix- → fix/)
+cargo run --bin conductor -- worktree create conductor-ai <name>
+# e.g. cargo run --bin conductor -- worktree create conductor-ai fix-800-snapshot-crash
+#      cargo run --bin conductor -- worktree create conductor-ai feat-801-new-thing
+
+# Worktree lands at:
+~/.conductor/workspaces/conductor-ai/<name>/
+```
+
+Do all work — edits, builds, tests, commits — inside the worktree directory. Push and create the PR from there.
+
+```bash
+cd ~/.conductor/workspaces/conductor-ai/<name>
+# ... make changes, run cargo test, cargo fmt --all ...
+git add <files> && git commit -m "..."
+git push -u origin <branch>
+gh pr create ...
+```
 
 ## Key Constraints
 

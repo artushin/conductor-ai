@@ -3,9 +3,11 @@ mod dashboard;
 mod help;
 pub(crate) mod helpers;
 mod modal;
+mod pending_gates;
 mod repo_detail;
-mod tickets;
-mod workflows;
+mod workflow_column;
+mod workflow_def_detail;
+pub(crate) mod workflows;
 mod worktree_detail;
 
 use ratatui::Frame;
@@ -16,44 +18,32 @@ use crate::state::{AppState, Modal, View};
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
 
-    // Compute global status once per frame — used for both header height and rendering.
-    let gs = state.global_status();
-
-    // Layout: header (1–2 lines) + body (fill) + status bar (1 line).
-    // Header height is dynamic: 1 line when nothing is active or 4+ items are
-    // collapsed, 2 lines when 1–3 active items or the user has expanded the bar.
-    let header_h = state.header_height(&gs);
-
+    // Layout: body (fill) + footer (1 line).
     let layout = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(header_h),
             ratatui::layout::Constraint::Min(0),
             ratatui::layout::Constraint::Length(1),
         ])
         .split(area);
 
-    let header_area = layout[0];
-    let body_area = layout[1];
-    let status_area = layout[2];
-
-    common::render_header(frame, header_area, state, &gs);
+    let body_area = layout[0];
+    let footer_area = layout[1];
 
     match state.view {
         View::Dashboard => dashboard::render(frame, body_area, state),
         View::RepoDetail => repo_detail::render(frame, body_area, state),
         View::WorktreeDetail => worktree_detail::render(frame, body_area, state),
-        View::Tickets => tickets::render(frame, body_area, state),
-        View::Workflows => workflows::render(frame, body_area, state),
         View::WorkflowRunDetail => workflows::render_run_detail(frame, body_area, state),
+        View::WorkflowDefDetail => workflow_def_detail::render(frame, body_area, state),
     }
 
-    common::render_status_bar(frame, status_area, state);
+    common::render_footer(frame, footer_area, state);
 
     // Modal overlay on top
     match &state.modal {
         Modal::None => {}
-        Modal::Help => help::render(frame, area),
+        Modal::Help => help::render(frame, area, &state.theme),
         Modal::Confirm { title, message, .. } => {
             modal::render_confirm(frame, area, title, message, &state.theme)
         }
@@ -109,19 +99,19 @@ pub fn render(frame: &mut Frame, state: &AppState) {
                 &state.theme,
             );
         }
-        Modal::PostCreatePicker {
+        Modal::BranchPicker {
             items,
+            tree_positions,
             selected,
-            ticket_id,
+            ..
+        }
+        | Modal::BaseBranchPicker {
+            items,
+            tree_positions,
+            selected,
             ..
         } => {
-            let source_id = state
-                .data
-                .ticket_map
-                .get(ticket_id)
-                .map(|t| t.source_id.as_str())
-                .unwrap_or("?");
-            modal::render_post_create_picker(frame, area, items, *selected, source_id, &state.theme)
+            modal::render_branch_picker(frame, area, items, tree_positions, *selected, &state.theme)
         }
         Modal::IssueSourceManager {
             repo_slug,
@@ -144,6 +134,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             custom_input,
             custom_active,
             suggested,
+            allow_default,
             ..
         } => modal::render_model_picker(
             frame,
@@ -155,6 +146,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             custom_input,
             *custom_active,
             suggested.as_deref(),
+            *allow_default,
             &state.theme,
         ),
         Modal::GateAction {
@@ -211,32 +203,42 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             error.as_deref(),
             &state.theme,
         ),
-        Modal::PrWorkflowPicker {
-            pr_number,
-            pr_title,
-            workflow_defs,
-            selected,
-        } => modal::render_pr_workflow_picker(
-            frame,
-            area,
-            *pr_number,
-            pr_title,
-            workflow_defs,
-            *selected,
-            &state.theme,
-        ),
         Modal::WorkflowPicker {
             target,
-            workflow_defs,
+            items,
             selected,
-        } => modal::render_workflow_picker(
-            frame,
-            area,
-            target,
-            workflow_defs,
-            *selected,
-            &state.theme,
-        ),
+            scroll_offset,
+        } => {
+            let ticket_source_id = if let crate::state::WorkflowPickerTarget::PostCreate {
+                ref ticket_id,
+                ..
+            } = target
+            {
+                state
+                    .data
+                    .ticket_map
+                    .get(ticket_id)
+                    .map(|t| t.source_id.as_str())
+            } else {
+                None
+            };
+            modal::render_workflow_picker(
+                frame,
+                area,
+                target,
+                items,
+                *selected,
+                *scroll_offset,
+                ticket_source_id,
+                &state.theme,
+            )
+        }
+        Modal::TemplatePicker {
+            items,
+            selected,
+            repo_slug,
+            ..
+        } => modal::render_template_picker(frame, area, items, *selected, repo_slug, &state.theme),
         Modal::Progress { message } => modal::render_progress(frame, area, message, &state.theme),
         Modal::ThemePicker {
             themes,
@@ -246,5 +248,9 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         } => {
             modal::render_theme_picker(frame, area, themes, *selected, original_name, &state.theme)
         }
+        Modal::Notifications {
+            notifications,
+            selected,
+        } => modal::render_notifications(frame, area, notifications, *selected, &state.theme),
     }
 }

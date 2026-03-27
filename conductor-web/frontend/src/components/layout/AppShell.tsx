@@ -1,6 +1,7 @@
-import { createContext, useContext, useMemo, useState, useCallback } from "react";
-import { Outlet, useNavigate } from "react-router";
+import { createContext, useContext, useMemo, useState, useCallback, useEffect } from "react";
+import { Outlet, useNavigate, useLocation } from "react-router";
 import { Sidebar } from "./Sidebar";
+import { BottomTabBar } from "./BottomTabBar";
 import { useApi } from "../../hooks/useApi";
 import { api } from "../../api/client";
 import type { Repo } from "../../api/types";
@@ -11,6 +12,10 @@ import {
 } from "../../hooks/useConductorEvents";
 import { useHotkeys } from "../../hooks/useHotkeys";
 import { KeyboardShortcutHelp } from "../shared/KeyboardShortcutHelp";
+import { NotificationBell } from "../notifications/NotificationBell";
+import { ToastContainer } from "../notifications/ToastContainer";
+import { useToast } from "../../hooks/useToast";
+import { CommandPalette } from "../shared/CommandPalette";
 
 interface ReposContextValue {
   repos: Repo[];
@@ -29,9 +34,18 @@ export function useRepos() {
 }
 
 export function AppShell() {
-  const { data: repos, loading, refetch } = useApi(() => api.listRepos(), []);
+  const { data: repos, loading, error, refetch } = useApi(() => api.listRepos(), []);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const { toasts, addToast, dismissToast } = useToast();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  // Auto-close sidebar when route changes (mobile drawer behaviour)
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [location.pathname]);
 
   const openHelp = useCallback(() => setHelpOpen(true), []);
   const closeHelp = useCallback(() => setHelpOpen(false), []);
@@ -46,6 +60,18 @@ export function AppShell() {
     { key: "g s", handler: goToSettings, description: "Go to Settings" },
   ]);
 
+  // Cmd+K / Ctrl+K for command palette (separate from useHotkeys which ignores meta)
+  useEffect(() => {
+    const handleCmdK = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setPaletteOpen((prev) => !prev);
+      }
+    };
+    document.addEventListener("keydown", handleCmdK);
+    return () => document.removeEventListener("keydown", handleCmdK);
+  }, []);
+
   const handlers = useMemo(() => {
     const refetchRepos = (_data: ConductorEventData) => refetch();
     const handleMap: Partial<
@@ -54,23 +80,81 @@ export function AppShell() {
       repo_registered: refetchRepos,
       repo_unregistered: refetchRepos,
       lagged: refetchRepos,
+      notification_created: (data: ConductorEventData) => {
+        if (data.data) {
+          const d = data.data as Record<string, string>;
+          addToast({
+            title: d.title || d.kind?.replace(/_/g, " ") || "Notification",
+            body: d.body || "",
+            severity: (d.severity as "info" | "warning" | "action_required") ?? "info",
+          });
+        }
+      },
     };
     return handleMap;
-  }, [refetch]);
+  }, [refetch, addToast]);
 
   useConductorEvents(handlers);
+
+  if (error && !repos) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-50">
+        <div className="max-w-md text-center p-8">
+          <h1 className="text-xl font-semibold text-gray-900 mb-2">
+            Signal lost
+          </h1>
+          <p className="text-gray-600 mb-4">
+            Couldn&rsquo;t reach the station. {error}
+          </p>
+          <button
+            onClick={refetch}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <ReposContext.Provider
       value={{ repos: repos ?? [], loading, refreshRepos: refetch }}
     >
       <div className="flex h-screen bg-gray-50">
-        <Sidebar />
-        <main className="flex-1 overflow-auto p-6">
-          <Outlet />
+        {/* Mobile backdrop */}
+        {sidebarOpen && (
+          <div
+            className="fixed inset-0 bg-black/40 z-30 md:hidden"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+        <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+        <main className="flex-1 overflow-auto">
+          {/* Mobile top bar */}
+          <div className="md:hidden flex items-center gap-3 px-4 border-b border-gray-200 bg-white sticky top-0 z-20" style={{ minHeight: 56 }}>
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="flex items-center justify-center rounded text-gray-600 hover:bg-gray-100"
+              style={{ minHeight: 44, minWidth: 44 }}
+              aria-label="Open menu"
+            >
+              ☰
+            </button>
+            <span className="font-semibold text-gray-900">Conductor</span>
+            <div className="ml-auto">
+              <NotificationBell />
+            </div>
+          </div>
+          <div className="p-3 md:p-4 pb-20 md:pb-4">
+            <Outlet />
+          </div>
         </main>
+        <BottomTabBar />
       </div>
       <KeyboardShortcutHelp open={helpOpen} onClose={closeHelp} />
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </ReposContext.Provider>
   );
 }

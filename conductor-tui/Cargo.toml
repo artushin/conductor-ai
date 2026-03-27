@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "TUI for Conductor — multi-repo orchestration"
 
+[lib]
+name = "conductor_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "conductor-tui"
 path = "src/main.rs"
@@ -23,7 +27,8 @@ tui-textarea = "0.7"
 toml = "0.8"
 serde_yml = "0.0"
 tracing = "0.1"
-ulid = "1"
 
 [dev-dependencies]
+conductor-core = { path = "../conductor-core", features = ["test-helpers", "test-notifications"] }
 tempfile = "3"
+insta = "1"

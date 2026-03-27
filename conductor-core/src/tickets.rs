@@ -25,10 +25,7 @@ pub struct Ticket {
     pub url: String,
     pub synced_at: String,
     pub raw_json: String,
-    /// Optional workflow name. When set, this workflow is used directly instead
-    /// of relying on routing heuristics.
     pub workflow: Option<String>,
-    /// Optional agent map JSON. Pre-resolved agent assignments for FSM states.
     pub agent_map: Option<String>,
 }
 
@@ -39,7 +36,7 @@ pub struct TicketInput {
     pub title: String,
     pub body: String,
     pub state: String,
-    pub labels: String,
+    pub labels: Vec<String>,
     pub assignee: Option<String>,
     pub priority: Option<String>,
     pub url: String,
@@ -47,6 +44,25 @@ pub struct TicketInput {
     /// Label details (name + color) for populating the ticket_labels join table.
     /// Pass `vec![]` for sources that do not supply color data.
     pub label_details: Vec<TicketLabelInput>,
+}
+
+const VALID_TICKET_STATES: &[&str] = &["open", "in_progress", "closed"];
+
+impl TicketInput {
+    /// Validate this ticket input, returning an error if any field is invalid.
+    pub fn validate(&self) -> Result<()> {
+        if !VALID_TICKET_STATES.contains(&self.state.as_str()) {
+            return Err(crate::error::ConductorError::InvalidInput(format!(
+                "Invalid ticket state '{}'. Must be one of: open, in_progress, closed.",
+                self.state
+            )));
+        }
+        Ok(())
+    }
+
+    fn labels_json(&self) -> String {
+        serde_json::to_string(&self.labels).unwrap_or_else(|_| "[]".to_string())
+    }
 }
 
 /// Label detail passed in during sync. Carries color alongside the name.
@@ -118,11 +134,16 @@ impl<'a> TicketSyncer<'a> {
 
     /// Upsert a batch of tickets for a repo. Returns the number of tickets upserted.
     pub fn upsert_tickets(&self, repo_id: &str, tickets: &[TicketInput]) -> Result<usize> {
+        for ticket in tickets {
+            ticket.validate()?;
+        }
+
         let tx = self.conn.unchecked_transaction()?;
         let now = Utc::now().to_rfc3339();
 
         for ticket in tickets {
-            let id = ulid::Ulid::new().to_string();
+            let id = crate::new_id();
+            let labels_json = ticket.labels_json();
             tx.execute(
                 "INSERT INTO tickets (id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -144,7 +165,7 @@ impl<'a> TicketSyncer<'a> {
                     ticket.title,
                     ticket.body,
                     ticket.state,
-                    ticket.labels,
+                    labels_json,
                     ticket.assignee,
                     ticket.priority,
                     ticket.url,
@@ -190,42 +211,46 @@ impl<'a> TicketSyncer<'a> {
         }
 
         let now = Utc::now().to_rfc3339();
-        let placeholders: Vec<String> = (0..synced_source_ids.len())
-            .map(|i| format!("?{}", i + 4))
-            .collect();
-        let sql = format!(
-            "UPDATE tickets SET state = 'closed', synced_at = ?1
-             WHERE repo_id = ?2 AND source_type = ?3
-             AND state != 'closed'
-             AND source_id NOT IN ({})",
-            placeholders.join(", ")
-        );
+        let ids: Vec<String> = synced_source_ids.iter().map(|s| s.to_string()).collect();
+        crate::db::with_in_clause(
+            "UPDATE tickets SET state = 'closed', synced_at = ?1 \
+             WHERE repo_id = ?2 AND source_type = ?3 AND state != 'closed' \
+             AND source_id NOT IN",
+            &[
+                &now as &dyn rusqlite::types::ToSql,
+                &repo_id as &dyn rusqlite::types::ToSql,
+                &source_type as &dyn rusqlite::types::ToSql,
+            ],
+            &ids,
+            |sql, params| Ok(self.conn.prepare(sql)?.execute(params)?),
+        )
+    }
 
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        param_values.push(Box::new(now));
-        param_values.push(Box::new(repo_id.to_string()));
-        param_values.push(Box::new(source_type.to_string()));
-        for id in synced_source_ids {
-            param_values.push(Box::new(id.to_string()));
-        }
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-        let count = stmt.execute(params.as_slice())?;
-
-        Ok(count)
+    /// Return the most recent `synced_at` timestamp for tickets in a repo.
+    /// Returns `None` when no tickets exist for the repo (i.e. never synced).
+    pub fn latest_synced_at(&self, repo_id: &str) -> Result<Option<String>> {
+        let ts: Option<String> = self.conn.query_row(
+            "SELECT MAX(synced_at) FROM tickets WHERE repo_id = ?1",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        Ok(ts)
     }
 
     /// List tickets, optionally filtered by repo.
+    ///
+    /// Results are sorted by issue number descending (highest first).
+    /// Non-numeric `source_id` values (e.g. Jira keys like `PROJ-123`) cast to 0
+    /// and sort after all numeric IDs, ordered among themselves by string comparison.
     pub fn list(&self, repo_id: Option<&str>) -> Result<Vec<Ticket>> {
         let query = match repo_id {
             Some(_) => {
                 "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
-                 FROM tickets WHERE repo_id = ?1 ORDER BY synced_at DESC"
+                 FROM tickets WHERE repo_id = ?1 ORDER BY CAST(source_id AS INTEGER) DESC, source_id DESC"
             }
             None => {
                 "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
-                 FROM tickets ORDER BY synced_at DESC"
+                 FROM tickets ORDER BY CAST(source_id AS INTEGER) DESC, source_id DESC"
             }
         };
 
@@ -281,10 +306,10 @@ impl<'a> TicketSyncer<'a> {
         }
 
         let sql = if conditions.is_empty() {
-            format!("{select} ORDER BY t.synced_at DESC")
+            format!("{select} ORDER BY CAST(t.source_id AS INTEGER) DESC, t.source_id DESC")
         } else {
             format!(
-                "{select} WHERE {} ORDER BY t.synced_at DESC",
+                "{select} WHERE {} ORDER BY CAST(t.source_id AS INTEGER) DESC, t.source_id DESC",
                 conditions.join(" AND ")
             )
         };
@@ -332,28 +357,19 @@ impl<'a> TicketSyncer<'a> {
             })
     }
 
-    /// Fetch a single ticket by ULID or source_id (fallback).
-    ///
-    /// Tries the `id` column first; if not found, tries `source_id`.
-    /// Unlike `get_by_source_id`, this does not require a `repo_id`.
-    pub fn get_ticket(&self, id_or_source: &str) -> Result<Ticket> {
-        // Try ULID lookup first
-        match self.get_by_id(id_or_source) {
-            Ok(t) => return Ok(t),
-            Err(ConductorError::TicketNotFound { .. }) => {}
-            Err(e) => return Err(e),
-        }
-        // Fallback: source_id lookup (across all repos)
+    /// Fetch a single ticket by source_id across all repos.
+    /// Returns the first match. Use when the caller does not know the repo_id.
+    pub fn get_by_source_id_any_repo(&self, source_id: &str) -> Result<Ticket> {
         self.conn
             .query_row(
                 "SELECT id, repo_id, source_type, source_id, title, body, state, labels, assignee, priority, url, synced_at, raw_json, workflow, agent_map
-                 FROM tickets WHERE source_id = ?1",
-                params![id_or_source],
+                 FROM tickets WHERE source_id = ?1 LIMIT 1",
+                params![source_id],
                 map_ticket_row,
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
-                    id: id_or_source.to_string(),
+                    id: source_id.to_string(),
                 },
                 _ => ConductorError::Database(e),
             })
@@ -374,6 +390,90 @@ impl<'a> TicketSyncer<'a> {
                 },
                 _ => ConductorError::Database(e),
             })
+    }
+
+    /// Update the `state`, `workflow`, and/or `agent_map` columns on a ticket.
+    ///
+    /// For `workflow` and `agent_map`:
+    /// - `Some("")` clears the column to NULL.
+    /// - `Some(value)` sets the column to `value`.
+    /// - `None` leaves the column unchanged.
+    ///
+    /// For `state`:
+    /// - `Some(value)` sets the state (must be one of: open, in_progress, closed).
+    /// - `None` leaves the state unchanged.
+    /// - Empty string is NOT valid for state (state is NOT NULL).
+    pub fn update_ticket(
+        &self,
+        ticket_id: &str,
+        state: Option<&str>,
+        workflow: Option<&str>,
+        agent_map: Option<&str>,
+    ) -> Result<()> {
+        // Verify ticket exists
+        let _ = self.get_by_id(ticket_id)?;
+
+        if let Some(s) = state {
+            if !VALID_TICKET_STATES.contains(&s) {
+                return Err(crate::error::ConductorError::InvalidInput(format!(
+                    "Invalid ticket state '{}'. Must be one of: open, in_progress, closed.",
+                    s
+                )));
+            }
+            self.conn.execute(
+                "UPDATE tickets SET state = ?1 WHERE id = ?2",
+                rusqlite::params![s, ticket_id],
+            )?;
+        }
+        if let Some(w) = workflow {
+            let val: Option<&str> = if w.is_empty() { None } else { Some(w) };
+            self.conn.execute(
+                "UPDATE tickets SET workflow = ?1 WHERE id = ?2",
+                rusqlite::params![val, ticket_id],
+            )?;
+        }
+        if let Some(a) = agent_map {
+            let val: Option<&str> = if a.is_empty() { None } else { Some(a) };
+            self.conn.execute(
+                "UPDATE tickets SET agent_map = ?1 WHERE id = ?2",
+                rusqlite::params![val, ticket_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Delete a ticket by its `(repo_id, source_type, source_id)` key.
+    /// NULLs out `workflow_runs.ticket_id` first (that FK lacks ON DELETE SET NULL),
+    /// then deletes the ticket row. Returns an error if no matching ticket exists.
+    pub fn delete_ticket(&self, repo_id: &str, source_type: &str, source_id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Look up the ticket id first so we can clean up the FK.
+        let ticket_id: String = tx
+            .query_row(
+                "SELECT id FROM tickets WHERE repo_id = ?1 AND source_type = ?2 AND source_id = ?3",
+                params![repo_id, source_type, source_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
+                    id: format!("{source_type}#{source_id}"),
+                },
+                _ => ConductorError::Database(e),
+            })?;
+
+        // NULL out workflow_runs.ticket_id (FK lacks ON DELETE SET NULL).
+        tx.execute(
+            "UPDATE workflow_runs SET ticket_id = NULL WHERE ticket_id = ?1",
+            params![ticket_id],
+        )?;
+
+        // Delete the ticket row. Cascades handle ticket_labels and feature_tickets;
+        // worktrees.ticket_id is ON DELETE SET NULL.
+        tx.execute("DELETE FROM tickets WHERE id = ?1", params![ticket_id])?;
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// Upsert a batch of synced tickets, close any missing ones, and mark their
@@ -713,7 +813,7 @@ mod tests {
             title: title.to_string(),
             body: String::new(),
             state: "open".to_string(),
-            labels: "[]".to_string(),
+            labels: vec![],
             assignee: None,
             priority: None,
             url: String::new(),
@@ -729,6 +829,61 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_latest_synced_at_no_tickets() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+        let result = syncer.latest_synced_at("r1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_latest_synced_at_returns_most_recent() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        // Insert first ticket, then manually backdate its synced_at.
+        syncer
+            .upsert_tickets("r1", &[make_ticket("1", "Issue 1")])
+            .unwrap();
+        let old_ts = "2020-01-01T00:00:00Z";
+        conn.execute(
+            "UPDATE tickets SET synced_at = ?1 WHERE source_id = '1'",
+            rusqlite::params![old_ts],
+        )
+        .unwrap();
+
+        // Insert a second ticket — it gets the current timestamp.
+        syncer
+            .upsert_tickets("r1", &[make_ticket("2", "Issue 2")])
+            .unwrap();
+
+        let latest = syncer.latest_synced_at("r1").unwrap().unwrap();
+        // The MAX must be the newer ticket's timestamp, not the backdated one.
+        assert_ne!(
+            latest, old_ts,
+            "MAX should return the most recent timestamp"
+        );
+        assert!(
+            latest.as_str() > old_ts,
+            "latest synced_at should be after the backdated timestamp"
+        );
+    }
+
+    #[test]
+    fn test_latest_synced_at_scoped_to_repo() {
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        syncer
+            .upsert_tickets("r1", &[make_ticket("1", "Issue 1")])
+            .unwrap();
+
+        // Different repo has no tickets
+        let ts = syncer.latest_synced_at("other-repo").unwrap();
+        assert!(ts.is_none());
     }
 
     #[test]
@@ -1339,7 +1494,7 @@ mod tests {
                 color: None,
             },
         ];
-        ticket.labels = r#"["bug","enhancement"]"#.to_string();
+        ticket.labels = vec!["bug".to_string(), "enhancement".to_string()];
         syncer.upsert_tickets("r1", &[ticket]).unwrap();
 
         let ticket_id: String = conn
@@ -1601,7 +1756,7 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             state: "open".to_string(),
-            labels: "[]".to_string(),
+            labels: vec![],
             assignee: None,
             priority: None,
             url: String::new(),
@@ -1891,215 +2046,95 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // create_ticket / update_ticket tests
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_create_ticket_roundtrip() {
+    fn test_list_sorts_by_issue_number_descending() {
         let conn = setup_db();
         let syncer = TicketSyncer::new(&conn);
 
-        let labels = vec!["bug".to_string(), "urgent".to_string()];
-        let ticket = syncer
-            .create_ticket("r1", "New local ticket", "Some body text", Some("high"), &labels, None, None)
-            .unwrap();
-
-        assert_eq!(ticket.repo_id, "r1");
-        assert_eq!(ticket.source_type, "local");
-        assert_eq!(ticket.title, "New local ticket");
-        assert_eq!(ticket.body, "Some body text");
-        assert_eq!(ticket.state, "open");
-        assert_eq!(ticket.priority, Some("high".to_string()));
-        assert!(ticket.url.is_empty());
-
-        // Labels should be stored as JSON array
-        let parsed: Vec<String> = serde_json::from_str(&ticket.labels).unwrap();
-        assert_eq!(parsed, labels);
-
-        // Fetch again by id and verify round-trip
-        let fetched = syncer.get_by_id(&ticket.id).unwrap();
-        assert_eq!(fetched.id, ticket.id);
-        assert_eq!(fetched.title, "New local ticket");
-        assert_eq!(fetched.source_type, "local");
-        assert_eq!(fetched.source_id, ticket.source_id);
-    }
-
-    #[test]
-    fn test_update_ticket_fields() {
-        let conn = setup_db();
-        let syncer = TicketSyncer::new(&conn);
-
-        let ticket = syncer
-            .create_ticket("r1", "Original title", "Original body", None, &[], None, None)
-            .unwrap();
-
-        let updated = syncer
-            .update_ticket(
-                &ticket.id,
-                TicketUpdate {
-                    title: Some("Updated title".to_string()),
-                    body: None,
-                    state: None,
-                    priority: None,
-                    labels: None,
-                    assignee: None,
-                    workflow: None,
-                    agent_map: None,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(updated.id, ticket.id);
-        assert_eq!(updated.title, "Updated title");
-        assert_eq!(updated.body, "Original body"); // unchanged
-    }
-
-    #[test]
-    fn test_update_nonexistent_ticket() {
-        let conn = setup_db();
-        let syncer = TicketSyncer::new(&conn);
-
-        let result = syncer.update_ticket(
-            "nonexistent-id",
-            TicketUpdate {
-                title: Some("Won't work".to_string()),
-                body: None,
-                state: None,
-                priority: None,
-                labels: None,
-                assignee: None,
-                workflow: None,
-                agent_map: None,
-            },
-        );
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ConductorError::TicketNotFound { .. }
-        ));
-    }
-
-    #[test]
-    fn test_create_ticket_empty_labels() {
-        let conn = setup_db();
-        let syncer = TicketSyncer::new(&conn);
-
-        let ticket = syncer
-            .create_ticket("r1", "No labels ticket", "body", None, &[], None, None)
-            .unwrap();
-
-        assert_eq!(ticket.labels, "[]");
-        assert_eq!(ticket.priority, None);
-        assert_eq!(ticket.source_type, "local");
-    }
-
-    #[test]
-    fn test_update_ticket_multiple_fields() {
-        let conn = setup_db();
-        let syncer = TicketSyncer::new(&conn);
-
-        let ticket = syncer
-            .create_ticket("r1", "Original", "Original body", None, &[], None, None)
-            .unwrap();
-
-        let updated = syncer
-            .update_ticket(
-                &ticket.id,
-                TicketUpdate {
-                    title: Some("New title".to_string()),
-                    body: Some("New body".to_string()),
-                    state: Some("closed".to_string()),
-                    priority: Some("critical".to_string()),
-                    labels: None,
-                    assignee: None,
-                    workflow: None,
-                    agent_map: None,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(updated.title, "New title");
-        assert_eq!(updated.body, "New body");
-        assert_eq!(updated.state, "closed");
-        assert_eq!(updated.priority, Some("critical".to_string()));
-    }
-
-    #[test]
-    fn test_update_ticket_no_fields_returns_unchanged() {
-        let conn = setup_db();
-        let syncer = TicketSyncer::new(&conn);
-
-        let ticket = syncer
-            .create_ticket("r1", "Stay the same", "body", Some("low"), &[], None, None)
-            .unwrap();
-
-        let result = syncer
-            .update_ticket(
-                &ticket.id,
-                TicketUpdate {
-                    title: None,
-                    body: None,
-                    state: None,
-                    priority: None,
-                    labels: None,
-                    assignee: None,
-                    workflow: None,
-                    agent_map: None,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(result.title, "Stay the same");
-        assert_eq!(result.body, "body");
-        assert_eq!(result.priority, Some("low".to_string()));
-    }
-
-    #[test]
-    fn test_create_ticket_label_serialization_special_chars() {
-        let conn = setup_db();
-        let syncer = TicketSyncer::new(&conn);
-
-        let labels = vec![
-            "bug: critical".to_string(),
-            "area/frontend".to_string(),
-            "won't fix".to_string(),
+        // Insert tickets with numeric source_ids in non-sequential order
+        let tickets = vec![
+            make_ticket("5", "Issue 5"),
+            make_ticket("123", "Issue 123"),
+            make_ticket("1", "Issue 1"),
+            make_ticket("42", "Issue 42"),
         ];
-        let ticket = syncer
-            .create_ticket("r1", "Special labels", "", None, &labels, None, None)
-            .unwrap();
+        syncer.upsert_tickets("r1", &tickets).unwrap();
 
-        let parsed: Vec<String> = serde_json::from_str(&ticket.labels).unwrap();
-        assert_eq!(parsed, labels);
+        let result = syncer.list(Some("r1")).unwrap();
+        let ids: Vec<&str> = result.iter().map(|t| t.source_id.as_str()).collect();
+        assert_eq!(ids, vec!["123", "42", "5", "1"]);
     }
 
     #[test]
-    fn test_update_ticket_labels_via_update() {
+    fn test_list_filtered_sorts_by_issue_number_descending() {
         let conn = setup_db();
         let syncer = TicketSyncer::new(&conn);
 
-        let ticket = syncer
-            .create_ticket("r1", "Label test", "", None, &["old".to_string()], None, None)
-            .unwrap();
+        let tickets = vec![
+            make_ticket("10", "Issue 10"),
+            make_ticket("200", "Issue 200"),
+            make_ticket("3", "Issue 3"),
+        ];
+        syncer.upsert_tickets("r1", &tickets).unwrap();
 
-        let updated = syncer
-            .update_ticket(
-                &ticket.id,
-                TicketUpdate {
-                    title: None,
-                    body: None,
-                    state: None,
-                    priority: None,
-                    labels: Some(vec!["new-label".to_string(), "another".to_string()]),
-                    assignee: None,
-                    workflow: None,
-                    agent_map: None,
-                },
-            )
-            .unwrap();
+        let filter = TicketFilter {
+            labels: vec![],
+            search: None,
+            include_closed: false,
+        };
+        let result = syncer.list_filtered(Some("r1"), &filter).unwrap();
+        let ids: Vec<&str> = result.iter().map(|t| t.source_id.as_str()).collect();
+        assert_eq!(ids, vec!["200", "10", "3"]);
+    }
 
-        let parsed: Vec<String> = serde_json::from_str(&updated.labels).unwrap();
-        assert_eq!(parsed, vec!["new-label", "another"]);
+    #[test]
+    fn test_list_all_repos_sorts_by_issue_number_descending() {
+        let conn = setup_db();
+        // Register a second repo so we can test cross-repo listing
+        conn.execute(
+            "INSERT INTO repos (id, slug, local_path, remote_url, workspace_dir, created_at) \
+             VALUES ('r2', 'test-repo-2', '/tmp/repo2', 'https://github.com/test/repo2.git', '/tmp/ws2', '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        let syncer = TicketSyncer::new(&conn);
+
+        // Insert tickets across two different repos with interleaved source_ids
+        let repo1_tickets = vec![
+            make_ticket("10", "Repo1 Issue 10"),
+            make_ticket("50", "Repo1 Issue 50"),
+        ];
+        let repo2_tickets = vec![
+            make_ticket("25", "Repo2 Issue 25"),
+            make_ticket("100", "Repo2 Issue 100"),
+        ];
+        syncer.upsert_tickets("r1", &repo1_tickets).unwrap();
+        syncer.upsert_tickets("r2", &repo2_tickets).unwrap();
+
+        // list(None) should return all tickets sorted by issue number descending
+        let result = syncer.list(None).unwrap();
+        let ids: Vec<&str> = result.iter().map(|t| t.source_id.as_str()).collect();
+        assert_eq!(ids, vec!["100", "50", "25", "10"]);
+    }
+
+    #[test]
+    fn test_list_sorts_non_numeric_source_ids_to_end() {
+        // Non-numeric source_ids (e.g. Jira keys) CAST to 0, so they sort
+        // after all numeric IDs. Among themselves, they fall back to the
+        // secondary `source_id DESC` (string) sort.
+        let conn = setup_db();
+        let syncer = TicketSyncer::new(&conn);
+
+        let tickets = vec![
+            make_ticket("PROJ-10", "Jira ticket 10"),
+            make_ticket("5", "GitHub issue 5"),
+            make_ticket("PROJ-3", "Jira ticket 3"),
+            make_ticket("100", "GitHub issue 100"),
+        ];
+        syncer.upsert_tickets("r1", &tickets).unwrap();
+
+        let result = syncer.list(Some("r1")).unwrap();
+        let ids: Vec<&str> = result.iter().map(|t| t.source_id.as_str()).collect();
+        // Numeric IDs first (descending), then non-numeric (string descending)
+        assert_eq!(ids, vec!["100", "5", "PROJ-3", "PROJ-10"]);
     }
 }

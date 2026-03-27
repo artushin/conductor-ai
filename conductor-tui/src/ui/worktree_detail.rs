@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
@@ -7,9 +7,13 @@ use ratatui::Frame;
 use conductor_core::worktree::WorktreeStatus;
 
 use super::helpers::shorten_paths;
-use crate::state::{AppState, VisualRow, WorktreeDetailFocus};
+use crate::state::{AppState, ColumnFocus, VisualRow, WorktreeDetailFocus};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    super::workflow_column::render_with_workflow_column(frame, area, state, render_content);
+}
+
+fn render_content(frame: &mut Frame, area: Rect, state: &AppState) {
     let wt = state
         .selected_worktree_id
         .as_ref()
@@ -64,7 +68,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let status_color = match wt.status {
         WorktreeStatus::Active => state.theme.status_completed,
-        WorktreeStatus::Merged => Color::Blue,
+        WorktreeStatus::Merged => state.theme.label_info,
         WorktreeStatus::Abandoned => state.theme.status_failed,
     };
 
@@ -93,6 +97,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(state.theme.label_secondary),
                 ),
             },
+            Span::styled(
+                " (Enter to change)",
+                Style::default().fg(state.theme.label_secondary),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Path: ", Style::default().fg(state.theme.label_secondary)),
@@ -131,6 +139,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(ticket_line),
     ];
 
+    // PR row — index 9, only present when a PR exists for this branch
+    if let Some(pr) = state.find_pr_for_worktree(&wt.branch) {
+        let pr_state_color = match pr.state.as_str() {
+            "OPEN" => state.theme.status_completed,
+            "MERGED" => state.theme.label_info,
+            _ => state.theme.label_secondary,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("PR: ", Style::default().fg(state.theme.label_secondary)),
+            Span::raw(format!("#{} — {}", pr.number, pr.title)),
+            Span::raw("  "),
+            Span::styled(
+                format!("[{}]", pr.state.to_lowercase()),
+                Style::default().fg(pr_state_color),
+            ),
+        ]));
+    }
+
     if let Some(ref completed) = wt.completed_at {
         lines.push(Line::from(vec![
             Span::styled(
@@ -154,16 +180,38 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
         // Show pending feedback request prompt
         if let Some(ref fb) = state.data.pending_feedback {
+            let type_label = match fb.feedback_type {
+                conductor_core::agent::FeedbackType::Text => "",
+                conductor_core::agent::FeedbackType::Confirm => " [y/n]",
+                conductor_core::agent::FeedbackType::SingleSelect => " [select one]",
+                conductor_core::agent::FeedbackType::MultiSelect => " [select many]",
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     "  Feedback: ",
                     Style::default().fg(state.theme.status_waiting),
                 ),
                 Span::styled(
-                    fb.prompt.clone(),
+                    format!("{}{type_label}", fb.prompt),
                     Style::default().fg(state.theme.label_primary),
                 ),
             ]));
+            // Show options for select types
+            if let Some(ref opts) = fb.options {
+                for (i, opt) in opts.iter().enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}. {}", i + 1, opt.label),
+                        Style::default().fg(state.theme.label_secondary),
+                    )));
+                }
+            }
+            // Show timeout info
+            if let Some(timeout) = fb.timeout_secs {
+                lines.push(Line::from(Span::styled(
+                    format!("    (auto-dismiss in {timeout}s)"),
+                    Style::default().fg(state.theme.label_secondary),
+                )));
+            }
         }
 
         // Show child runs if this is a parent (supervisor) run
@@ -188,9 +236,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                             .fg(state.theme.status_completed)
                             .add_modifier(Modifier::DIM),
                     ),
-                    StepStatus::InProgress => {
-                        ("[>]", Color::Blue, Style::default().fg(Color::Blue))
-                    }
+                    StepStatus::InProgress => (
+                        "[>]",
+                        state.theme.label_info,
+                        Style::default().fg(state.theme.label_info),
+                    ),
                     StepStatus::Failed => (
                         "[!]",
                         state.theme.status_failed,
@@ -279,7 +329,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         Layout::vertical([Constraint::Length(info_height), Constraint::Min(3)]).split(area);
 
     // Top pane: worktree info
-    let info_focus = state.worktree_detail_focus == WorktreeDetailFocus::InfoPanel;
+    let info_focus = state.column_focus == ColumnFocus::Content
+        && state.worktree_detail_focus == WorktreeDetailFocus::InfoPanel;
     let info_border_color = if info_focus {
         state.theme.border_focused
     } else {
@@ -308,7 +359,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_agent_activity(frame: &mut Frame, area: Rect, state: &AppState) {
     let events = &state.data.agent_events;
 
-    let log_focus = state.worktree_detail_focus == WorktreeDetailFocus::LogPanel;
+    let log_focus = state.column_focus == ColumnFocus::Content
+        && state.worktree_detail_focus == WorktreeDetailFocus::LogPanel;
     let log_border_color = if log_focus {
         state.theme.border_focused
     } else {
@@ -356,7 +408,7 @@ fn render_agent_activity(frame: &mut Frame, area: Rect, state: &AppState) {
                 ))));
             }
             VisualRow::Event(ev) => {
-                let style = event_style(&ev.kind);
+                let style = event_style(&ev.kind, &state.theme);
                 let (display_text, effective_style) = if ev.kind == "prompt" {
                     let step_label = extract_step_label(&ev.summary);
                     let is_step = step_label.is_some();
@@ -437,14 +489,14 @@ fn extract_step_label(prompt: &str) -> Option<String> {
     Some(format!("STEP {step_num}/{total}"))
 }
 
-fn event_style(kind: &str) -> Style {
+fn event_style(kind: &str, theme: &crate::theme::Theme) -> Style {
     match kind {
-        "text" => Style::default().fg(Color::White),
-        "tool" => Style::default().fg(Color::Yellow),
-        "result" => Style::default().fg(Color::Green),
-        "system" => Style::default().fg(Color::DarkGray),
-        "error" => Style::default().fg(Color::Red),
-        "prompt" => Style::default().fg(Color::Cyan),
+        "text" => Style::default().fg(theme.label_primary),
+        "tool" => Style::default().fg(theme.label_warning),
+        "result" => Style::default().fg(theme.status_completed),
+        "system" => Style::default().fg(theme.label_secondary),
+        "error" | "tool_error" => Style::default().fg(theme.status_failed),
+        "prompt" => Style::default().fg(theme.label_info),
         _ => Style::default(),
     }
 }

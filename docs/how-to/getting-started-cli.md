@@ -13,7 +13,7 @@ This guide is for teams that want to use `conductor` as a standalone command-lin
 - **macOS or Linux**
 - **[`gh` CLI](https://cli.github.com/)** — authenticated (`gh auth login`)
 - **[`tmux`](https://github.com/tmux/tmux)** — agents run in tmux windows
-- **Claude API key** — set as `ANTHROPIC_API_KEY` in your environment
+- **[Claude Code CLI (`claude`)](https://docs.anthropic.com/en/docs/claude-code)** — installed and authenticated
 - **Git**
 
 ## Installation
@@ -187,7 +187,7 @@ Re-running `conductor statusline install` upgrades the script automatically.
 ## Tips
 
 - **Model override:** Pass `--model claude-opus-4-6` to any `workflow run` to use a specific model for all agent steps.
-- **Step timeout:** Default is 30 minutes per step. Override with `--step-timeout-secs 3600`.
+- **Step timeout:** Default is 12 hours per step. Override with `--step-timeout-secs 3600`.
 - **Continue on failure:** Use `--no-fail-fast` to run remaining steps even if one fails.
 - **Multiple inputs:** `--input` can be repeated: `--input ticket_id=123 --input skip_tests=true`
 - **Agent logs:** Agent output streams live to the tmux window. Attach with `tmux attach` to watch in real time.

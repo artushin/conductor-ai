@@ -2,23 +2,33 @@
 
 A local-first orchestration tool for managing multiple git repos, worktrees, tickets, and AI agent runs. Multi-step workflows are defined in a custom `.wf` DSL and executed by a workflow engine that spawns Claude agents in tmux windows. All state is stored in a single SQLite database.
 
-## Quick Start
+## What is Conductor?
 
-### Prerequisites
+Conductor is a local tool for managing AI-assisted development across multiple git worktrees. If you're already using Claude to write and review code, Conductor is the layer that keeps everything organized when you're running multiple agents in parallel.
+
+**The problem it solves:**
+
+When you let an agent work on a branch, you don't want to sit and watch it. You want to kick off the work and move on to something else. But the moment you have two or three agents running at once — each on its own worktree — the overhead of managing them adds up fast: tracking which terminal has which branch, knowing when something needs your attention, keeping your ticket tracker in sync with what's actually happening in git.
+
+Conductor handles that overhead. It gives you one place to see all your repos, worktrees, and in-flight work, and a workflow system for defining how agents should handle common tasks (fix-ci, review-pr, iterate-pr, etc.) so you're not copy-pasting prompts.
+
+**Key things it does:**
+- Manages git worktrees for you — create, push, PR, delete — with branch naming handled automatically
+- Runs agent workflows (pre-defined sequences of Claude tasks) against a worktree, PR, or ticket with a single keypress
+- Syncs GitHub issues so your tickets live next to your code, not in a separate browser tab
+- Lets multiple workflows run in parallel without you babysitting them
+
+**Interfaces:** The primary interface is a TUI (terminal UI), with a CLI for scripting. There's also a web app and a Mac app — both are usable today but still being refined, so if you're not a TUI person they're worth trying.
+
+**What it is:** Local-first, no cloud, no account. Runs on your machine, your Claude API key stays yours.
+
+## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
-- [GitHub CLI (`gh`)](https://cli.github.com/) -- installed and authenticated
-- [tmux](https://github.com/tmux/tmux) -- for agent sessions
-- `ANTHROPIC_API_KEY` set in your shell
-
-### Build and Install
-
-```bash
-./build.sh                            # Full build (frontend + all crates)
-cargo install --path conductor-cli    # Install CLI
-cargo install --path conductor-tui    # Install TUI
-cargo install --path conductor-web    # Install web UI (requires ./build.sh first)
-```
+- [Node.js](https://nodejs.org/) (for the web UI frontend)
+- [GitHub CLI (`gh`)](https://cli.github.com/) — installed and authenticated (for GitHub issue sync)
+- [tmux](https://github.com/tmux/tmux) (for AI agent sessions)
+- [Claude Code CLI (`claude`)](https://docs.anthropic.com/en/docs/claude-code) — installed and authenticated
 
 ### First Commands
 
@@ -60,6 +70,19 @@ For design decisions and trade-offs, see [docs/architecture/crate-structure.md](
 | [docs/reference/](docs/reference/) | Workflow DSL syntax, MCP tools, CLI commands, DB schema, output schemas, configuration |
 | [docs/how-to/](docs/how-to/) | Write workflows, manage repos, use worktrees |
 | [docs/README.md](docs/README.md) | Full documentation index with quick navigation |
+
+### Desktop (macOS)
+
+Native Mac app powered by Tauri, embedding the same web UI. Still being refined but usable today.
+
+```bash
+# Dev mode (hot-reload frontend, run from workspace root)
+cd conductor-desktop && cargo tauri dev
+
+# Production build — outputs Conductor.app
+cd conductor-desktop && cargo tauri build
+# App bundle: target/release/bundle/macos/Conductor.app
+```
 
 ## Workflows
 

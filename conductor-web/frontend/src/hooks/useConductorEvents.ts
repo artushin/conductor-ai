@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef } from "react";
+import { getApiOrigin } from "../api/transport";
 
 /** All SSE event types emitted by the backend. */
 export type ConductorEventType =
@@ -10,8 +11,12 @@ export type ConductorEventType =
   | "agent_started"
   | "agent_stopped"
   | "agent_event"
-  | "work_targets_changed"
+  | "repo_agent_started"
+  | "repo_agent_stopped"
+  | "feedback_requested"
+  | "feedback_submitted"
   | "issue_sources_changed"
+  | "notification_created"
   | "lagged";
 
 export interface ConductorEventData {
@@ -21,11 +26,115 @@ export interface ConductorEventData {
 
 type EventHandler = (data: ConductorEventData) => void;
 
+const ALL_EVENT_TYPES: ConductorEventType[] = [
+  "repo_registered",
+  "repo_unregistered",
+  "worktree_created",
+  "worktree_deleted",
+  "tickets_synced",
+  "agent_started",
+  "agent_stopped",
+  "agent_event",
+  "repo_agent_started",
+  "repo_agent_stopped",
+  "feedback_requested",
+  "feedback_submitted",
+  "issue_sources_changed",
+  "notification_created",
+  "lagged",
+];
+
+type Subscriber = {
+  handlersRef: React.RefObject<Partial<Record<ConductorEventType, EventHandler>>>;
+};
+
+/** Shared singleton state — one EventSource for all hook instances. */
+let sharedSource: EventSource | null = null;
+let connecting = false;
+/** Generation counter — incremented on each close so stale `.then()` callbacks are discarded. */
+let connectGeneration = 0;
+let subscribers: Set<Subscriber> = new Set();
+let boundListeners: [string, EventListener][] = [];
+
+function dispatch(eventType: ConductorEventType, e: MessageEvent) {
+  let parsed: ConductorEventData = { event: eventType };
+  try {
+    const json = JSON.parse(e.data);
+    parsed = { event: eventType, data: json.data ?? json };
+  } catch (err) {
+    console.warn(`[useConductorEvents] failed to parse SSE data for "${eventType}":`, err);
+  }
+  for (const sub of subscribers) {
+    const handler = sub.handlersRef.current?.[eventType];
+    if (handler) handler(parsed);
+  }
+}
+
+function connectSource(origin: string) {
+  const source = new EventSource(`${origin}/api/events`);
+  sharedSource = source;
+
+  for (const type of ALL_EVENT_TYPES) {
+    const listener = ((e: MessageEvent) => dispatch(type, e)) as EventListener;
+    source.addEventListener(type, listener);
+    boundListeners.push([type, listener]);
+  }
+
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) {
+      // Connection permanently closed — tear down and reconnect if there are still subscribers
+      closeSharedSource();
+      if (subscribers.size > 0) {
+        setTimeout(() => openSharedSource(), 3000);
+      }
+    }
+  };
+}
+
+function openSharedSource() {
+  if (sharedSource && sharedSource.readyState !== EventSource.CLOSED) return;
+  if (connecting) return;
+
+  // Clean up any dead connection before creating a new one
+  if (sharedSource) {
+    closeSharedSource();
+  }
+
+  // Guard against concurrent callers all entering before the async origin resolves.
+  connecting = true;
+  const gen = connectGeneration;
+  getApiOrigin()
+    .then((origin) => {
+      connecting = false;
+      // If closeSharedSource() was called while we were awaiting, this callback
+      // is stale — a new openSharedSource() may already be in flight.
+      if (gen !== connectGeneration) return;
+      connectSource(origin);
+    })
+    .catch((e) => {
+      connecting = false;
+      console.error("[conductor] Failed to resolve API origin for SSE:", e);
+    });
+}
+
+function closeSharedSource() {
+  connecting = false;
+  connectGeneration++;
+  if (!sharedSource) return;
+  for (const [type, listener] of boundListeners) {
+    sharedSource.removeEventListener(type, listener);
+  }
+  sharedSource.close();
+  sharedSource = null;
+  boundListeners = [];
+}
+
 /**
  * Subscribe to the backend SSE stream at /api/events.
  *
- * Accepts a map of event types to handler functions. The hook manages a single
- * shared EventSource connection per mount, reconnecting automatically on error.
+ * Accepts a map of event types to handler functions. All hook instances share
+ * a single EventSource connection (ref-counted). The first caller opens the
+ * connection; the last unmount closes it.
  */
 export function useConductorEvents(
   handlers: Partial<Record<ConductorEventType, EventHandler>>,
@@ -33,50 +142,16 @@ export function useConductorEvents(
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
 
-  const makeHandler = useCallback(
-    (eventType: ConductorEventType) => (e: MessageEvent) => {
-      const handler = handlersRef.current[eventType];
-      if (!handler) return;
-      try {
-        const parsed = JSON.parse(e.data);
-        handler({ event: eventType, data: parsed.data ?? parsed });
-      } catch {
-        handler({ event: eventType });
-      }
-    },
-    [],
-  );
-
   useEffect(() => {
-    const source = new EventSource("/api/events");
-
-    const eventTypes: ConductorEventType[] = [
-      "repo_registered",
-      "repo_unregistered",
-      "worktree_created",
-      "worktree_deleted",
-      "tickets_synced",
-      "agent_started",
-      "agent_stopped",
-      "agent_event",
-      "work_targets_changed",
-      "issue_sources_changed",
-      "lagged",
-    ];
-
-    const boundHandlers: [string, (e: MessageEvent) => void][] = [];
-
-    for (const type of eventTypes) {
-      const handler = makeHandler(type);
-      source.addEventListener(type, handler as EventListener);
-      boundHandlers.push([type, handler]);
-    }
+    const subscriber: Subscriber = { handlersRef };
+    subscribers.add(subscriber);
+    openSharedSource();
 
     return () => {
-      for (const [type, handler] of boundHandlers) {
-        source.removeEventListener(type, handler as EventListener);
+      subscribers.delete(subscriber);
+      if (subscribers.size === 0) {
+        closeSharedSource();
       }
-      source.close();
     };
-  }, [makeHandler]);
+  }, []);
 }

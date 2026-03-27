@@ -19,6 +19,16 @@ pub enum ConductorEvent {
     AgentStarted { run_id: String, worktree_id: String },
     #[serde(rename = "agent_stopped")]
     AgentStopped { run_id: String, worktree_id: String },
+    #[serde(rename = "repo_agent_started")]
+    RepoAgentStarted { run_id: String, repo_id: String },
+    #[serde(rename = "repo_agent_stopped")]
+    RepoAgentStopped { run_id: String, repo_id: String },
+    #[serde(rename = "agent_restarted")]
+    AgentRestarted {
+        run_id: String,
+        old_run_id: String,
+        worktree_id: String,
+    },
     #[serde(rename = "agent_event")]
     AgentEvent { run_id: String, worktree_id: String },
     #[serde(rename = "feedback_requested")]
@@ -33,8 +43,6 @@ pub enum ConductorEvent {
         worktree_id: String,
         feedback_id: String,
     },
-    #[serde(rename = "work_targets_changed")]
-    WorkTargetsChanged,
     #[serde(rename = "issue_sources_changed")]
     IssueSourcesChanged { repo_id: String },
     #[serde(rename = "workflow_run_status_changed")]
@@ -51,6 +59,14 @@ pub enum ConductorEvent {
     },
     #[serde(rename = "workflow_gate_waiting")]
     WorkflowGateWaiting { run_id: String, step_id: String },
+    #[serde(rename = "notification_created")]
+    NotificationCreated {
+        id: String,
+        kind: String,
+        severity: String,
+        title: String,
+        body: String,
+    },
 }
 
 impl ConductorEvent {
@@ -64,14 +80,17 @@ impl ConductorEvent {
             Self::TicketsSynced { .. } => "tickets_synced",
             Self::AgentStarted { .. } => "agent_started",
             Self::AgentStopped { .. } => "agent_stopped",
+            Self::RepoAgentStarted { .. } => "repo_agent_started",
+            Self::RepoAgentStopped { .. } => "repo_agent_stopped",
+            Self::AgentRestarted { .. } => "agent_restarted",
             Self::AgentEvent { .. } => "agent_event",
             Self::FeedbackRequested { .. } => "feedback_requested",
             Self::FeedbackSubmitted { .. } => "feedback_submitted",
-            Self::WorkTargetsChanged => "work_targets_changed",
             Self::IssueSourcesChanged { .. } => "issue_sources_changed",
             Self::WorkflowRunStatusChanged { .. } => "workflow_run_status_changed",
             Self::WorkflowStepStatusChanged { .. } => "workflow_step_status_changed",
             Self::WorkflowGateWaiting { .. } => "workflow_gate_waiting",
+            Self::NotificationCreated { .. } => "notification_created",
         }
     }
 }
@@ -176,6 +195,28 @@ mod tests {
                 "agent_stopped",
             ),
             (
+                ConductorEvent::RepoAgentStarted {
+                    run_id: "".into(),
+                    repo_id: "".into(),
+                },
+                "repo_agent_started",
+            ),
+            (
+                ConductorEvent::RepoAgentStopped {
+                    run_id: "".into(),
+                    repo_id: "".into(),
+                },
+                "repo_agent_stopped",
+            ),
+            (
+                ConductorEvent::AgentRestarted {
+                    run_id: "".into(),
+                    old_run_id: "".into(),
+                    worktree_id: "".into(),
+                },
+                "agent_restarted",
+            ),
+            (
                 ConductorEvent::AgentEvent {
                     run_id: "".into(),
                     worktree_id: "".into(),
@@ -198,7 +239,6 @@ mod tests {
                 },
                 "feedback_submitted",
             ),
-            (ConductorEvent::WorkTargetsChanged, "work_targets_changed"),
             (
                 ConductorEvent::IssueSourcesChanged { repo_id: "".into() },
                 "issue_sources_changed",
@@ -225,6 +265,16 @@ mod tests {
                     step_id: "".into(),
                 },
                 "workflow_gate_waiting",
+            ),
+            (
+                ConductorEvent::NotificationCreated {
+                    id: "".into(),
+                    kind: "".into(),
+                    severity: "".into(),
+                    title: "".into(),
+                    body: "".into(),
+                },
+                "notification_created",
             ),
         ];
         for (event, expected) in cases {

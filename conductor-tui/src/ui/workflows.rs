@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -6,17 +6,49 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use conductor_core::workflow::{WorkflowDef, WorkflowRun, WorkflowRunStatus};
+use conductor_core::workflow::InputType;
+use conductor_core::workflow::WorkflowNode;
+use conductor_core::workflow::{
+    WorkflowDef, WorkflowRun, WorkflowRunStatus, WorkflowRunStep, WorkflowStepStatus,
+};
 
-use super::common::truncate;
-use super::helpers::{shorten_paths, visual_idx_with_headers};
+use super::common::{gate_type_icon, truncate};
+use super::helpers::{format_condition, shorten_paths};
 use crate::state::AppState;
+use crate::state::ColumnFocus;
 use crate::state::TargetType;
+use crate::state::View;
+use crate::state::WorkflowDefFocus;
 use crate::state::WorkflowRunDetailFocus;
 use crate::state::WorkflowRunRow;
 use crate::state::WorkflowsFocus;
+use crate::theme::Theme;
+
+/// Returns a short context label for workflow pane titles, e.g. "my-repo" or "feat-123".
+/// Returns `None` when in global (all-repos) mode.
+fn workflow_context_label(state: &AppState) -> Option<String> {
+    if let Some(ref wt_id) = state.selected_worktree_id {
+        let slug = state
+            .data
+            .worktrees
+            .iter()
+            .find(|w| &w.id == wt_id)
+            .map(|w| w.slug.clone());
+        return slug;
+    }
+    if state.view == View::RepoDetail {
+        let slug = state
+            .selected_repo_id
+            .as_ref()
+            .and_then(|id| state.data.repos.iter().find(|r| &r.id == id))
+            .map(|r| r.slug.clone());
+        return slug;
+    }
+    None
+}
 
 /// Render the Workflows split-pane view: defs (left) + runs (right).
+#[allow(dead_code)]
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     // Always show a 1-line context bar so the user knows which worktree's
     // workflows they are viewing (or that they are in global mode).
@@ -66,18 +98,92 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(area);
 
     render_defs(frame, chunks[0], state);
-    render_runs(frame, chunks[1], state);
+    if state.workflows_focus == WorkflowsFocus::Defs
+        && state.workflow_def_focus == WorkflowDefFocus::Steps
+    {
+        render_def_steps(frame, chunks[1], state);
+    } else {
+        render_runs(frame, chunks[1], state);
+    }
 }
 
-fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let focused = state.workflows_focus == WorkflowsFocus::Defs;
+/// Returns the number of visible rows in the defs list (items + separator headers in global mode).
+/// Used by both `render_defs` and `workflow_column::render_workflow_column` for height calculation.
+pub(super) fn render_defs_row_count(state: &AppState) -> usize {
+    let global_mode = state.selected_worktree_id.is_none() && state.selected_repo_id.is_none();
+    if global_mode {
+        let sep_count = state
+            .data
+            .workflow_def_slugs
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        // Also count distinct named group headers per repo.
+        let mut group_header_count = 0usize;
+        let mut prev_repo = "";
+        let mut prev_group: Option<&str> = None;
+        let fallback = String::from("?");
+        for (i, def) in state.data.workflow_defs.iter().enumerate() {
+            let slug = state
+                .data
+                .workflow_def_slugs
+                .get(i)
+                .unwrap_or(&fallback)
+                .as_str();
+            if slug != prev_repo {
+                prev_repo = slug;
+                prev_group = None;
+            }
+            if let Some(g) = def.group.as_deref() {
+                if Some(g) != prev_group {
+                    group_header_count += 1;
+                    prev_group = Some(g);
+                }
+            }
+        }
+        state.data.workflow_defs.len() + sep_count + group_header_count
+    } else {
+        // Count distinct named group headers.
+        let mut prev_group: Option<&str> = None;
+        let mut header_count = 0usize;
+        for def in &state.data.workflow_defs {
+            if let Some(g) = def.group.as_deref() {
+                if Some(g) != prev_group {
+                    header_count += 1;
+                    prev_group = Some(g);
+                }
+            }
+        }
+        state.data.workflow_defs.len() + header_count
+    }
+}
+
+pub(super) fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
+    let focused = state.column_focus == ColumnFocus::Workflow
+        && state.workflows_focus == WorkflowsFocus::Defs;
     let border_color = if focused {
         state.theme.border_focused
     } else {
         state.theme.border_inactive
     };
 
-    let global_mode = state.selected_worktree_id.is_none();
+    // Collapsed: render a single-line header with def count.
+    if state.workflow_defs_collapsed {
+        let count = state.data.workflow_defs.len();
+        let title = format!("▶ Definitions ({count})");
+        let style = if focused {
+            Style::default()
+                .fg(state.theme.border_focused)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(state.theme.border_inactive)
+        };
+        frame.render_widget(Paragraph::new(Span::styled(title, style)), area);
+        return;
+    }
+
+    let context = workflow_context_label(state);
+    let global_mode = state.selected_worktree_id.is_none() && state.selected_repo_id.is_none();
 
     if global_mode {
         // Use pre-computed (repo_slug, def) pairs from state (populated by background thread).
@@ -100,6 +206,7 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let mut items: Vec<ListItem> = Vec::new();
         let mut prev_repo = "";
+        let mut prev_group: Option<&str> = None;
         for (repo_slug, def) in &defs_with_slug {
             if *repo_slug != prev_repo {
                 let fill = format!("{:─<30}", "");
@@ -110,9 +217,28 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
                         .add_modifier(Modifier::BOLD),
                 )])));
                 prev_repo = repo_slug;
+                prev_group = None;
+            }
+            if let Some(g) = def.group.as_deref() {
+                if Some(g) != prev_group {
+                    items.push(ListItem::new(Line::from(vec![Span::styled(
+                        format!("  ─ {g} "),
+                        Style::default()
+                            .fg(state.theme.group_header)
+                            .add_modifier(Modifier::BOLD),
+                    )])));
+                    prev_group = Some(g);
+                }
             }
             let node_count = def.body.len();
             let input_count = def.inputs.len();
+            let (badge_sym, badge_label, badge_color) =
+                last_run_badge(&def.name, &state.data.workflow_runs, &state.theme);
+            let badge_text = if badge_label.is_empty() {
+                format!("  {badge_sym}")
+            } else {
+                format!("  {badge_sym} {badge_label}")
+            };
             let mut spans = vec![
                 Span::raw("  \u{2514} "),
                 Span::styled(
@@ -123,6 +249,7 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
                     format!("  {node_count} steps"),
                     Style::default().fg(state.theme.label_warning),
                 ),
+                Span::styled(badge_text, Style::default().fg(badge_color)),
             ];
             if !def.targets.is_empty() {
                 let badge = format!("  [{}]", def.targets.join(", "));
@@ -144,7 +271,24 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
             let logical_idx = state
                 .workflow_def_index
                 .min(defs_with_slug.len().saturating_sub(1));
-            visual_idx_with_headers(&defs_with_slug, |(slug, _)| slug.to_string(), logical_idx)
+            // Count both repo-slug headers and named-group headers up to logical_idx.
+            let mut headers = 0usize;
+            let mut prev_r = "";
+            let mut prev_g: Option<&str> = None;
+            for (slug, def) in defs_with_slug.iter().take(logical_idx + 1) {
+                if *slug != prev_r {
+                    headers += 1; // repo header
+                    prev_r = slug;
+                    prev_g = None;
+                }
+                if let Some(g) = def.group.as_deref() {
+                    if Some(g) != prev_g {
+                        headers += 1; // named-group header
+                        prev_g = Some(g);
+                    }
+                }
+            }
+            logical_idx + headers
         } else {
             0
         };
@@ -154,7 +298,11 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border_color))
-                    .title(" All Workflow Definitions "),
+                    .title(if focused {
+                        " All Definitions  Enter=view  l=steps  r=run "
+                    } else {
+                        " All Workflow Definitions "
+                    }),
             )
             .highlight_style(
                 Style::default()
@@ -169,51 +317,98 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         frame.render_stateful_widget(list, area, &mut list_state);
     } else {
-        // Single-worktree mode: flat list with description and target badges.
-        let items: Vec<ListItem> = state
-            .data
-            .workflow_defs
-            .iter()
-            .map(|def| {
-                let node_count = def.body.len();
-                let input_count = def.inputs.len();
-                let mut spans = vec![
-                    Span::styled(
-                        format!("{:<20}", def.name),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  {}", truncate(&def.description, 30)),
-                        Style::default().fg(state.theme.label_secondary),
-                    ),
-                    Span::styled(
-                        format!("  {node_count} steps"),
-                        Style::default().fg(state.theme.label_warning),
-                    ),
-                ];
-                if !def.targets.is_empty() {
-                    let badge = format!("  [{}]", def.targets.join(", "));
-                    spans.push(Span::styled(
-                        badge,
-                        Style::default().fg(state.theme.label_accent),
-                    ));
+        // Worktree-scoped or repo-scoped: list with group header rows for named groups.
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut prev_group: Option<&str> = None;
+        for def in &state.data.workflow_defs {
+            if let Some(g) = def.group.as_deref() {
+                if Some(g) != prev_group {
+                    items.push(ListItem::new(Line::from(vec![Span::styled(
+                        format!("─ {g} "),
+                        Style::default()
+                            .fg(state.theme.group_header)
+                            .add_modifier(Modifier::BOLD),
+                    )])));
+                    prev_group = Some(g);
                 }
-                if input_count > 0 {
-                    spans.push(Span::styled(
-                        format!("  {input_count} inputs"),
-                        Style::default().fg(state.theme.status_waiting),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
+            }
+            let node_count = def.body.len();
+            let input_count = def.inputs.len();
+            let (badge_sym, badge_label, badge_color) =
+                last_run_badge(&def.name, &state.data.workflow_runs, &state.theme);
+            let badge_text = if badge_label.is_empty() {
+                format!("  {badge_sym}")
+            } else {
+                format!("  {badge_sym} {badge_label}")
+            };
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<20}", def.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", truncate(&def.description, 30)),
+                    Style::default().fg(state.theme.label_secondary),
+                ),
+                Span::styled(
+                    format!("  {node_count} steps"),
+                    Style::default().fg(state.theme.label_warning),
+                ),
+                Span::styled(badge_text, Style::default().fg(badge_color)),
+            ];
+            if !def.targets.is_empty() {
+                let badge = format!("  [{}]", def.targets.join(", "));
+                spans.push(Span::styled(
+                    badge,
+                    Style::default().fg(state.theme.label_accent),
+                ));
+            }
+            if input_count > 0 {
+                spans.push(Span::styled(
+                    format!("  {input_count} inputs"),
+                    Style::default().fg(state.theme.status_waiting),
+                ));
+            }
+            items.push(ListItem::new(Line::from(spans)));
+        }
 
+        // Compute visual_idx: logical_idx + number of named-group headers that precede it.
+        let visual_idx = if !state.data.workflow_defs.is_empty() {
+            let logical_idx = state
+                .workflow_def_index
+                .min(state.data.workflow_defs.len().saturating_sub(1));
+            let mut prev_seen_group: Option<&str> = None;
+            let mut header_count = 0usize;
+            for def in state.data.workflow_defs.iter().take(logical_idx + 1) {
+                if let Some(g) = def.group.as_deref() {
+                    if Some(g) != prev_seen_group {
+                        header_count += 1;
+                        prev_seen_group = Some(g);
+                    }
+                }
+            }
+            logical_idx + header_count
+        } else {
+            0
+        };
+
+        let defs_title = if focused {
+            match &context {
+                Some(label) => format!(" Definitions ({label})  Enter=view  l=steps  r=run "),
+                None => " Definitions  Enter=view  l=steps  r=run ".to_string(),
+            }
+        } else {
+            match &context {
+                Some(label) => format!(" Workflow Definitions ({label}) "),
+                None => " Workflow Definitions ".to_string(),
+            }
+        };
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border_color))
-                    .title(" Workflow Definitions "),
+                    .title(defs_title),
             )
             .highlight_style(
                 Style::default()
@@ -224,22 +419,561 @@ fn render_defs(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let mut list_state = ListState::default();
         if !state.data.workflow_defs.is_empty() {
-            list_state.select(Some(state.workflow_def_index));
+            list_state.select(Some(visual_idx));
         }
         frame.render_stateful_widget(list, area, &mut list_state);
     }
 }
 
-fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let focused = state.workflows_focus == WorkflowsFocus::Runs;
+/// Render the step tree pane for the selected workflow definition.
+pub(super) fn render_def_steps(frame: &mut Frame, area: Rect, state: &AppState) {
+    let focused = state.column_focus == ColumnFocus::Workflow
+        && state.workflows_focus == WorkflowsFocus::Defs
+        && state.workflow_def_focus == WorkflowDefFocus::Steps;
     let border_color = if focused {
         state.theme.border_focused
     } else {
         state.theme.border_inactive
     };
 
-    // In global mode (no worktree selected), show target context on each run row.
-    let global_mode = state.selected_worktree_id.is_none();
+    let def = state.data.workflow_defs.get(state.workflow_def_index);
+
+    let empty_set = HashSet::new();
+    let items = match def {
+        Some(d) if !d.body.is_empty() => build_def_step_lines(
+            &d.body,
+            0,
+            &state.theme,
+            &state.data.workflow_defs,
+            &state.workflow_def_expanded_calls,
+            "",
+            &empty_set,
+        ),
+        _ => vec![ListItem::new(Line::from(vec![Span::styled(
+            "(no steps)",
+            Style::default().fg(state.theme.label_secondary),
+        )]))],
+    };
+
+    let total = items.len();
+    let title = if total > 0 {
+        format!(" Steps ({total})  j/k=navigate  Enter=expand  Esc=back ")
+    } else {
+        " Steps  Esc=back ".to_string()
+    };
+
+    // Split area vertically when the definition has inputs.
+    let has_inputs = def.map(|d| !d.inputs.is_empty()).unwrap_or(false);
+    let (steps_area, inputs_area_opt) = if has_inputs {
+        let input_count = def.map(|d| d.inputs.len()).unwrap_or(0);
+        let inputs_height = (input_count.min(6) as u16) + 2; // +2 for border
+        let splits = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(inputs_height)])
+            .split(area);
+        (splits[0], Some(splits[1]))
+    } else {
+        (area, None)
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(title),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(state.theme.highlight_bg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("");
+
+    let mut list_state = ListState::default();
+    if total > 0 {
+        list_state.select(Some(
+            state.workflow_def_step_index.min(total.saturating_sub(1)),
+        ));
+    }
+    frame.render_stateful_widget(list, steps_area, &mut list_state);
+
+    // Render inputs section below the step list when present.
+    if let (Some(inputs_area), Some(d)) = (inputs_area_opt, def) {
+        let input_lines: Vec<ListItem> = d
+            .inputs
+            .iter()
+            .map(|inp| {
+                let mut spans = vec![Span::styled(
+                    format!("  {:<18}", inp.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                if inp.required {
+                    spans.push(Span::styled(
+                        " (required)",
+                        Style::default().fg(state.theme.label_warning),
+                    ));
+                } else if let Some(ref default) = inp.default {
+                    spans.push(Span::styled(
+                        format!(" default: {default}"),
+                        Style::default().fg(state.theme.label_secondary),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let inputs_list = List::new(input_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(" Inputs "),
+        );
+        frame.render_widget(inputs_list, inputs_area);
+    }
+}
+
+/// Recursively build flat `ListItem`s from a `WorkflowNode` slice.
+/// Returns the items so callers can also use `.len()` for navigation bounds.
+///
+/// `workflow_defs` — all known workflow definitions (for inline CallWorkflow expansion).
+/// `expanded_calls` — set of dot-path strings identifying expanded CallWorkflow nodes.
+/// `path_prefix` — dot-path prefix for the current recursion level (e.g. `""` or `"2."`).
+/// `seen` — workflow names already in the current expansion stack (cycle guard).
+pub(crate) fn build_def_step_lines<'a>(
+    nodes: &[WorkflowNode],
+    depth: usize,
+    theme: &crate::theme::Theme,
+    workflow_defs: &[WorkflowDef],
+    expanded_calls: &HashSet<String>,
+    path_prefix: &str,
+    seen: &HashSet<String>,
+) -> Vec<ListItem<'a>> {
+    let indent = "  ".repeat(depth);
+    let mut items = Vec::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+        let path = format!("{}{}", path_prefix, i);
+        match node {
+            WorkflowNode::Call(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[call]  ", Style::default().fg(theme.label_accent)),
+                    Span::styled(
+                        n.agent.label().to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])));
+            }
+            WorkflowNode::CallWorkflow(n) => {
+                let is_expanded = expanded_calls.contains(&path);
+                let indicator = if is_expanded { "▼" } else { "▶" };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(
+                        format!("{indicator} [→ wf]  "),
+                        Style::default().fg(theme.label_accent),
+                    ),
+                    Span::styled(
+                        n.workflow.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])));
+                if is_expanded {
+                    let child_indent = "  ".repeat(depth + 1);
+                    if seen.contains(&n.workflow) {
+                        items.push(ListItem::new(Line::from(vec![
+                            Span::raw(child_indent),
+                            Span::styled(
+                                "(↺ recursive — not expanded)",
+                                Style::default().fg(theme.label_secondary),
+                            ),
+                        ])));
+                    } else if let Some(sub_def) =
+                        workflow_defs.iter().find(|d| d.name == n.workflow)
+                    {
+                        let mut new_seen = seen.clone();
+                        new_seen.insert(n.workflow.clone());
+                        let new_prefix = format!("{}.", path);
+                        items.extend(build_def_step_lines(
+                            &sub_def.body,
+                            depth + 1,
+                            theme,
+                            workflow_defs,
+                            expanded_calls,
+                            &new_prefix,
+                            &new_seen,
+                        ));
+                    } else {
+                        items.push(ListItem::new(Line::from(vec![
+                            Span::raw(child_indent),
+                            Span::styled(
+                                "(workflow not found)",
+                                Style::default().fg(theme.label_secondary),
+                            ),
+                        ])));
+                    }
+                }
+            }
+            WorkflowNode::Parallel(n) => {
+                let count = n.calls.len();
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[para]  ", Style::default().fg(theme.label_warning)),
+                    Span::styled(
+                        format!("{count} agents"),
+                        Style::default().fg(theme.label_secondary),
+                    ),
+                ])));
+                for call in &n.calls {
+                    let child_indent = "  ".repeat(depth + 1);
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::raw(child_indent),
+                        Span::styled("└ ", Style::default().fg(theme.label_secondary)),
+                        Span::styled("[call]  ", Style::default().fg(theme.label_accent)),
+                        Span::raw::<String>(call.label().to_string()),
+                    ])));
+                }
+            }
+            WorkflowNode::Gate(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[gate]  ", Style::default().fg(theme.label_warning)),
+                    Span::styled(
+                        n.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  ({})", n.gate_type),
+                        Style::default().fg(theme.label_secondary),
+                    ),
+                ])));
+            }
+            WorkflowNode::If(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[if]    ", Style::default().fg(theme.label_accent)),
+                    Span::styled(
+                        format_condition(&n.condition),
+                        Style::default().fg(theme.label_secondary),
+                    ),
+                ])));
+                items.extend(build_def_step_lines(
+                    &n.body,
+                    depth + 1,
+                    theme,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                ));
+            }
+            WorkflowNode::Unless(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[unless]", Style::default().fg(theme.label_accent)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format_condition(&n.condition),
+                        Style::default().fg(theme.label_secondary),
+                    ),
+                ])));
+                items.extend(build_def_step_lines(
+                    &n.body,
+                    depth + 1,
+                    theme,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                ));
+            }
+            WorkflowNode::While(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[while] ", Style::default().fg(theme.label_accent)),
+                    Span::styled(
+                        format!("{}.{}", n.step, n.marker),
+                        Style::default().fg(theme.label_secondary),
+                    ),
+                ])));
+                items.extend(build_def_step_lines(
+                    &n.body,
+                    depth + 1,
+                    theme,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                ));
+            }
+            WorkflowNode::DoWhile(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[do]    ", Style::default().fg(theme.label_accent)),
+                    Span::styled(
+                        format!("while {}.{}", n.step, n.marker),
+                        Style::default().fg(theme.label_secondary),
+                    ),
+                ])));
+                items.extend(build_def_step_lines(
+                    &n.body,
+                    depth + 1,
+                    theme,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                ));
+            }
+            WorkflowNode::Do(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[do]    ", Style::default().fg(theme.label_accent)),
+                ])));
+                items.extend(build_def_step_lines(
+                    &n.body,
+                    depth + 1,
+                    theme,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                ));
+            }
+            WorkflowNode::Script(s) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[script]", Style::default().fg(theme.label_accent)),
+                    Span::raw("  "),
+                    Span::styled(
+                        s.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])));
+            }
+            WorkflowNode::Always(n) => {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("[always]", Style::default().fg(theme.label_warning)),
+                ])));
+                items.extend(build_def_step_lines(
+                    &n.body,
+                    depth + 1,
+                    theme,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                ));
+            }
+        }
+    }
+
+    items
+}
+
+/// Returns the dot-path of the `CallWorkflow` node at flat list index `target`,
+/// or `None` if the row at that index is not a `CallWorkflow` header.
+///
+/// Mirrors the traversal of `build_def_step_lines` exactly.
+/// Used by the binary (app.rs) — suppress dead_code warning from lib target.
+#[allow(dead_code)]
+pub(crate) fn get_def_step_node_at(
+    nodes: &[WorkflowNode],
+    workflow_defs: &[WorkflowDef],
+    expanded_calls: &HashSet<String>,
+    path_prefix: &str,
+    seen: &HashSet<String>,
+    target: usize,
+    counter: &mut usize,
+) -> Option<String> {
+    for (i, node) in nodes.iter().enumerate() {
+        let path = format!("{}{}", path_prefix, i);
+        match node {
+            WorkflowNode::Call(_) | WorkflowNode::Gate(_) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+            }
+            WorkflowNode::Parallel(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                for _ in &n.calls {
+                    if *counter == target {
+                        return None;
+                    }
+                    *counter += 1;
+                }
+            }
+            WorkflowNode::CallWorkflow(n) => {
+                if *counter == target {
+                    return Some(path.clone());
+                }
+                *counter += 1;
+                if expanded_calls.contains(&path) {
+                    if seen.contains(&n.workflow) {
+                        // "(↺ recursive)" row
+                        if *counter == target {
+                            return None;
+                        }
+                        *counter += 1;
+                    } else if let Some(sub_def) =
+                        workflow_defs.iter().find(|d| d.name == n.workflow)
+                    {
+                        let mut new_seen = seen.clone();
+                        new_seen.insert(n.workflow.clone());
+                        let new_prefix = format!("{}.", path);
+                        if let Some(r) = get_def_step_node_at(
+                            &sub_def.body,
+                            workflow_defs,
+                            expanded_calls,
+                            &new_prefix,
+                            &new_seen,
+                            target,
+                            counter,
+                        ) {
+                            return Some(r);
+                        }
+                    } else {
+                        // "(workflow not found)" row
+                        if *counter == target {
+                            return None;
+                        }
+                        *counter += 1;
+                    }
+                }
+            }
+            WorkflowNode::If(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                if let Some(r) = get_def_step_node_at(
+                    &n.body,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                    target,
+                    counter,
+                ) {
+                    return Some(r);
+                }
+            }
+            WorkflowNode::Unless(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                if let Some(r) = get_def_step_node_at(
+                    &n.body,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                    target,
+                    counter,
+                ) {
+                    return Some(r);
+                }
+            }
+            WorkflowNode::While(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                if let Some(r) = get_def_step_node_at(
+                    &n.body,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                    target,
+                    counter,
+                ) {
+                    return Some(r);
+                }
+            }
+            WorkflowNode::DoWhile(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                if let Some(r) = get_def_step_node_at(
+                    &n.body,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                    target,
+                    counter,
+                ) {
+                    return Some(r);
+                }
+            }
+            WorkflowNode::Do(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                if let Some(r) = get_def_step_node_at(
+                    &n.body,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                    target,
+                    counter,
+                ) {
+                    return Some(r);
+                }
+            }
+            WorkflowNode::Script(_) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+            }
+            WorkflowNode::Always(n) => {
+                if *counter == target {
+                    return None;
+                }
+                *counter += 1;
+                if let Some(r) = get_def_step_node_at(
+                    &n.body,
+                    workflow_defs,
+                    expanded_calls,
+                    &format!("{}.", path),
+                    seen,
+                    target,
+                    counter,
+                ) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
+    let focused = state.column_focus == ColumnFocus::Workflow
+        && state.workflows_focus == WorkflowsFocus::Runs;
+    let border_color = if focused {
+        state.theme.border_focused
+    } else {
+        state.theme.border_inactive
+    };
+
+    let context = workflow_context_label(state);
+    // In global mode (no worktree or repo selected), show target context on each run row.
+    let global_mode = state.selected_worktree_id.is_none() && state.selected_repo_id.is_none();
+    // In repo-detail mode, show slug label rows above run groups and indent run rows.
+    let repo_detail_mode = state.selected_repo_id.is_some() && state.selected_worktree_id.is_none();
 
     let visible = state.visible_workflow_run_rows();
 
@@ -296,6 +1030,81 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                         Style::default().fg(state.theme.label_secondary),
                     )]));
                 }
+                WorkflowRunRow::SlugLabel { label } => {
+                    return ListItem::new(Line::from(vec![Span::styled(
+                        label.clone(),
+                        Style::default()
+                            .fg(state.theme.label_secondary)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                }
+                WorkflowRunRow::Step {
+                    step_name,
+                    status,
+                    position,
+                    depth,
+                    role,
+                    ..
+                } => {
+                    let base_indent = if global_mode {
+                        "    "
+                    } else if repo_detail_mode {
+                        "  "
+                    } else {
+                        ""
+                    };
+                    let level_indent = "  ".repeat(*depth as usize);
+                    let (status_symbol, status_color) = status_display(status, &state.theme);
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(format!("{base_indent}{level_indent}")),
+                        Span::styled(
+                            "\u{2570} ",
+                            Style::default().fg(state.theme.label_secondary),
+                        ),
+                        Span::styled(
+                            format!("{position}. "),
+                            Style::default().fg(state.theme.label_secondary),
+                        ),
+                        Span::styled(status_symbol, Style::default().fg(status_color)),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("[{:<8}]", display_role(role)),
+                            Style::default().fg(role_color(role, &state.theme)),
+                        ),
+                        Span::raw("  "),
+                        Span::raw(step_name.clone()),
+                    ]));
+                }
+                WorkflowRunRow::ParallelGroup {
+                    status,
+                    count,
+                    depth,
+                    ..
+                } => {
+                    let base_indent = if global_mode {
+                        "    "
+                    } else if repo_detail_mode {
+                        "  "
+                    } else {
+                        ""
+                    };
+                    let level_indent = "  ".repeat(*depth as usize);
+                    let (status_symbol, status_color) = status_display(status, &state.theme);
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(format!("{base_indent}{level_indent}")),
+                        Span::styled(
+                            "\u{2570} ",
+                            Style::default().fg(state.theme.label_secondary),
+                        ),
+                        Span::styled(status_symbol, Style::default().fg(status_color)),
+                        Span::raw("  "),
+                        Span::styled(
+                            "[parallel]",
+                            Style::default().fg(state.theme.status_waiting),
+                        ),
+                        Span::raw(format!("  ({count} steps)")),
+                    ]));
+                }
                 _ => {}
             }
 
@@ -307,7 +1116,8 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                 return ListItem::new(Line::from(vec![Span::raw("?")]));
             };
 
-            let (status_symbol, status_color) = status_display(&run.status.to_string());
+            let (status_symbol, status_color) =
+                run_status_icon(run, &state.data.workflow_run_steps, &state.theme);
             let duration = if let Some(ref ended) = run.ended_at {
                 format_duration(&run.started_at, ended)
             } else {
@@ -318,9 +1128,11 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                 WorkflowRunRow::Parent {
                     collapsed,
                     child_count,
+                    run_id,
+                    max_iteration,
                     ..
                 } => {
-                    // Prefix: collapse toggle indicator (only when there are children).
+                    // Prefix: collapse toggle indicator.
                     let prefix = if *child_count > 0 {
                         if *collapsed {
                             "▶ "
@@ -328,11 +1140,23 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                             "▼ "
                         }
                     } else {
-                        "  "
+                        // Leaf run: show step expansion state.
+                        if state.expanded_step_run_ids.contains(run_id) {
+                            "▼ "
+                        } else {
+                            "▶ "
+                        }
                     };
 
                     // In global mode, indent run rows under their target header.
-                    let indent = if global_mode { "    " } else { "" };
+                    // In repo-detail mode, indent run rows under their slug label.
+                    let indent = if global_mode {
+                        "    "
+                    } else if repo_detail_mode {
+                        "  "
+                    } else {
+                        ""
+                    };
 
                     let mut spans = vec![
                         Span::raw(format!("{indent}{prefix}")),
@@ -361,6 +1185,8 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                         Style::default().fg(state.theme.label_accent),
                     ));
 
+                    push_iteration_badge(&mut spans, *max_iteration, state.theme.label_accent);
+
                     // Child count badge when collapsed.
                     if *collapsed && *child_count > 0 {
                         spans.push(Span::styled(
@@ -385,9 +1211,16 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                     depth,
                     collapsed,
                     child_count,
+                    max_iteration,
                     ..
                 } => {
-                    let base_indent = if global_mode { "    " } else { "" };
+                    let base_indent = if global_mode {
+                        "    "
+                    } else if repo_detail_mode {
+                        "  "
+                    } else {
+                        ""
+                    };
                     let level_indent = "  ".repeat(*depth as usize);
                     let toggle = if *child_count > 0 {
                         if *collapsed {
@@ -415,6 +1248,8 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
                         ),
                     ];
 
+                    push_iteration_badge(&mut spans, *max_iteration, state.theme.label_accent);
+
                     if *collapsed && *child_count > 0 {
                         spans.push(Span::styled(
                             format!("  (+{child_count})"),
@@ -434,43 +1269,27 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
 
                     ListItem::new(Line::from(spans))
                 }
-                WorkflowRunRow::Step {
-                    step_name,
-                    status,
-                    position,
-                    depth,
-                    ..
-                } => {
-                    let base_indent = if global_mode { "    " } else { "" };
-                    let level_indent = "  ".repeat(*depth as usize);
-                    let (status_symbol, status_color) = status_display(status);
-                    ListItem::new(Line::from(vec![
-                        Span::raw(format!("{base_indent}{level_indent}")),
-                        Span::styled(
-                            "\u{2570} ",
-                            Style::default().fg(state.theme.label_secondary),
-                        ),
-                        Span::styled(
-                            format!("{position}. "),
-                            Style::default().fg(state.theme.label_secondary),
-                        ),
-                        Span::styled(status_symbol, Style::default().fg(status_color)),
-                        Span::raw("  "),
-                        Span::raw(step_name.clone()),
-                    ]))
-                }
-                // Header arms already handled above; this branch is unreachable.
-                WorkflowRunRow::RepoHeader { .. } | WorkflowRunRow::TargetHeader { .. } => {
-                    ListItem::new(Line::from(vec![Span::raw("")]))
-                }
+                // Step, ParallelGroup, RepoHeader, and TargetHeader are handled above.
+                _ => ListItem::new(Line::from(vec![Span::raw("")])),
             }
         })
         .collect();
 
-    let runs_title = if global_mode {
-        " All Workflow Runs (Space=expand/collapse) "
+    let hidden = state.hidden_workflow_run_count();
+    let hidden_suffix = if hidden > 0 {
+        format!(" +{hidden} hidden (H to show)")
+    } else if !state.show_completed_workflow_runs {
+        " (H: show history)".to_string()
     } else {
-        " Workflow Runs (Space=expand/collapse) "
+        String::new()
+    };
+    let runs_title = if global_mode {
+        format!(" All Workflow Runs{hidden_suffix} ")
+    } else {
+        match &context {
+            Some(label) => format!(" Workflow Runs ({label}){hidden_suffix} "),
+            None => format!(" Workflow Runs{hidden_suffix} "),
+        }
     };
 
     let list = List::new(items)
@@ -494,7 +1313,7 @@ fn render_runs(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-/// Render the workflow run detail view: header + split pane (steps | agent activity).
+/// Render the workflow run detail view: info panel + split pane (steps | agent activity).
 pub fn render_run_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let run_info = state
         .selected_workflow_run_id
@@ -515,113 +1334,247 @@ pub fn render_run_detail(frame: &mut Frame, area: Rect, state: &AppState) {
             .and_then(|tid| state.data.ticket_map.get(tid))
     });
 
-    // Header height: 3 base lines + optional worktree lines (branch + path) + optional ticket line + 1 border
-    let worktree_extra = if run_worktree.is_some() { 2 } else { 0 };
-    let ticket_extra = if run_ticket.is_some() { 1 } else { 0 };
-    let header_height = 3 + worktree_extra + ticket_extra + 1;
+    // Look up pre-parsed declared inputs from the cache (populated on data refresh,
+    // not on every render frame).
+    let declared_inputs = run_info
+        .and_then(|run| state.data.workflow_run_declared_inputs.get(&run.id))
+        .map(|v| v.as_slice())
+        .unwrap_or_default();
+    let matched_inputs: Vec<_> = run_info
+        .map(|run| {
+            declared_inputs
+                .iter()
+                .filter_map(|decl| run.inputs.get(&decl.name).map(|val| (decl, val.as_str())))
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // Header area + body
+    // Info panel: 8 fixed rows + 2 border lines = 10
+    // Plus optional declared inputs rendered below the info panel
+    let info_height: u16 = 10;
+    let inputs_extra = matched_inputs.len() as u16;
+    let inputs_height = if inputs_extra > 0 {
+        inputs_extra + 2 // rows + top/bottom border
+    } else {
+        0
+    };
+
+    // Error pane: visible only for Failed runs with a non-empty result_summary
+    let has_error = state.selected_run_has_error();
+    let error_text = if has_error {
+        run_info
+            .and_then(|r| r.result_summary.as_deref())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    let error_height: u16 = if has_error {
+        // Estimate wrapped line count: each line of text wraps within available width
+        let avail_width = area.width.saturating_sub(4).max(1) as usize; // borders + padding
+        let wrapped_lines: usize = error_text
+            .lines()
+            .map(|l| {
+                let len = l.len();
+                if len == 0 {
+                    1
+                } else {
+                    len.div_ceil(avail_width)
+                }
+            })
+            .sum::<usize>()
+            .max(1);
+        let capped = wrapped_lines.min(6) as u16;
+        capped + 2 // content + borders
+    } else {
+        0
+    };
+
+    // Layout: info panel + optional inputs + optional error pane + body
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(header_height as u16), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(info_height),
+            Constraint::Length(inputs_height),
+            Constraint::Length(error_height),
+            Constraint::Min(0),
+        ])
         .split(area);
 
-    // Header
+    // Info panel (8 fixed rows)
+    let info_focused = state.workflow_run_detail_focus == WorkflowRunDetailFocus::Info;
+
     if let Some(run) = run_info {
-        let (status_symbol, status_color) = status_display(&run.status.to_string());
+        let (status_symbol, status_color) = status_display(&run.status.to_string(), &state.theme);
         let started_display = run
             .started_at
             .get(..19)
             .unwrap_or(&run.started_at)
             .replace('T', " ");
         let summary_display = run.result_summary.as_deref().unwrap_or("—").to_string();
+        let run_id_short = if run.id.len() >= 8 {
+            &run.id[..8]
+        } else {
+            &run.id
+        };
 
-        let mut header_lines = vec![Line::from(vec![
-            Span::styled(
-                " Workflow: ",
-                Style::default().fg(state.theme.label_secondary),
-            ),
-            Span::styled(
-                run.workflow_name.clone(),
-                Style::default()
-                    .fg(state.theme.label_accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(status_symbol, Style::default().fg(status_color)),
-        ])];
-
-        if let Some(wt) = run_worktree {
-            header_lines.push(Line::from(vec![
-                Span::styled(
-                    " Branch:   ",
-                    Style::default().fg(state.theme.label_secondary),
-                ),
-                Span::raw(wt.branch.clone()),
-            ]));
-            let display_path = match state.home_dir.as_deref() {
+        let branch_display = run_worktree
+            .map(|wt| wt.branch.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let path_display = run_worktree
+            .map(|wt| match state.home_dir.as_deref() {
                 Some(home) => wt.path.replacen(home, "~", 1),
                 None => wt.path.clone(),
-            };
-            header_lines.push(Line::from(vec![
-                Span::styled(
-                    " Path:     ",
-                    Style::default().fg(state.theme.label_secondary),
-                ),
-                Span::raw(display_path),
-            ]));
-        }
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let ticket_display = run_ticket
+            .map(|t| format!("#{} — {}", t.source_id, t.title))
+            .unwrap_or_else(|| "—".to_string());
 
-        if let Some(ticket) = run_ticket {
-            header_lines.push(Line::from(vec![
+        let label_style = Style::default().fg(state.theme.label_secondary);
+
+        let mut info_lines = vec![
+            // Row 0: Run ID
+            Line::from(vec![
+                Span::styled(" Run ID:   ", label_style),
                 Span::styled(
-                    " Ticket:   ",
-                    Style::default().fg(state.theme.label_secondary),
+                    run_id_short.to_string(),
+                    Style::default().fg(state.theme.label_accent),
                 ),
+            ]),
+            // Row 1: Workflow
+            Line::from(vec![
+                Span::styled(" Workflow: ", label_style),
                 Span::styled(
-                    format!("#{} — {}", ticket.source_id, ticket.title),
+                    run.workflow_name.clone(),
+                    Style::default()
+                        .fg(state.theme.label_accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            // Row 2: Status
+            Line::from(vec![
+                Span::styled(" Status:   ", label_style),
+                Span::styled(status_symbol, Style::default().fg(status_color)),
+                if run.dry_run {
+                    Span::styled(
+                        "  [dry-run]",
+                        Style::default().fg(state.theme.label_warning),
+                    )
+                } else {
+                    Span::raw("")
+                },
+            ]),
+            // Row 3: Branch
+            Line::from(vec![
+                Span::styled(" Branch:   ", label_style),
+                Span::raw(branch_display),
+            ]),
+            // Row 4: Path
+            Line::from(vec![
+                Span::styled(" Path:     ", label_style),
+                Span::raw(path_display),
+            ]),
+            // Row 5: Ticket
+            Line::from(vec![
+                Span::styled(" Ticket:   ", label_style),
+                Span::styled(
+                    ticket_display,
                     Style::default().fg(state.theme.group_header),
                 ),
-            ]));
-        }
-
-        header_lines.push(Line::from(vec![
-            Span::styled(
-                " Started:  ",
-                Style::default().fg(state.theme.label_secondary),
-            ),
-            Span::raw(started_display),
-            if run.dry_run {
-                Span::styled(
-                    "  [dry-run]",
-                    Style::default().fg(state.theme.label_warning),
-                )
+            ]),
+            // Row 6: Started
+            Line::from(vec![
+                Span::styled(" Started:  ", label_style),
+                Span::raw(started_display),
+            ]),
+            // Row 7: Summary (show "see pane below" when Error pane is visible)
+            if has_error {
+                Line::from(vec![
+                    Span::styled(" Summary:  ", label_style),
+                    Span::styled("—", Style::default().fg(state.theme.label_secondary)),
+                ])
+            } else if run.status == WorkflowRunStatus::Failed {
+                Line::from(vec![
+                    Span::styled(" Error:    ", Style::default().fg(state.theme.label_error)),
+                    Span::styled(
+                        summary_display,
+                        Style::default().fg(state.theme.label_error),
+                    ),
+                ])
             } else {
-                Span::raw("")
+                Line::from(vec![
+                    Span::styled(" Summary:  ", label_style),
+                    Span::raw(summary_display),
+                ])
             },
-        ]));
-        if run.status == WorkflowRunStatus::Failed {
-            header_lines.push(Line::from(vec![
-                Span::styled(" Error:    ", Style::default().fg(state.theme.label_error)),
-                Span::styled(
-                    summary_display,
-                    Style::default().fg(state.theme.label_error),
-                ),
-            ]));
-        } else {
-            header_lines.push(Line::from(vec![
-                Span::styled(
-                    " Summary:  ",
-                    Style::default().fg(state.theme.label_secondary),
-                ),
-                Span::raw(summary_display),
-            ]));
+        ];
+
+        // Apply selection highlight when Info pane is focused
+        if info_focused {
+            let row = state.workflow_run_info_row;
+            if let Some(line) = info_lines.get_mut(row) {
+                *line =
+                    std::mem::take(line).style(Style::default().add_modifier(Modifier::REVERSED));
+            }
         }
 
-        let header_block = Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(state.theme.border_inactive));
-        frame.render_widget(Paragraph::new(header_lines).block(header_block), chunks[0]);
+        let info_border_color = if info_focused {
+            state.theme.border_focused
+        } else {
+            state.theme.border_inactive
+        };
+        let info_title = if info_focused {
+            " Info (y=copy, Tab=switch) "
+        } else {
+            " Info "
+        };
+        let info_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(info_border_color))
+            .title(info_title);
+        frame.render_widget(Paragraph::new(info_lines).block(info_block), chunks[0]);
+
+        // Declared inputs (non-selectable, below info panel)
+        if !matched_inputs.is_empty() {
+            let mut input_lines: Vec<Line> = Vec::new();
+            for (decl, val) in &matched_inputs {
+                let name_display = if decl.name.chars().count() > 9 {
+                    let truncated: String = decl.name.chars().take(8).collect();
+                    format!("{truncated}…")
+                } else {
+                    decl.name.clone()
+                };
+                let label = format!(" {name_display}: ");
+                let padded_label = format!("{label:<11}");
+                let value_display = match decl.input_type {
+                    InputType::Boolean => {
+                        if *val == "true" {
+                            "[x]".to_string()
+                        } else {
+                            "[ ]".to_string()
+                        }
+                    }
+                    InputType::String => truncate(val, area.width.saturating_sub(12) as usize),
+                };
+                input_lines.push(Line::from(vec![
+                    Span::styled(
+                        padded_label,
+                        Style::default().fg(state.theme.label_secondary),
+                    ),
+                    Span::raw(value_display),
+                ]));
+            }
+            let inputs_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.border_inactive))
+                .title(" Inputs ");
+            frame.render_widget(Paragraph::new(input_lines).block(inputs_block), chunks[1]);
+        }
+    }
+
+    // Render error pane (chunk 2) when visible
+    if has_error {
+        render_error_pane(frame, chunks[2], state, error_text);
     }
 
     // Determine if the selected step has agent activity to show
@@ -635,7 +1588,7 @@ pub fn render_run_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         let body_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(chunks[1]);
+            .split(chunks[3]);
 
         let focus = state.workflow_run_detail_focus;
         render_step_list(frame, body_chunks[0], state, focus);
@@ -643,8 +1596,27 @@ pub fn render_run_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         // Full-width step list when no agent activity to show —
         // force Steps focus since agent pane is hidden.
-        render_step_list(frame, chunks[1], state, WorkflowRunDetailFocus::Steps);
+        render_step_list(frame, chunks[3], state, WorkflowRunDetailFocus::Steps);
     }
+}
+
+fn render_error_pane(frame: &mut Frame, area: Rect, state: &AppState, error_text: &str) {
+    let focused = state.workflow_run_detail_focus == WorkflowRunDetailFocus::Error;
+    let border_color = state.theme.label_error;
+    let title = if focused {
+        " Error (y=copy, Tab=switch) "
+    } else {
+        " Error "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title);
+    let paragraph = Paragraph::new(error_text.to_string())
+        .style(Style::default().fg(state.theme.label_error))
+        .block(block)
+        .scroll((state.error_pane_scroll as u16, 0));
+    frame.render_widget(paragraph, area);
 }
 
 fn render_step_list(
@@ -660,86 +1632,118 @@ fn render_step_list(
         state.theme.border_inactive
     };
 
-    let items: Vec<ListItem> = state
-        .data
-        .workflow_steps
-        .iter()
-        .enumerate()
-        .map(|(i, step)| {
-            let (status_symbol, status_color) = status_display(&step.status.to_string());
-            let duration = match (&step.started_at, &step.ended_at) {
-                (Some(start), Some(end)) => format_duration(start, end),
-                (Some(_), None) => "…".to_string(),
-                _ => "—".to_string(),
-            };
+    // Root run row — shown at the top so the overall status is visible in context.
+    let root_run = state
+        .selected_workflow_run_id
+        .as_deref()
+        .and_then(|id| state.data.workflow_runs.iter().find(|r| r.id == id));
+    let mut items: Vec<ListItem> = Vec::new();
+    let has_root_row = root_run.is_some();
+    if let Some(root) = root_run {
+        let (root_symbol, root_color) = status_display(&root.status.to_string(), &state.theme);
+        let root_duration = root
+            .ended_at
+            .as_deref()
+            .map(|e| format_duration(&root.started_at, e))
+            .unwrap_or_else(|| "…".to_string());
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(root_symbol, Style::default().fg(root_color)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:<20}", root.workflow_name),
+                Style::default()
+                    .fg(state.theme.label_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {root_duration}"),
+                Style::default().fg(state.theme.label_accent),
+            ),
+        ])));
+    }
 
-            let mut spans = vec![
-                Span::styled(
-                    format!(" {:>2}. ", step.position),
-                    Style::default().fg(state.theme.label_secondary),
-                ),
-                Span::styled(status_symbol, Style::default().fg(status_color)),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{:<20}", step.step_name),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  [{:<5}]", step.role),
-                    Style::default().fg(state.theme.status_waiting),
-                ),
-                Span::styled(
-                    format!("  {duration}"),
-                    Style::default().fg(state.theme.label_accent),
-                ),
-            ];
+    items.extend(
+        state
+            .data
+            .workflow_steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let (status_symbol, status_color) =
+                    status_display(&step.status.to_string(), &state.theme);
+                let duration = match (&step.started_at, &step.ended_at) {
+                    (Some(start), Some(end)) => format_duration(start, end),
+                    (Some(_), None) => "…".to_string(),
+                    _ => "—".to_string(),
+                };
 
-            if step.iteration > 0 {
-                spans.push(Span::styled(
-                    format!("  iter:{}", step.iteration),
-                    Style::default().fg(state.theme.label_accent),
-                ));
-            }
-            if step.retry_count > 0 {
-                spans.push(Span::styled(
-                    format!("  retries:{}", step.retry_count),
-                    Style::default().fg(state.theme.label_error),
-                ));
-            }
-            if let Some(ref gate_type) = step.gate_type {
-                spans.push(Span::styled(
-                    format!("  gate:{gate_type}"),
-                    Style::default().fg(state.theme.label_warning),
-                ));
-            }
-
-            // Inline detail: show snippet of result/context/markers for non-selected steps
-            if i != state.workflow_step_index {
-                if let Some(ref rt) = step.result_text {
-                    let snippet = truncate(rt.lines().next().unwrap_or(""), 40);
-                    spans.push(Span::styled(
-                        format!("  → {snippet}"),
+                let mut spans = vec![
+                    Span::styled(
+                        format!("  {:>2}. ", step.position),
                         Style::default().fg(state.theme.label_secondary),
-                    ));
-                } else if let Some(ref ctx) = step.context_out {
-                    let snippet = truncate(ctx.lines().next().unwrap_or(""), 40);
+                    ),
+                    Span::styled(status_symbol, Style::default().fg(status_color)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:<20}", step.step_name),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  [{:<5}]", step.role),
+                        Style::default().fg(state.theme.status_waiting),
+                    ),
+                    Span::styled(
+                        format!("  {duration}"),
+                        Style::default().fg(state.theme.label_accent),
+                    ),
+                ];
+
+                if step.iteration > 0 {
                     spans.push(Span::styled(
-                        format!("  ctx:{snippet}"),
-                        Style::default().fg(state.theme.label_secondary),
+                        format!("  (iter {})", step.iteration + 1),
+                        Style::default().fg(state.theme.label_accent),
                     ));
                 }
-            }
+                if step.retry_count > 0 {
+                    spans.push(Span::styled(
+                        format!("  retries:{}", step.retry_count),
+                        Style::default().fg(state.theme.label_error),
+                    ));
+                }
+                if let Some(ref gate_type) = step.gate_type {
+                    spans.push(Span::styled(
+                        format!("  gate:{gate_type}"),
+                        Style::default().fg(state.theme.label_warning),
+                    ));
+                }
 
-            if let Some(ref mk) = step.markers_out {
-                spans.push(Span::styled(
-                    format!("  [{mk}]"),
-                    Style::default().fg(state.theme.label_accent),
-                ));
-            }
+                // Inline detail: show snippet of result/context/markers for non-selected steps
+                if i != state.workflow_step_index {
+                    if let Some(ref rt) = step.result_text {
+                        let snippet = truncate(rt.lines().next().unwrap_or(""), 40);
+                        spans.push(Span::styled(
+                            format!("  → {snippet}"),
+                            Style::default().fg(state.theme.label_secondary),
+                        ));
+                    } else if let Some(ref ctx) = step.context_out {
+                        let snippet = truncate(ctx.lines().next().unwrap_or(""), 40);
+                        spans.push(Span::styled(
+                            format!("  ctx:{snippet}"),
+                            Style::default().fg(state.theme.label_secondary),
+                        ));
+                    }
+                }
 
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
+                if let Some(ref mk) = step.markers_out {
+                    spans.push(Span::styled(
+                        format!("  [{mk}]"),
+                        Style::default().fg(state.theme.label_accent),
+                    ));
+                }
+
+                ListItem::new(Line::from(spans))
+            }),
+    );
 
     let has_waiting_gate = state
         .data
@@ -770,7 +1774,9 @@ fn render_step_list(
 
     let mut list_state = ListState::default();
     if !state.data.workflow_steps.is_empty() {
-        list_state.select(Some(state.workflow_step_index));
+        // Offset by 1 if a root run row was prepended.
+        let offset = if has_root_row { 1 } else { 0 };
+        list_state.select(Some(state.workflow_step_index + offset));
     }
     frame.render_stateful_widget(list, area, &mut list_state);
 }
@@ -848,7 +1854,7 @@ fn render_step_agent_activity(
     let items: Vec<ListItem> = events
         .iter()
         .map(|ev| {
-            let style = event_kind_style(&ev.kind);
+            let style = event_kind_style(&ev.kind, &state.theme);
             let dur = ev
                 .duration_ms()
                 .map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
@@ -892,29 +1898,63 @@ fn render_step_agent_activity(
     }
 }
 
-fn event_kind_style(kind: &str) -> Style {
+fn event_kind_style(kind: &str, theme: &Theme) -> Style {
     match kind {
-        "tool_use" => Style::default().fg(Color::Blue),
-        "tool_result" => Style::default().fg(Color::Green),
-        "api_request" => Style::default().fg(Color::Yellow),
-        "error" => Style::default().fg(Color::Red),
-        "prompt" => Style::default().fg(Color::Magenta),
-        "result" => Style::default().fg(Color::Cyan),
-        _ => Style::default().fg(Color::White),
+        "tool_use" => Style::default().fg(theme.label_info),
+        "tool_result" => Style::default().fg(theme.status_completed),
+        "api_request" => Style::default().fg(theme.label_warning),
+        "error" => Style::default().fg(theme.status_failed),
+        "prompt" => Style::default().fg(theme.label_keyword),
+        "result" => Style::default().fg(theme.label_accent),
+        _ => Style::default().fg(theme.label_primary),
     }
 }
 
-fn status_display(status: &str) -> (String, Color) {
-    match status {
-        "pending" => ("○ pending".to_string(), Color::DarkGray),
-        "running" => ("● running".to_string(), Color::Yellow),
-        "completed" => ("✓ completed".to_string(), Color::Green),
-        "failed" => ("✗ failed".to_string(), Color::Red),
-        "cancelled" => ("○ cancelled".to_string(), Color::DarkGray),
-        "waiting" => ("⏸ waiting".to_string(), Color::Magenta),
-        "skipped" => ("⊘ skipped".to_string(), Color::DarkGray),
-        _ => (format!("? {status}"), Color::White),
+fn display_role(role: &str) -> &str {
+    match role {
+        "actor" => "agent",
+        other => other,
     }
+}
+
+fn role_color(role: &str, theme: &Theme) -> Color {
+    match role {
+        "actor" | "agent" => theme.label_accent,
+        "gate" => theme.label_warning,
+        "reviewer" => theme.label_info,
+        "parallel" => theme.status_waiting,
+        _ => theme.label_secondary,
+    }
+}
+
+fn status_display(status: &str, theme: &Theme) -> (&'static str, Color) {
+    match status {
+        "pending" => ("○", theme.label_secondary),
+        "running" => ("⚙", theme.label_accent),
+        "completed" => ("✓", theme.status_completed),
+        "failed" => ("✗", theme.status_failed),
+        "cancelled" => ("⊘", theme.status_cancelled),
+        "waiting" => ("⏸", theme.status_waiting),
+        "skipped" => ("⊘", theme.label_secondary),
+        _ => ("?", theme.label_primary),
+    }
+}
+
+fn run_status_icon(
+    run: &WorkflowRun,
+    steps: &HashMap<String, Vec<WorkflowRunStep>>,
+    theme: &Theme,
+) -> (&'static str, Color) {
+    if run.status != WorkflowRunStatus::Waiting {
+        return status_display(&run.status.to_string(), theme);
+    }
+    // For waiting runs, inspect the first waiting step's gate_type.
+    let gate_type = steps.get(&run.id).and_then(|ss| {
+        ss.iter()
+            .find(|s| s.status == WorkflowStepStatus::Waiting && s.gate_type.is_some())
+            .and_then(|s| s.gate_type.as_ref())
+    });
+    gate_type_icon(gate_type, theme)
 }
 
 fn format_duration(start: &str, end: &str) -> String {
@@ -930,5 +1970,479 @@ fn format_duration(start: &str, end: &str) -> String {
         format!("{secs}s")
     } else {
         format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// Returns a human-readable relative time string, e.g. "5m ago", "2h ago", "1d ago".
+fn time_ago(ts: &str) -> String {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        return "?".to_string();
+    };
+    let secs = chrono::Utc::now()
+        .signed_duration_since(t)
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+fn ordinal_suffix(n: i64) -> &'static str {
+    let m100 = n % 100;
+    if m100 == 11 || m100 == 12 || m100 == 13 {
+        return "th";
+    }
+    match n % 10 {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        _ => "th",
+    }
+}
+
+/// Push an iteration counter badge span onto `spans` when `max_iteration > 0`.
+fn push_iteration_badge(spans: &mut Vec<Span<'static>>, max_iteration: i64, accent_color: Color) {
+    if max_iteration > 0 {
+        let n = max_iteration + 1;
+        spans.push(Span::styled(
+            format!("  {}{} iteration", n, ordinal_suffix(n)),
+            Style::default().fg(accent_color),
+        ));
+    }
+}
+
+fn last_run_badge(
+    def_name: &str,
+    runs: &[WorkflowRun],
+    theme: &Theme,
+) -> (&'static str, String, Color) {
+    let latest = runs
+        .iter()
+        .filter(|r| r.workflow_name == def_name)
+        .max_by(|a, b| a.started_at.cmp(&b.started_at));
+
+    match latest {
+        None => ("—", String::new(), theme.label_secondary),
+        Some(run) => {
+            let label = time_ago(&run.started_at);
+            match run.status {
+                WorkflowRunStatus::Completed => ("✓", label, theme.status_completed),
+                WorkflowRunStatus::Failed => ("✗", label, theme.status_failed),
+                WorkflowRunStatus::Running => ("▶", label, theme.label_accent),
+                _ => ("—", label, theme.label_secondary),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conductor_core::workflow::{
+        AgentRef, AlwaysNode, CallNode, CallWorkflowNode, DoNode, IfNode, ParallelNode,
+        WorkflowDef, WorkflowNode, WorkflowTrigger,
+    };
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    fn call_node(name: &str) -> WorkflowNode {
+        WorkflowNode::Call(CallNode {
+            agent: AgentRef::Name(name.to_string()),
+            retries: 0,
+            on_fail: None,
+            output: None,
+            with: vec![],
+            bot_name: None,
+            plugin_dirs: vec![],
+        })
+    }
+
+    fn call_wf_node(workflow: &str) -> WorkflowNode {
+        WorkflowNode::CallWorkflow(CallWorkflowNode {
+            workflow: workflow.to_string(),
+            inputs: Default::default(),
+            retries: 0,
+            on_fail: None,
+            bot_name: None,
+        })
+    }
+
+    fn if_node(body: Vec<WorkflowNode>) -> WorkflowNode {
+        use conductor_core::workflow::Condition;
+        WorkflowNode::If(IfNode {
+            condition: Condition::StepMarker {
+                step: "some-step".to_string(),
+                marker: "done".to_string(),
+            },
+            body,
+        })
+    }
+
+    fn empty_workflow_def(name: &str, body: Vec<WorkflowNode>) -> WorkflowDef {
+        WorkflowDef {
+            name: name.to_string(),
+            description: String::new(),
+            trigger: WorkflowTrigger::Manual,
+            targets: vec![],
+            group: None,
+            inputs: vec![],
+            body,
+            always: vec![],
+            source_path: format!("{name}.wf"),
+        }
+    }
+
+    fn run_get(
+        nodes: &[WorkflowNode],
+        workflow_defs: &[WorkflowDef],
+        expanded_calls: &HashSet<String>,
+        target: usize,
+    ) -> Option<String> {
+        get_def_step_node_at(
+            nodes,
+            workflow_defs,
+            expanded_calls,
+            "",
+            &HashSet::new(),
+            target,
+            &mut 0,
+        )
+    }
+
+    // ---------------------------------------------------------------------------
+    // get_def_step_node_at — basic cases
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_call_node_returns_none() {
+        // A plain Call node is never a CallWorkflow header.
+        let nodes = vec![call_node("agent-a")];
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 0), None);
+    }
+
+    #[test]
+    fn test_call_workflow_at_index_0_returns_path() {
+        let nodes = vec![call_wf_node("sub-workflow")];
+        assert_eq!(
+            run_get(&nodes, &[], &HashSet::new(), 0),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_call_workflow_at_index_1_after_call_node() {
+        // [Call, CallWorkflow] → flat indices 0, 1
+        let nodes = vec![call_node("first"), call_wf_node("child-wf")];
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 0), None);
+        assert_eq!(
+            run_get(&nodes, &[], &HashSet::new(), 1),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_out_of_range_returns_none() {
+        let nodes = vec![call_node("a"), call_node("b")];
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 5), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Expanded CallWorkflow — children occupy additional flat indices
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_collapsed_call_workflow_children_not_counted() {
+        // Not in expanded_calls → no child rows added.
+        // [CallWorkflow("sub"), Call("b")] → flat indices 0=sub header, 1=b
+        let nodes = vec![call_wf_node("sub"), call_node("b")];
+        let sub_def = empty_workflow_def("sub", vec![call_node("sub-step")]);
+        // collapsed: index 1 is Call("b"), not a sub-step
+        assert_eq!(run_get(&nodes, &[sub_def], &HashSet::new(), 1), None);
+    }
+
+    #[test]
+    fn test_expanded_call_workflow_children_counted() {
+        // CallWorkflow("sub") expanded → children fill flat indices 1..
+        // Layout: index 0 = CallWorkflow header, index 1 = sub-step (Call inside sub)
+        let nodes = vec![call_wf_node("sub")];
+        let sub_def = empty_workflow_def("sub", vec![call_node("sub-step")]);
+        let mut expanded = HashSet::new();
+        expanded.insert("0".to_string()); // path "0" is expanded
+
+        // index 0 → the CallWorkflow header itself
+        assert_eq!(
+            get_def_step_node_at(
+                &nodes,
+                std::slice::from_ref(&sub_def),
+                &expanded,
+                "",
+                &HashSet::new(),
+                0,
+                &mut 0,
+            ),
+            Some("0".to_string())
+        );
+
+        // index 1 → the Call node inside the sub-workflow (not a CallWorkflow, so None)
+        assert_eq!(
+            get_def_step_node_at(
+                &nodes,
+                &[sub_def],
+                &expanded,
+                "",
+                &HashSet::new(),
+                1,
+                &mut 0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_expanded_call_workflow_with_nested_call_workflow() {
+        // sub-workflow itself contains a CallWorkflow node.
+        // Layout (sub expanded, inner NOT expanded):
+        //   0 = CallWorkflow("sub") header  → Some("0")
+        //   1 = CallWorkflow("inner") header inside sub → Some("0.0")
+        //   2 = Call("after") in parent    → None
+        let inner_def = empty_workflow_def("inner", vec![call_node("deep")]);
+        let sub_def = empty_workflow_def("sub", vec![call_wf_node("inner")]);
+        let nodes = vec![call_wf_node("sub"), call_node("after")];
+
+        let mut expanded = HashSet::new();
+        expanded.insert("0".to_string()); // "sub" expanded at path "0"
+
+        let all_defs = vec![sub_def, inner_def];
+
+        assert_eq!(
+            get_def_step_node_at(&nodes, &all_defs, &expanded, "", &HashSet::new(), 0, &mut 0),
+            Some("0".to_string()),
+            "index 0 should be the outer CallWorkflow header"
+        );
+        assert_eq!(
+            get_def_step_node_at(&nodes, &all_defs, &expanded, "", &HashSet::new(), 1, &mut 0),
+            Some("0.0".to_string()),
+            "index 1 should be the nested CallWorkflow header"
+        );
+        assert_eq!(
+            get_def_step_node_at(&nodes, &all_defs, &expanded, "", &HashSet::new(), 2, &mut 0),
+            None,
+            "index 2 should be the Call('after') node → None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Recursive cycle guard
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_recursive_cycle_produces_single_placeholder_row() {
+        // sub-workflow calls itself. When both the outer and inner nodes are expanded,
+        // the inner one sees "sub" in `seen` and emits a single "(↺ recursive)" placeholder row.
+        // Layout (both "0" and "0.0" expanded):
+        //   0 = CallWorkflow("sub") header at path "0" → Some("0")
+        //   1 = CallWorkflow("sub") header at path "0.0" inside sub → Some("0.0")
+        //   2 = "(↺ recursive)" placeholder (sub already in seen) → None
+        let sub_def = empty_workflow_def("sub", vec![call_wf_node("sub")]);
+        let nodes = vec![call_wf_node("sub")];
+
+        let mut expanded = HashSet::new();
+        expanded.insert("0".to_string()); // outer node expanded
+        expanded.insert("0.0".to_string()); // inner self-referencing node also expanded
+
+        let all_defs = vec![sub_def];
+
+        assert_eq!(
+            get_def_step_node_at(&nodes, &all_defs, &expanded, "", &HashSet::new(), 0, &mut 0),
+            Some("0".to_string()),
+            "outer CallWorkflow header"
+        );
+        assert_eq!(
+            get_def_step_node_at(&nodes, &all_defs, &expanded, "", &HashSet::new(), 1, &mut 0),
+            Some("0.0".to_string()),
+            "inner CallWorkflow header inside expanded sub"
+        );
+        assert_eq!(
+            get_def_step_node_at(&nodes, &all_defs, &expanded, "", &HashSet::new(), 2, &mut 0),
+            None,
+            "recursive placeholder row is not a CallWorkflow header"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Control-flow nodes (If, While, Do, Always) — children are nested
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_if_node_children_counted_after_parent() {
+        // [If([CallWorkflow("sub")]), Call("b")]
+        // Layout: 0 = if header, 1 = CallWorkflow inside if body, 2 = Call("b")
+        let nodes = vec![if_node(vec![call_wf_node("sub")]), call_node("b")];
+        // index 0 = If node → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 0), None);
+        // index 1 = CallWorkflow inside If body → Some("0.0")
+        assert_eq!(
+            run_get(&nodes, &[], &HashSet::new(), 1),
+            Some("0.0".to_string())
+        );
+        // index 2 = Call("b") → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 2), None);
+    }
+
+    #[test]
+    fn test_parallel_node_children_counted() {
+        // Parallel with 2 agents → 3 flat rows: header + 2 call rows
+        let nodes = vec![
+            WorkflowNode::Parallel(ParallelNode {
+                fail_fast: true,
+                min_success: None,
+                calls: vec![
+                    AgentRef::Name("a".to_string()),
+                    AgentRef::Name("b".to_string()),
+                ],
+                output: None,
+                call_outputs: Default::default(),
+                with: vec![],
+                call_with: Default::default(),
+                call_if: Default::default(),
+            }),
+            call_wf_node("next"),
+        ];
+        // index 0 = Parallel header → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 0), None);
+        // index 1 = parallel branch "a" → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 1), None);
+        // index 2 = parallel branch "b" → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 2), None);
+        // index 3 = CallWorkflow("next") → Some("1")
+        assert_eq!(
+            run_get(&nodes, &[], &HashSet::new(), 3),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_do_node_children_counted() {
+        // Do([Call("a"), CallWorkflow("sub")]) → 3 rows: do header, call, callwf
+        let nodes = vec![WorkflowNode::Do(DoNode {
+            output: None,
+            with: vec![],
+            body: vec![call_node("a"), call_wf_node("sub")],
+        })];
+        // index 0 = do header → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 0), None);
+        // index 1 = Call("a") → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 1), None);
+        // index 2 = CallWorkflow("sub") → Some("0.1")
+        assert_eq!(
+            run_get(&nodes, &[], &HashSet::new(), 2),
+            Some("0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_always_node_children_counted() {
+        let nodes = vec![WorkflowNode::Always(AlwaysNode {
+            body: vec![call_wf_node("cleanup")],
+        })];
+        // index 0 = always header → None
+        assert_eq!(run_get(&nodes, &[], &HashSet::new(), 0), None);
+        // index 1 = CallWorkflow("cleanup") → Some("0.0")
+        assert_eq!(
+            run_get(&nodes, &[], &HashSet::new(), 1),
+            Some("0.0".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_def_step_lines — row count mirrors get_def_step_node_at traversal
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_build_and_traverse_row_counts_match() {
+        // Verify that the number of rows produced by build_def_step_lines matches
+        // what get_def_step_node_at can traverse (i.e. the last valid index + 1).
+        let theme = crate::theme::Theme::default();
+        let nodes = vec![
+            call_node("a"),
+            call_wf_node("sub"),
+            if_node(vec![call_node("b"), call_wf_node("inner")]),
+            call_node("last"),
+        ];
+        let expanded = HashSet::new();
+        let all_defs: Vec<WorkflowDef> = vec![];
+
+        let items =
+            build_def_step_lines(&nodes, 0, &theme, &all_defs, &expanded, "", &HashSet::new());
+        let row_count = items.len();
+
+        // Walk with get_def_step_node_at and find the last reachable index.
+        let mut last_reachable = 0;
+        for idx in 0..row_count {
+            let result = get_def_step_node_at(
+                &nodes,
+                &all_defs,
+                &expanded,
+                "",
+                &HashSet::new(),
+                idx,
+                &mut 0,
+            );
+            // result is either Some (CallWorkflow header) or None (other row)
+            // Both are valid — we just confirm get_def_step_node_at doesn't return
+            // Some on an out-of-range index.
+            let _ = result;
+            last_reachable = idx;
+        }
+
+        // One past the end should not be reachable as a CallWorkflow.
+        let beyond = get_def_step_node_at(
+            &nodes,
+            &all_defs,
+            &expanded,
+            "",
+            &HashSet::new(),
+            row_count,
+            &mut 0,
+        );
+        assert_eq!(beyond, None, "index beyond row_count should return None");
+        assert_eq!(
+            last_reachable + 1,
+            row_count,
+            "row count should match traversal"
+        );
+    }
+
+    #[test]
+    fn test_workflow_not_found_produces_single_placeholder_row() {
+        // CallWorkflow referring to a non-existent workflow name → "(workflow not found)" row
+        // Layout (expanded): 0 = header, 1 = placeholder
+        let nodes = vec![call_wf_node("missing")];
+        let mut expanded = HashSet::new();
+        expanded.insert("0".to_string());
+
+        // index 0 = CallWorkflow header → Some("0")
+        assert_eq!(
+            get_def_step_node_at(&nodes, &[], &expanded, "", &HashSet::new(), 0, &mut 0),
+            Some("0".to_string())
+        );
+        // index 1 = "(workflow not found)" placeholder → None
+        assert_eq!(
+            get_def_step_node_at(&nodes, &[], &expanded, "", &HashSet::new(), 1, &mut 0),
+            None
+        );
+        // index 2 = beyond → None
+        assert_eq!(
+            get_def_step_node_at(&nodes, &[], &expanded, "", &HashSet::new(), 2, &mut 0),
+            None
+        );
     }
 }

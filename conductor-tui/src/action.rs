@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use conductor_core::agent::{AgentRun, AgentRunEvent, TicketAgentTotals};
+use conductor_core::agent::{AgentRun, AgentRunEvent, FeedbackRequest, TicketAgentTotals};
+use conductor_core::feature::FeatureRow;
 use conductor_core::github::DiscoveredRepo;
 use conductor_core::repo::Repo;
 use conductor_core::tickets::{Ticket, TicketLabel};
@@ -54,6 +55,23 @@ pub struct DataRefreshedPayload {
     pub workflow_step_summaries: HashMap<String, WorkflowStepSummary>,
     /// Active root workflow runs with no associated worktree (repo/ticket-targeted).
     pub active_non_worktree_workflow_runs: Vec<WorkflowRun>,
+    /// All pending agent feedback requests (for cross-process notifications).
+    pub pending_feedback_requests: Vec<FeedbackRequest>,
+    /// All waiting gate steps with their workflow name and optional target label (for cross-process notifications).
+    pub waiting_gate_steps: Vec<(WorkflowRunStep, String, Option<String>)>,
+    /// Live turn count for currently running agents, keyed by worktree_id.
+    /// Computed in the background poller to avoid blocking the main thread.
+    pub live_turns_by_worktree: HashMap<String, i64>,
+    /// Active features per repo (repo_id → active FeatureRows).
+    pub features_by_repo: HashMap<String, Vec<FeatureRow>>,
+    /// Number of unread in-app notifications.
+    pub unread_notification_count: usize,
+    /// repo_id -> latest repo-scoped AgentRun (populated by DB poller)
+    pub latest_repo_agent_runs: HashMap<String, AgentRun>,
+    /// All worktree-scoped agent events keyed by worktree_id (populated by background poller).
+    pub worktree_agent_events: HashMap<String, Vec<AgentRunEvent>>,
+    /// All repo-scoped agent events keyed by repo_id (populated by background poller).
+    pub repo_agent_events: HashMap<String, Vec<AgentRunEvent>>,
 }
 
 /// Every user intent or background result flows through this enum.
@@ -68,10 +86,9 @@ pub enum Action {
     MoveDown,
     Select,
 
-    // Views
-    GoToDashboard,
-    GoToTickets,
-    GoToWorkflows,
+    FocusContentColumn,
+    FocusWorkflowColumn,
+    ToggleWorkflowColumn,
     // CRUD triggers
     RegisterRepo,
     Create,
@@ -115,6 +132,18 @@ pub enum Action {
     // Model configuration
     SetModel,
 
+    // Base branch change (worktree detail)
+    SetBaseBranch,
+    BaseBranchesLoaded {
+        repo_slug: String,
+        wt_slug: String,
+        items: Vec<crate::state::BranchPickerItem>,
+    },
+    BaseBranchesFailed {
+        error: String,
+    },
+    SelectBaseBranch(Option<usize>),
+
     // Theme picker
     ShowThemePicker,
     /// Background result: theme directory scan completed; open the picker modal.
@@ -138,13 +167,15 @@ pub enum Action {
     // Toggle visibility of closed tickets in all ticket views
     ToggleClosedTickets,
 
-    // Toggle the global status bar expanded/collapsed (for 4+ active items)
-    ToggleStatusBar,
+    // Toggle visibility of completed/cancelled workflow runs in the workflow column
+    ToggleCompletedRuns,
 
     // Agent triggers (tmux-based)
     LaunchAgent,
+    PromptRepoAgent,
     OrchestrateAgent,
     StopAgent,
+    RestartAgent,
     #[allow(dead_code)]
     CopyLastCodeBlock,
     ExpandAgentEvent,
@@ -160,6 +191,8 @@ pub enum Action {
     RepoDetailInfoOpen,
     /// Copy the value of the selected row in the RepoDetail info pane.
     RepoDetailInfoCopy,
+    /// Copy the value of the selected row in the WorkflowRunDetail info pane.
+    WorkflowRunDetailCopy,
     ScrollLeft,
     ScrollRight,
 
@@ -168,7 +201,6 @@ pub enum Action {
     GoToBottom,
     HalfPageDown,
     HalfPageUp,
-    PendingG,
 
     // Filter
     EnterFilter,
@@ -179,6 +211,7 @@ pub enum Action {
 
     // Modal
     ShowHelp,
+    ShowNotifications,
     DismissModal,
     OpenTicketUrl,
     CopyErrorMessage,
@@ -199,6 +232,7 @@ pub enum Action {
     FormNextField,
     FormPrevField,
     FormSubmit,
+    FormToggle,
 
     // Background results
     PrsRefreshed {
@@ -238,6 +272,31 @@ pub enum Action {
         message: String,
     },
 
+    // Background result for repo agent launch
+    RepoAgentLaunched {
+        result: Result<String, String>,
+    },
+    // Background result for repo agent stop
+    RepoAgentStopComplete {
+        result: Result<String, String>,
+    },
+    // Background result for worktree agent launch
+    AgentLaunchComplete {
+        result: Result<String, String>,
+    },
+    // Background result for orchestrate agent launch
+    OrchestrateLaunchComplete {
+        result: Result<String, String>,
+    },
+    // Background result for worktree agent stop
+    AgentStopComplete {
+        result: Result<String, String>,
+    },
+    // Background result for agent restart
+    AgentRestartComplete {
+        result: Result<String, String>,
+    },
+
     // Background result for worktree delete readiness check
     DeleteWorktreeReady {
         repo_slug: String,
@@ -266,12 +325,32 @@ pub enum Action {
         imported: usize,
         errors: Vec<String>,
     },
+    /// Background result: repo model set/cleared via file I/O.
+    SetRepoModelComplete {
+        slug: String,
+        result: Result<Option<String>, String>,
+    },
 
-    // Post-create picker (after worktree creation)
-    SelectPostCreateChoice(usize),
-    /// Background result: workflow defs loaded, ready to show post-create picker.
+    // Branch picker (during worktree creation)
+    /// Background result: feature branches loaded for branch picker.
+    FeatureBranchesLoaded {
+        repo_slug: String,
+        wt_name: String,
+        ticket_id: Option<String>,
+        items: Vec<crate::state::BranchPickerItem>,
+    },
+    /// Background result: feature branch load failed.
+    FeatureBranchesFailed {
+        error: String,
+    },
+    SelectBranch(Option<usize>),
+
+    /// Select a list-picker item by number-key shortcut (0-indexed).
+    /// Used by both WorkflowPicker and TemplatePicker modals.
+    SelectListItem(usize),
+    /// Background result: workflow items loaded, ready to show post-create workflow picker.
     PostCreatePickerReady {
-        items: Vec<crate::state::PostCreateChoice>,
+        items: Vec<crate::state::WorkflowPickerItem>,
         worktree_id: String,
         worktree_path: String,
         worktree_slug: String,
@@ -282,8 +361,18 @@ pub enum Action {
     // Workflow actions
     /// Toggle expand/collapse for the hovered parent run row.
     ToggleWorkflowRunCollapse,
+    /// Toggle collapse/expand for the workflow definitions pane (Space key on Defs focus).
+    ToggleWorkflowDefsCollapse,
     /// Open a workflow picker for the current context (worktree, PR, etc.)
     PickWorkflow,
+    /// Open the template picker for the current context (scaffold a new workflow from a template).
+    PickTemplate,
+    /// Background result: template instantiation prompt was built successfully.
+    TemplateInstantiateReady {
+        template_name: String,
+        prompt: String,
+        suggested_filename: String,
+    },
     RunWorkflow,
     RunPrWorkflow,
     ResumeWorkflow,
@@ -296,9 +385,29 @@ pub enum Action {
     ViewWorkflowDef,
     /// Open the selected workflow definition's source file in $EDITOR.
     EditWorkflowDef,
+    /// Enter or exit the step tree pane for the selected workflow definition.
+    ToggleDefStepTree,
     GateInputChar(char),
     GateInputBackspace,
     WorkflowDataRefreshed(Box<WorkflowDataPayload>),
+
+    // Notification modal loaded
+    NotificationsLoaded {
+        notifications: Vec<conductor_core::notification_manager::Notification>,
+    },
+
+    /// Background result: workflow defs loaded from disk for a picker.
+    WorkflowPickerDefsLoaded {
+        target: crate::state::WorkflowPickerTarget,
+        defs: Vec<WorkflowDef>,
+        /// If list_defs failed, carries the error message so the user sees the real reason.
+        error: Option<String>,
+    },
+    /// Background result: worktree-scoped workflow defs reloaded.
+    WorkflowDefsReloaded {
+        defs: Vec<WorkflowDef>,
+        warnings: Vec<WorkflowWarning>,
+    },
 
     // Timer tick — also triggers workflow data refresh on workflow views
     Tick,

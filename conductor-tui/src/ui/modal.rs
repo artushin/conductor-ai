@@ -446,6 +446,21 @@ pub fn render_form(
     let mut lines = vec![Line::from("")];
 
     for (i, field) in fields.iter().enumerate() {
+        // Readonly fields: render as plain label: value display, no cursor or edit hints
+        if field.readonly {
+            let label_style = Style::default().fg(theme.label_secondary);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", field.label),
+                label_style,
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("    {}", field.value),
+                Style::default().fg(theme.label_secondary),
+            )));
+            lines.push(Line::from(""));
+            continue;
+        }
+
         let is_active = i == active_field;
         let label_style = if is_active {
             Style::default()
@@ -466,7 +481,21 @@ pub fn render_form(
         lines.push(Line::from(Span::styled(label_text, label_style)));
 
         // Value line
-        if is_active {
+        if matches!(field.field_type, crate::state::FormFieldType::Boolean) {
+            let checked = field.value == "true";
+            let box_str = if checked { "[x]" } else { "[ ]" };
+            let style = if is_active {
+                Style::default()
+                    .fg(theme.border_focused)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.label_secondary)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {box_str}  Space to toggle"),
+                style,
+            )));
+        } else if is_active {
             lines.push(Line::from(vec![
                 Span::styled("  > ", Style::default().fg(theme.border_focused)),
                 Span::styled(
@@ -487,8 +516,19 @@ pub fn render_form(
         lines.push(Line::from(""));
     }
 
+    let has_boolean = fields
+        .iter()
+        .any(|f| !f.readonly && matches!(f.field_type, crate::state::FormFieldType::Boolean));
+    let has_editable = fields.iter().any(|f| !f.readonly);
+    let hint = if has_editable && has_boolean {
+        "  Tab next field  Space toggle  Enter submit  Esc cancel"
+    } else if has_editable {
+        "  Tab next field  Enter submit  Esc cancel"
+    } else {
+        "  Enter submit  Esc cancel"
+    };
     lines.push(Line::from(Span::styled(
-        "  Tab next field  Enter submit  Esc cancel",
+        hint,
         Style::default().fg(theme.label_secondary),
     )));
 
@@ -502,15 +542,23 @@ pub fn render_form(
     frame.render_widget(content, popup);
 }
 
-pub fn render_post_create_picker(
+/// Configuration for a numbered picker modal.
+struct NumberedPickerConfig<'a> {
+    title: &'a str,
+    subtitle: &'a str,
+    labels: &'a [&'a str],
+    selected: usize,
+    hint: &'a str,
+}
+
+/// Shared rendering for numbered picker modals (branch picker, post-create picker, etc.).
+fn render_numbered_picker(
     frame: &mut Frame,
     area: Rect,
-    items: &[crate::state::PostCreateChoice],
-    selected: usize,
-    ticket_source_id: &str,
+    cfg: &NumberedPickerConfig,
     theme: &Theme,
 ) {
-    let height = (items.len() as u16 + 6).min(20);
+    let height = (cfg.labels.len() as u16 + 6).min(20);
     let percent_y = ((height as f32 / area.height as f32) * 100.0) as u16;
     let popup = centered_rect(50, percent_y.max(25), area);
     frame.render_widget(Clear, popup);
@@ -518,14 +566,14 @@ pub fn render_post_create_picker(
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  Start work on #{ticket_source_id}?"),
+            format!("  {}", cfg.subtitle),
             Style::default().fg(theme.label_accent),
         )),
         Line::from(""),
     ];
 
-    for (i, item) in items.iter().enumerate() {
-        let is_selected = i == selected;
+    for (i, label) in cfg.labels.iter().enumerate() {
+        let is_selected = i == cfg.selected;
         let prefix = if is_selected { "▸ " } else { "  " };
         let number = format!("{}. ", i + 1);
 
@@ -539,13 +587,13 @@ pub fn render_post_create_picker(
 
         lines.push(Line::from(vec![
             Span::styled(format!("  {prefix}{number}"), style),
-            Span::styled(format!("{item}"), style),
+            Span::styled(*label, style),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  1-9 select  Enter confirm  Esc skip",
+        format!("  {}", cfg.hint),
         Style::default().fg(theme.label_secondary),
     )));
 
@@ -553,82 +601,83 @@ pub fn render_post_create_picker(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused))
-            .title(" Post-Create Actions "),
+            .title(format!(" {} ", cfg.title)),
     );
 
     frame.render_widget(content, popup);
 }
 
-pub fn render_pr_workflow_picker(
+pub fn render_branch_picker(
     frame: &mut Frame,
     area: Rect,
-    pr_number: i64,
-    pr_title: &str,
-    workflow_defs: &[conductor_core::workflow::WorkflowDef],
+    items: &[crate::state::BranchPickerItem],
+    tree_positions: &[crate::state::TreePosition],
     selected: usize,
     theme: &Theme,
 ) {
-    let height = (workflow_defs.len() as u16 + 7).min(25);
-    let percent_y = ((height as f32 / area.height as f32) * 100.0) as u16;
-    let popup = centered_rect(60, percent_y.max(25), area);
-    frame.render_widget(Clear, popup);
-
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  Run workflow on PR #{pr_number}: {pr_title}"),
-            Style::default().fg(theme.label_accent),
-        )),
-        Line::from(""),
-    ];
-
-    for (i, def) in workflow_defs.iter().enumerate() {
-        let is_selected = i == selected;
-        let prefix = if is_selected { "▸ " } else { "  " };
-
-        let style = if is_selected {
-            Style::default()
-                .fg(theme.label_warning)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.label_primary)
-        };
-
-        let mut row = vec![
-            Span::styled(format!("  {prefix}"), style),
-            Span::styled(&def.name, style),
-        ];
-        if !def.description.is_empty() {
-            row.push(Span::styled(
-                format!("  — {}", def.description),
-                Style::default().fg(theme.label_secondary),
-            ));
-        }
-        lines.push(Line::from(row));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Enter confirm  Esc cancel",
-        Style::default().fg(theme.label_secondary),
-    )));
-
-    let content = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border_focused))
-            .title(" Run Workflow on PR "),
+    let label_strings: Vec<String> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let tree_prefix = tree_positions
+                .get(i)
+                .map(|pos| pos.to_prefix())
+                .unwrap_or_default();
+            match &item.branch {
+                None => "default branch".to_string(),
+                Some(branch) => {
+                    let mut parts = Vec::new();
+                    if item.worktree_count > 0 {
+                        parts.push(format!(
+                            "{} worktree{}",
+                            item.worktree_count,
+                            if item.worktree_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if item.ticket_count > 0 {
+                        parts.push(format!(
+                            "{} ticket{}",
+                            item.ticket_count,
+                            if item.ticket_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if let Some(days) = item.stale_days {
+                        parts.push(format!("\u{26a0} stale {days}d"));
+                    }
+                    let label = if parts.is_empty() {
+                        branch.clone()
+                    } else {
+                        format!("{} ({})", branch, parts.join(", "))
+                    };
+                    format!("{tree_prefix}{label}")
+                }
+            }
+        })
+        .collect();
+    let labels: Vec<&str> = label_strings.iter().map(|s| s.as_str()).collect();
+    render_numbered_picker(
+        frame,
+        area,
+        &NumberedPickerConfig {
+            title: "Branch Picker",
+            subtitle: "Target branch:",
+            labels: &labels,
+            selected,
+            hint: "1-9 select  Enter confirm  Esc cancel",
+        },
+        theme,
     );
-
-    frame.render_widget(content, popup);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_workflow_picker(
     frame: &mut Frame,
     area: Rect,
     target: &crate::state::WorkflowPickerTarget,
-    workflow_defs: &[conductor_core::workflow::WorkflowDef],
+    items: &[crate::state::WorkflowPickerItem],
     selected: usize,
+    scroll_offset: u16,
+    ticket_source_id: Option<&str>,
     theme: &Theme,
 ) {
     use crate::state::WorkflowPickerTarget;
@@ -671,9 +720,20 @@ pub fn render_workflow_picker(
                 format!("  {workflow_name} ({short_id}…)"),
             )
         }
+        WorkflowPickerTarget::PostCreate { .. } => {
+            let sid = ticket_source_id.unwrap_or("?");
+            (
+                " Post-Create Actions ".to_string(),
+                format!("  Start work on #{sid}?"),
+            )
+        }
     };
 
-    let height = (workflow_defs.len() as u16 + 7).min(25);
+    let header_count = items
+        .iter()
+        .filter(|i| matches!(i, crate::state::WorkflowPickerItem::Header(_)))
+        .count() as u16;
+    let height = (items.len() as u16 + header_count + 7).min(area.height.saturating_sub(4));
     let percent_y = ((height as f32 / area.height as f32) * 100.0) as u16;
     let popup = centered_rect(60, percent_y.max(25), area);
     frame.render_widget(Clear, popup);
@@ -687,43 +747,61 @@ pub fn render_workflow_picker(
         Line::from(""),
     ];
 
-    for (i, def) in workflow_defs.iter().enumerate() {
-        let is_selected = i == selected;
-        let prefix = if is_selected { "▸ " } else { "  " };
+    for (i, item) in items.iter().enumerate() {
+        use crate::state::WorkflowPickerItem;
+        match item {
+            WorkflowPickerItem::Header(label) => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {label}"),
+                    Style::default()
+                        .fg(theme.label_accent)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            _ => {
+                let is_selected = i == selected;
+                let prefix = if is_selected { "▸ " } else { "  " };
 
-        let style = if is_selected {
-            Style::default()
-                .fg(theme.label_warning)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.label_primary)
-        };
+                let style = if is_selected {
+                    Style::default()
+                        .fg(theme.label_warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.label_primary)
+                };
 
-        let mut row = vec![
-            Span::styled(format!("  {prefix}"), style),
-            Span::styled(&def.name, style),
-        ];
-        if !def.description.is_empty() {
-            row.push(Span::styled(
-                format!("  — {}", def.description),
-                Style::default().fg(theme.label_secondary),
-            ));
+                let name = item.name();
+                let description = item.description();
+                let mut row = vec![
+                    Span::styled(format!("  {prefix}"), style),
+                    Span::styled(name, style),
+                ];
+                if !description.is_empty() {
+                    row.push(Span::styled(
+                        format!("  — {description}"),
+                        Style::default().fg(theme.label_secondary),
+                    ));
+                }
+                lines.push(Line::from(row));
+            }
         }
-        lines.push(Line::from(row));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Enter confirm  Esc cancel",
+        "  j/k navigate  Enter confirm  Esc cancel",
         Style::default().fg(theme.label_secondary),
     )));
 
-    let content = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border_focused))
-            .title(title),
-    );
+    let content = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_focused))
+                .title(title),
+        )
+        .scroll((scroll_offset, 0));
 
     frame.render_widget(content, popup);
 }
@@ -789,6 +867,7 @@ pub fn render_model_picker(
     custom_input: &str,
     custom_active: bool,
     suggested: Option<&str>,
+    allow_default: bool,
     theme: &Theme,
 ) {
     use conductor_core::models::KNOWN_MODELS;
@@ -825,9 +904,31 @@ pub fn render_model_picker(
     )));
     lines.push(Line::from(""));
 
+    // "Default" row — only shown in run-time pickers (allow_default: true)
+    let offset = if allow_default { 1 } else { 0 };
+    if allow_default {
+        let is_selected = !custom_active && selected == 0;
+        let style = if is_selected {
+            Style::default()
+                .fg(theme.label_warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.label_primary)
+        };
+        let prefix = if is_selected { "\u{25b8} " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {prefix}"), style),
+            Span::styled("Default", style),
+            Span::styled(
+                "  \u{2014} use each agent's frontmatter / claude default",
+                dim,
+            ),
+        ]));
+    }
+
     // Known models list
     for (i, model) in KNOWN_MODELS.iter().enumerate() {
-        let is_selected = !custom_active && i == selected;
+        let is_selected = !custom_active && i + offset == selected;
         let is_current = effective_default.is_some_and(|d| d == model.id || d == model.alias);
 
         let prefix = if is_selected { "\u{25b8} " } else { "  " };
@@ -871,7 +972,7 @@ pub fn render_model_picker(
     }
 
     // Custom input option
-    let custom_idx = KNOWN_MODELS.len();
+    let custom_idx = KNOWN_MODELS.len() + offset;
     let custom_selected = !custom_active && selected == custom_idx;
     let custom_prefix = if custom_selected || custom_active {
         "\u{25b8} "
@@ -1346,7 +1447,7 @@ pub fn render_event_detail(
         .collect();
 
     let hint = format!(
-        " j/k=scroll  h/l=pan  gg/G=top/bot  q/Esc=close  (line {}/{})",
+        " j/k=scroll  h/l=pan  g/G=top/bot  q/Esc=close  (line {}/{})",
         scroll_offset + 1,
         line_count.max(1),
     );
@@ -1525,6 +1626,180 @@ pub fn render_theme_picker(
                 .title(" Theme Picker "),
         )
         .wrap(Wrap { trim: false });
+
+    frame.render_widget(content, popup);
+}
+
+pub fn render_notifications(
+    frame: &mut Frame,
+    area: Rect,
+    notifications: &[conductor_core::notification_manager::Notification],
+    selected: usize,
+    theme: &Theme,
+) {
+    let popup = centered_rect(65, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let dim = Style::default().fg(theme.label_secondary);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Recent Notifications",
+            Style::default()
+                .fg(theme.label_accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if notifications.is_empty() {
+        lines.push(Line::from(Span::styled("  (no notifications)", dim)));
+    } else {
+        for (i, n) in notifications.iter().enumerate() {
+            let is_selected = i == selected;
+            let prefix = if is_selected { "\u{25b8} " } else { "  " };
+            let severity_icon = match n.severity {
+                conductor_core::notification_manager::NotificationSeverity::ActionRequired => {
+                    "\u{25cf}"
+                }
+                conductor_core::notification_manager::NotificationSeverity::Warning => "\u{25cb}",
+                conductor_core::notification_manager::NotificationSeverity::Info => "\u{00b7}",
+            };
+            let severity_color = match n.severity {
+                conductor_core::notification_manager::NotificationSeverity::ActionRequired => {
+                    theme.status_failed
+                }
+                conductor_core::notification_manager::NotificationSeverity::Warning => {
+                    theme.label_warning
+                }
+                conductor_core::notification_manager::NotificationSeverity::Info => {
+                    theme.label_secondary
+                }
+            };
+
+            let read_marker = if n.read { " " } else { "\u{2022}" };
+            let elapsed = super::common::format_elapsed(&n.created_at);
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme.label_warning)
+                    .add_modifier(Modifier::BOLD)
+            } else if n.read {
+                dim
+            } else {
+                Style::default().fg(theme.label_primary)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {prefix}"), style),
+                Span::styled(
+                    format!("{severity_icon} "),
+                    Style::default().fg(severity_color),
+                ),
+                Span::styled(read_marker, Style::default().fg(theme.label_accent)),
+                Span::styled(format!(" {}", n.title), style),
+                Span::styled(format!("  {elapsed}"), dim),
+            ]));
+            // Body on next line, indented
+            lines.push(Line::from(Span::styled(
+                format!("       {}", super::common::truncate(&n.body, 60)),
+                dim,
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  j/k navigate  Esc close", dim)));
+
+    // Scroll so the selected row stays roughly centred.
+    let cursor_abs_line = 3 + (selected * 2); // 3 header lines + 2 lines per notification
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let scroll_offset = cursor_abs_line.saturating_sub(inner_h / 2) as u16;
+
+    let content = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_focused))
+                .title(" Notifications "),
+        )
+        .scroll((scroll_offset, 0));
+
+    frame.render_widget(content, popup);
+}
+
+pub fn render_template_picker(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[conductor_core::workflow_template::WorkflowTemplate],
+    selected: usize,
+    repo_slug: &str,
+    theme: &Theme,
+) {
+    let height = (items.len() as u16 + 7).min(25);
+    let percent_y = ((height as f32 / area.height as f32) * 100.0) as u16;
+    let popup = centered_rect(60, percent_y.max(25), area);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Scaffold workflow from template for {repo_slug}"),
+            Style::default().fg(theme.label_accent),
+        )),
+        Line::from(""),
+    ];
+
+    for (i, item) in items.iter().enumerate() {
+        let is_selected = i == selected;
+        let prefix = if is_selected { "▸ " } else { "  " };
+        let num = if i < 9 {
+            format!("{} ", i + 1)
+        } else {
+            "  ".to_string()
+        };
+
+        let style = if is_selected {
+            Style::default()
+                .fg(theme.label_warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.label_primary)
+        };
+
+        let name = &item.metadata.name;
+        let description = &item.metadata.description;
+        let version = &item.metadata.version;
+        let mut row = vec![
+            Span::styled(format!("  {prefix}{num}"), style),
+            Span::styled(name.as_str(), style),
+            Span::styled(
+                format!(" v{version}"),
+                Style::default().fg(theme.label_secondary),
+            ),
+        ];
+        if !description.is_empty() {
+            row.push(Span::styled(
+                format!("  — {description}"),
+                Style::default().fg(theme.label_secondary),
+            ));
+        }
+        lines.push(Line::from(row));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  1-9 select  Enter confirm  Esc cancel",
+        Style::default().fg(theme.label_secondary),
+    )));
+
+    let content = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_focused))
+            .title(" From Template "),
+    );
 
     frame.render_widget(content, popup);
 }
