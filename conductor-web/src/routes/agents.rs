@@ -792,6 +792,7 @@ pub async fn restart_agent(
             None,
             new_run.model.as_deref(),
             new_run.bot_name.as_deref(),
+            &[],
         )
         .map_err(|e| {
             let _ = agent_mgr.update_run_failed(&new_run.id, &e);
