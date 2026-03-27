@@ -10,6 +10,7 @@ import { StatusBadge } from "../components/shared/StatusBadge";
 import { TimeAgo } from "../components/shared/TimeAgo";
 import { LoadingSpinner } from "../components/shared/LoadingSpinner";
 import { EmptyState } from "../components/shared/EmptyState";
+import { ErrorBanner } from "../components/shared/ErrorBanner";
 import { WelcomeAboard } from "../components/shared/WelcomeAboard";
 import { agentStatusColor } from "../utils/agentStats";
 import {
@@ -31,15 +32,21 @@ export function DashboardPage() {
   >([]);
   const [latestRuns, setLatestRuns] = useState<Record<string, AgentRun>>({});
   const [wtTick, setWtTick] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [registerRepoOpen, setRegisterRepoOpen] = useState(false);
   const [discoverOpen, setDiscoverOpen] = useState(false);
 
   const refreshWorktrees = useCallback(() => setWtTick((n) => n + 1), []);
 
   useEffect(() => {
-    api.listAllWorktrees().then((allWorktrees) => {
+    const fetchData = async () => {
       const repoSlugById: Record<string, string> = {};
       for (const r of repos) repoSlugById[r.id] = r.slug;
+
+      const [allWorktrees, runs] = await Promise.all([
+        api.listAllWorktrees(),
+        api.latestRunsByWorktree(),
+      ]);
 
       const counts: Record<string, number> = {};
       const active: (Worktree & { repoSlug: string })[] = [];
@@ -51,8 +58,13 @@ export function DashboardPage() {
       }
       setWorktreeCounts(counts);
       setActiveWorktrees(active);
+      setLatestRuns(runs);
+      setLoadError(null);
+    };
+
+    fetchData().catch((err: unknown) => {
+      setLoadError(err instanceof Error ? err.message : "Failed to load dashboard data");
     });
-    api.latestRunsByWorktree().then(setLatestRuns);
   }, [repos, wtTick]);
 
   const handlers = useMemo(() => {
@@ -119,6 +131,8 @@ export function DashboardPage() {
         onClose={() => setDiscoverOpen(false)}
         onImported={refreshRepos}
       />
+
+      <ErrorBanner error={loadError} />
 
       {/* Repos */}
       <section>
