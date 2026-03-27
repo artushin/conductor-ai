@@ -288,6 +288,7 @@ fn back_from_repo_detail_goes_to_dashboard() {
 fn back_from_worktree_detail_with_repo_goes_to_repo_detail() {
     let mut app = make_app();
     app.state.view = View::WorktreeDetail;
+    app.state.previous_view = Some(View::RepoDetail);
     app.state.selected_repo_id = Some("r1".into());
     app.state.selected_worktree_id = Some("w1".into());
     app.update(Action::Back);
@@ -299,7 +300,7 @@ fn back_from_worktree_detail_with_repo_goes_to_repo_detail() {
 fn back_from_worktree_detail_without_repo_goes_to_dashboard() {
     let mut app = make_app();
     app.state.view = View::WorktreeDetail;
-    app.state.selected_repo_id = None;
+    app.state.previous_view = Some(View::Dashboard);
     app.state.selected_worktree_id = Some("w1".into());
     app.update(Action::Back);
     assert_eq!(app.state.view, View::Dashboard);
