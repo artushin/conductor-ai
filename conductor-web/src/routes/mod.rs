@@ -94,6 +94,11 @@ pub fn api_router() -> Router<AppState> {
             get(agents::list_agent_runs),
         )
         .route("/api/agent/runs", get(agents::list_all_agent_runs))
+        .route("/api/agent/runs/{id}", get(agents::get_agent_run_by_id))
+        .route(
+            "/api/agent/runs/{id}/feedback",
+            get(agents::get_agent_run_feedback_by_run_id),
+        )
         .route(
             "/api/agent/latest-runs",
             get(agents::latest_runs_by_worktree),
