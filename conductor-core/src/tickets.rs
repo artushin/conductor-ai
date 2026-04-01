@@ -115,6 +115,14 @@ impl Ticket {
     }
 }
 
+fn ticket_not_found(id: impl Into<String>) -> impl FnOnce(rusqlite::Error) -> ConductorError {
+    let id = id.into();
+    move |e| match e {
+        rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound { id },
+        _ => ConductorError::Database(e),
+    }
+}
+
 pub struct TicketSyncer<'a> {
     conn: &'a Connection,
 }
@@ -349,12 +357,7 @@ impl<'a> TicketSyncer<'a> {
                 params![repo_id, source_id],
                 map_ticket_row,
             )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
-                    id: source_id.to_string(),
-                },
-                _ => ConductorError::Database(e),
-            })
+            .map_err(ticket_not_found(source_id))
     }
 
     /// Fetch a single ticket by source_id across all repos.
@@ -367,12 +370,7 @@ impl<'a> TicketSyncer<'a> {
                 params![source_id],
                 map_ticket_row,
             )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
-                    id: source_id.to_string(),
-                },
-                _ => ConductorError::Database(e),
-            })
+            .map_err(ticket_not_found(source_id))
     }
 
     /// Fetch a single ticket by its internal (ULID) ID.
@@ -384,12 +382,7 @@ impl<'a> TicketSyncer<'a> {
                 params![ticket_id],
                 map_ticket_row,
             )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
-                    id: ticket_id.to_string(),
-                },
-                _ => ConductorError::Database(e),
-            })
+            .map_err(ticket_not_found(ticket_id))
     }
 
     /// Update the `state`, `workflow`, and/or `agent_map` columns on a ticket.
@@ -455,12 +448,7 @@ impl<'a> TicketSyncer<'a> {
                 params![repo_id, source_type, source_id],
                 |row| row.get(0),
             )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ConductorError::TicketNotFound {
-                    id: format!("{source_type}#{source_id}"),
-                },
-                _ => ConductorError::Database(e),
-            })?;
+            .map_err(ticket_not_found(format!("{source_type}#{source_id}")))?;
 
         // NULL out workflow_runs.ticket_id (FK lacks ON DELETE SET NULL).
         tx.execute(

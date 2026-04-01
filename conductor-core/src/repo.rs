@@ -27,6 +27,14 @@ pub struct Repo {
     pub plugin_dirs: Vec<String>,
 }
 
+fn repo_not_found(slug: impl Into<String>) -> impl FnOnce(rusqlite::Error) -> ConductorError {
+    let slug = slug.into();
+    move |e| match e {
+        rusqlite::Error::QueryReturnedNoRows => ConductorError::RepoNotFound { slug },
+        _ => ConductorError::Database(e),
+    }
+}
+
 pub struct RepoManager<'a> {
     conn: &'a Connection,
     config: &'a Config,
@@ -166,12 +174,7 @@ impl<'a> RepoManager<'a> {
                 },
             )
             .map(|r| r.enrich(self.config))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ConductorError::RepoNotFound {
-                    slug: id.to_string(),
-                },
-                _ => ConductorError::Database(e),
-            })
+            .map_err(repo_not_found(id))
     }
 
     pub fn get_by_slug(&self, slug: &str) -> Result<Repo> {
@@ -197,12 +200,7 @@ impl<'a> RepoManager<'a> {
                 },
             )
             .map(|r| r.enrich(self.config))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ConductorError::RepoNotFound {
-                    slug: slug.to_string(),
-                },
-                _ => ConductorError::Database(e),
-            })
+            .map_err(repo_not_found(slug))
     }
 
     /// Set whether agents can create issues for this repo.
