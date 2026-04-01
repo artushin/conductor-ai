@@ -727,7 +727,7 @@ impl<'a> WorktreeManager<'a> {
         let worktree = self.get_by_slug(&repo.id, wt_slug)?;
 
         if !worktree.is_active() {
-            return Err(ConductorError::Git(format!(
+            return Err(ConductorError::InvalidInput(format!(
                 "worktree '{}' is not active (status: {})",
                 wt_slug, worktree.status
             )));

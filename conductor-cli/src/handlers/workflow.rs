@@ -221,6 +221,7 @@ pub fn handle_workflow(
                     run_id_notify: None,
                     triggered_by_hook: false,
                     conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(),
+                    force: false,
                     extra_plugin_dirs: plugin_dirs.clone(),
                 })?;
             } else if let Some(run_id) = workflow_run {
@@ -265,6 +266,7 @@ pub fn handle_workflow(
                     run_id_notify: None,
                     triggered_by_hook: false,
                     conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(),
+                    force: false,
                     extra_plugin_dirs: plugin_dirs.clone(),
                 })?;
             } else if let Some(ticket_id) = ticket {
@@ -306,6 +308,7 @@ pub fn handle_workflow(
                     run_id_notify: None,
                     triggered_by_hook: false,
                     conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(),
+                    force: false,
                     extra_plugin_dirs: plugin_dirs.clone(),
                 })?;
             } else {
@@ -344,7 +347,9 @@ pub fn handle_workflow(
                         run_id_notify: None,
                         triggered_by_hook: false,
                         conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(),
+                        force: false,
                         extra_plugin_dirs: plugin_dirs,
+                        db_path: None,
                     };
                     let run_id = crate::background::fork_and_run_workflow(params)?;
                     println!("{}", run_id);
@@ -381,6 +386,7 @@ pub fn handle_workflow(
                     run_id_notify: None,
                     triggered_by_hook: false,
                     conductor_bin_dir: conductor_core::workflow::resolve_conductor_bin_dir(),
+                    force: false,
                     extra_plugin_dirs: plugin_dirs,
                 })?;
             }

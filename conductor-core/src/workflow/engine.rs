@@ -291,12 +291,22 @@ pub fn execute_workflow(input: &WorkflowExecInput<'_>) -> Result<WorkflowResult>
 
     // Guard: prevent multiple concurrent top-level runs on the same worktree
     // (skipped for ephemeral PR runs which have no registered worktree).
+    // When force=true, cancel the existing run instead of rejecting.
+    // Part of: process-escape-hatch@1.0.0
     if input.depth == 0 {
         if let Some(wt_id) = input.worktree_id {
             if let Some(active) = wf_mgr.get_active_run_for_worktree(wt_id)? {
-                return Err(ConductorError::WorkflowRunAlreadyActive {
-                    name: active.workflow_name,
-                });
+                if input.force {
+                    tracing::info!(
+                        "Force override: cancelling active run {} to start new run",
+                        active.id
+                    );
+                    wf_mgr.cancel_run(&active.id, "force override: new run requested")?;
+                } else {
+                    return Err(ConductorError::WorkflowRunAlreadyActive {
+                        name: active.workflow_name,
+                    });
+                }
             }
         }
     }
@@ -641,6 +651,7 @@ fn evaluate_hooks(
             run_id_notify: None,
             triggered_by_hook: true,
             conductor_bin_dir: state.conductor_bin_dir.clone(),
+            force: false,
             extra_plugin_dirs: state.extra_plugin_dirs.clone(),
         };
 
@@ -663,7 +674,10 @@ fn evaluate_hooks(
 /// connection and resolves the conductor binary path. Designed for use in
 /// background threads where the caller cannot share a `&Connection`.
 pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<WorkflowResult> {
-    let db = crate::config::db_path();
+    let db = params
+        .db_path
+        .clone()
+        .unwrap_or_else(crate::config::db_path);
     let conn = crate::db::open_database(&db)?;
 
     let input = WorkflowExecInput {
@@ -687,6 +701,7 @@ pub fn execute_workflow_standalone(params: &WorkflowExecStandalone) -> Result<Wo
         run_id_notify: params.run_id_notify.clone(),
         triggered_by_hook: params.triggered_by_hook,
         conductor_bin_dir: params.conductor_bin_dir.clone(),
+        force: params.force,
         extra_plugin_dirs: params.extra_plugin_dirs.clone(),
     };
 
@@ -998,9 +1013,9 @@ pub(super) fn execute_nodes(state: &mut ExecutionState<'_>, nodes: &[WorkflowNod
         if !state.all_succeeded && state.exec_config.fail_fast {
             break;
         }
-        // Check if the run has been externally cancelled before each step.
-        if let Ok(Some(run)) = state.wf_mgr.get_workflow_run(&state.workflow_run_id) {
-            if matches!(run.status, WorkflowRunStatus::Cancelled) {
+        // Lightweight cancellation check — only reads the status column.
+        match state.wf_mgr.is_workflow_cancelled(&state.workflow_run_id) {
+            Ok(true) => {
                 tracing::info!(
                     "Workflow run {} cancelled externally, stopping execution",
                     state.workflow_run_id
@@ -1008,6 +1023,15 @@ pub(super) fn execute_nodes(state: &mut ExecutionState<'_>, nodes: &[WorkflowNod
                 return Err(ConductorError::Workflow(
                     "Workflow run cancelled".to_string(),
                 ));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Database error during cancellation check for workflow run {}: {}",
+                    state.workflow_run_id,
+                    e
+                );
+                // Continue execution - don't fail the workflow due to a transient DB error
             }
         }
         execute_single_node(state, node, 0)?;

@@ -19,12 +19,14 @@ import type {
   DiscoverableRepo,
   GlobalConfig,
   KnownModel,
+  WorkflowDef,
   WorkflowDefSummary,
   WorkflowRun,
   WorkflowRunStep,
   RunWorkflowRequest,
   FeedbackRequest,
   Notification,
+  ThemeUnlockStats,
   PushSubscribeRequest,
   VapidPublicKeyResponse,
   PushSubscribeResponse,
@@ -152,6 +154,8 @@ export const api = {
     }),
   getAgentEvents: (worktreeId: string) =>
     request<AgentEvent[]>(`/worktrees/${worktreeId}/agent/events`),
+  getRunEvents: (worktreeId: string, runId: string) =>
+    request<AgentEvent[]>(`/worktrees/${worktreeId}/agent/runs/${runId}/events`),
   getAgentPrompt: (worktreeId: string) =>
     request<AgentPromptInfo>(`/worktrees/${worktreeId}/agent/prompt`),
   listChildRuns: (worktreeId: string, runId: string) =>
@@ -236,6 +240,8 @@ export const api = {
   // Workflows
   listWorkflowDefs: (worktreeId: string) =>
     request<WorkflowDefSummary[]>(`/worktrees/${worktreeId}/workflows/defs`),
+  getWorkflowDef: (worktreeId: string, name: string) =>
+    request<WorkflowDef>(`/worktrees/${worktreeId}/workflows/defs/${encodeURIComponent(name)}`),
   runWorkflow: (worktreeId: string, data: RunWorkflowRequest) =>
     request<{ status: string; worktree_id: string }>(`/worktrees/${worktreeId}/workflows/run`, {
       method: "POST",
@@ -251,6 +257,8 @@ export const api = {
     request<WorkflowRun | null>(`/workflows/runs/${runId}`),
   getWorkflowSteps: (runId: string) =>
     request<WorkflowRunStep[]>(`/workflows/runs/${runId}/steps`),
+  getChildWorkflowRuns: (runId: string) =>
+    request<WorkflowRun[]>(`/workflows/runs/${runId}/children`),
   cancelWorkflow: (runId: string) =>
     request<void>(`/workflows/runs/${runId}/cancel`, { method: "POST" }),
   approveGate: (runId: string, feedback?: string, selections?: string[]) =>
@@ -275,6 +283,10 @@ export const api = {
     request<void>(`/notifications/${id}/read`, { method: "POST" }),
   markAllNotificationsRead: () =>
     request<void>("/notifications/read-all", { method: "POST" }),
+
+  // Stats
+  getThemeUnlockStats: () =>
+    request<ThemeUnlockStats>("/stats/theme-unlocks"),
 
   // Push Notifications
   getPushVapidKey: () =>
