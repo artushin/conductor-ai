@@ -10,6 +10,12 @@ PLAN.md
 script-*.out
 *.output
 *.ndjson
+.fsm/
+
+# FSM checkpoint files (runtime state, not source)
+roadmap/milestone-*/.ship-checkpoint.yaml
+roadmap/milestone-*/.plan-checkpoint.yaml
+roadmap/milestone-*/.preplan-checkpoint.yaml
 .conductor.db
 .conductor.db-wal
 .conductor.db-shm
