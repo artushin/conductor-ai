@@ -8,6 +8,8 @@ conductor-web/frontend/dist/
 PLAN.md
 .conductor/postmortems/
 script-*.out
+*.output
+*.ndjson
 .conductor.db
 .conductor.db-wal
 .conductor.db-shm
