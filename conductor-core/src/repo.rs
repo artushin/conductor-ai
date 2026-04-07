@@ -145,6 +145,7 @@ impl<'a> RepoManager<'a> {
                     created_at: row.get(5)?,
                     model: None,
                     allow_agent_issue_creation: row.get::<_, i64>(6).map(|v| v != 0)?,
+                    plugin_dirs: Vec::new(),
                 })
             },
         )?;
@@ -170,6 +171,7 @@ impl<'a> RepoManager<'a> {
                         created_at: row.get(5)?,
                         model: None,
                         allow_agent_issue_creation: row.get::<_, i64>(6).map(|v| v != 0)?,
+                        plugin_dirs: Vec::new(),
                     })
                 },
             )
@@ -196,6 +198,7 @@ impl<'a> RepoManager<'a> {
                         created_at: row.get(5)?,
                         model: None,
                         allow_agent_issue_creation: row.get::<_, i64>(6).map(|v| v != 0)?,
+                        plugin_dirs: Vec::new(),
                     })
                 },
             )

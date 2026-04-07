@@ -160,6 +160,24 @@ Create a new local ticket.
 | `--priority <LEVEL>` | No | Priority level |
 | `--label <NAME>` | No | Labels (repeatable) |
 
+### `tickets upsert <repo>`
+
+Create or update a ticket from an external source.
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--source-type <TYPE>` | Yes | Source type (e.g., `"github"`, `"jira"`, `"linear"`) |
+| `--source-id <ID>` | Yes | Source ID (e.g., issue number or key) |
+| `--title <TEXT>` | Yes | Ticket title |
+| `--state <STATE>` | Yes | Ticket state: `open`, `in_progress`, or `closed` |
+| `--body <TEXT>` | No | Ticket body (default: empty) |
+| `--url <URL>` | No | URL to the ticket (default: empty) |
+| `--labels <CSV>` | No | Comma-separated labels |
+| `--assignee <NAME>` | No | Assignee |
+| `--priority <LEVEL>` | No | Priority level |
+| `--workflow <NAME>` | No | Workflow name override (bypasses routing heuristics) |
+| `--agent-map <JSON>` | No | Agent map JSON (validated against AgentMap schema; empty string clears) |
+
 ### `tickets update <ticket>`
 
 Update an existing ticket by ULID or source ID.
@@ -170,6 +188,8 @@ Update an existing ticket by ULID or source ID.
 | `--body <TEXT>` | New body |
 | `--state <STATE>` | New state (e.g., `"open"`, `"closed"`, `"done"`) |
 | `--priority <LEVEL>` | New priority |
+| `--workflow <NAME>` | Workflow name override (empty string clears) |
+| `--agent-map <JSON>` | Agent map JSON (validated against AgentMap schema; empty string clears) |
 
 ## `conductor workflow`
 

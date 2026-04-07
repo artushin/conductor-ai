@@ -8,7 +8,7 @@ use conductor_core::github_app;
 use conductor_core::issue_source::{GitHubConfig, IssueSourceManager, JiraConfig};
 use conductor_core::jira_acli;
 use conductor_core::repo::RepoManager;
-use conductor_core::tickets::TicketSyncer;
+use conductor_core::tickets::{TicketSyncer, TicketUpdate};
 use conductor_core::worktree::WorktreeManager;
 
 use crate::commands::TicketCommands;
@@ -236,9 +236,11 @@ pub fn handle_tickets(command: TicketCommands, conn: &Connection, config: &Confi
                 let ticket = syncer.get_by_source_id(&repo_obj.id, &source_id)?;
                 syncer.update_ticket(
                     &ticket.id,
-                    None,
-                    workflow.as_deref(),
-                    agent_map.as_deref(),
+                    TicketUpdate {
+                        workflow: workflow.clone(),
+                        agent_map: agent_map.clone(),
+                        ..Default::default()
+                    },
                 )?;
             }
             println!(
@@ -257,9 +259,12 @@ pub fn handle_tickets(command: TicketCommands, conn: &Connection, config: &Confi
 
             syncer.update_ticket(
                 &id,
-                state.as_deref(),
-                workflow.as_deref(),
-                agent_map.as_deref(),
+                TicketUpdate {
+                    state: state.clone(),
+                    workflow: workflow.clone(),
+                    agent_map: agent_map.clone(),
+                    ..Default::default()
+                },
             )?;
 
             if let Some(ref new_state) = state {

@@ -144,6 +144,31 @@ conductor worktree create my-app feat-auth-flow
 
 **Why**: Conductor tracks worktrees in its database for ticket linking, workflow targeting, status monitoring, and cleanup. Manual git worktrees are invisible to conductor -- workflows cannot target them, the TUI does not display them, and they bypass automatic dependency installation.
 
+**Anti-pattern: Creating worktrees from a dirty main branch**
+
+WRONG:
+```bash
+# Uncommitted changes on main that fix compilation errors
+git diff  # shows changes
+conductor worktree create my-app feat-new-thing
+# Worktree is created from committed state -- uncommitted fixes are missing
+cd ~/.conductor/workspaces/my-app/feat-new-thing
+cargo build  # fails
+```
+
+RIGHT:
+```bash
+# Option A: Commit first
+git add -A && git commit -m "fix: ..."
+conductor worktree create my-app feat-new-thing
+
+# Option B: Apply the diff manually
+conductor worktree create my-app feat-new-thing
+git diff | (cd ~/.conductor/workspaces/my-app/feat-new-thing && git apply)
+```
+
+**Why**: `conductor worktree create` clones from the committed HEAD of the current branch. Unstaged and staged-but-uncommitted changes are not carried into the worktree. This leads to build failures or missing fixes that only exist as local modifications.
+
 **Anti-pattern: Leaving stale worktrees after completion**
 
 WRONG:
