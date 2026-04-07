@@ -57,14 +57,17 @@ impl<'a> WorkflowManager<'a> {
         Ok(recovered)
     }
 
-    /// Reap workflow runs that are stuck in `waiting` status because the executor
-    /// process died while polling a gate.
+    /// Reap workflow runs that are stuck in `waiting` status.
     ///
     /// A root run (`parent_workflow_run_id IS NULL`) is considered orphaned when:
-    /// - Its parent agent run is in a terminal state (`completed`, `failed`, or
-    ///   `cancelled`), meaning the executor loop that owned this run is gone, OR
-    /// - The active gate step's timeout has elapsed based on wall-clock time since
-    ///   `started_at`.
+    /// - It has an active gate step whose timeout has elapsed (wall-clock time
+    ///   since `started_at`), OR
+    /// - It has NO active gate step and its parent agent run is in a terminal
+    ///   state (`completed`, `failed`, or `cancelled`) or has been purged.
+    ///
+    /// When a gate step IS active, parent process status is intentionally ignored
+    /// because the workflow may be legitimately detached (e.g. chief's detached
+    /// spawn or `--background` fork). The gate's own timeout is the sole authority.
     ///
     /// Orphaned runs have their active gate step marked `timed_out` and the run
     /// itself marked `cancelled` with a descriptive summary.
@@ -152,7 +155,17 @@ impl<'a> WorkflowManager<'a> {
                 }
             });
 
-            if !dead_parent && !gate_timed_out {
+            // Gate-aware reaping: when a gate step is active, only the gate's
+            // own timeout can trigger cancellation — parent process status is
+            // irrelevant because the workflow may be intentionally detached
+            // (e.g. chief's detached spawn or --background fork).  When no gate
+            // is active, fall back to the original dead-parent check.
+            let has_active_gate = gate_step.is_some();
+            if has_active_gate {
+                if !gate_timed_out {
+                    continue;
+                }
+            } else if !dead_parent {
                 continue;
             }
 
